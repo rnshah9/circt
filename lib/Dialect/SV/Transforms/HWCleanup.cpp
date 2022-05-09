@@ -108,8 +108,8 @@ struct ConditionPairInformation {
 
   // Remove ops.
   void cleanUpOps() {
-    eraseOpWithoutUse(lhs.getDefiningOp());
-    eraseOpWithoutUse(rhs.getDefiningOp());
+    for (Operation *op : andOperations)
+      eraseOpWithoutUse(op);
   }
 
   Value lhs, rhs;
@@ -119,16 +119,18 @@ struct ConditionPairInformation {
   llvm::SmallVector<Value> commonOperand;
 
 private:
+  llvm::SmallDenseSet<comb::AndOp, 4> andOperations;
   // Helper function to accmulate operands.
-  static void peelOperands(Value cond, llvm::SmallSetVector<Value, 4> &result) {
+  void peelOperands(Value cond, llvm::SmallSetVector<Value, 4> &result) {
     auto andOp = dyn_cast_or_null<comb::AndOp>(cond.getDefiningOp());
     if (!andOp) {
       result.insert(cond);
       return;
     }
 
+    andOperations.insert(andOp);
     llvm::for_each(andOp.getOperands(),
-                   [&](Value cond) { result.insert(cond); });
+                   [&](Value cond) { peelOperands(cond, result); });
   }
 };
 
@@ -464,9 +466,16 @@ void HWCleanupPass::runIfOpsToCaseOnBlock(Block &body) {
     builder.setInsertionPoint(op);
     // Create case op with `caseValueAndIfOps.size()` cases.
     auto casez = builder.create<sv::CaseOp>(
-        comparedValue.getLoc(), CaseStmtType::CaseStmt, comparedValue,
-        caseIntegerAndIfOps.size(),
+        comparedValue.getLoc(), CaseStmtType::CaseStmt,
+        circt::sv::ValidationQualifierTypeEnum::ValidationQualifierUnique,
+        comparedValue, caseIntegerAndIfOps.size() + 1,
         [&](size_t caseIdx) -> circt::sv::CasePattern {
+          if (caseIdx == caseIntegerAndIfOps.size())
+            return circt::sv::CasePattern(
+                comparedValue.getType().getIntOrFloatBitWidth(),
+                circt::sv::CasePattern::CasePattern::DefaultPatternTag{},
+                op->getContext());
+
           auto constant = caseIntegerAndIfOps[caseIdx].first;
 
           circt::sv::CasePattern thePattern =
