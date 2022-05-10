@@ -959,6 +959,15 @@ hw.module @replicate(%arg0: i7, %arg1: i1) -> (r1: i21, r2: i9, r3: i16, r4: i16
   hw.output %r1, %r2, %r3, %r4 : i21, i9, i16, i16
 }
 
+// CHECK-LABEL: module constantComparison
+hw.module @constantComparison(%a: i3) -> (b: i1, c: i1) {
+  // CHECK:      assign b = a == 3'h2;
+  // CHECK-NEXT: assign c = a == 3'h2;
+  %c2_i3 = hw.constant 2 : i3
+  %0 = comb.icmp eq %a, %c2_i3 : i3
+  hw.output %0, %0 : i1, i1
+}
+
 // CHECK-LABEL: module parameters
 // CHECK-NEXT: #(parameter [41:0] p1 = 42'd17
 // CHECK-NEXT:   parameter [0:0]  p2) (

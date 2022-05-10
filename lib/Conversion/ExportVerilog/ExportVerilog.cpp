@@ -144,6 +144,10 @@ static bool isDuplicatableExpression(Operation *op) {
   if (op->getNumOperands() == 0)
     return isDuplicatableNullaryExpression(op);
 
+  // Constant comparison is duplicatable.
+  if (auto icmp = dyn_cast<comb::ICmpOp>(op))
+    return icmp.rhs().getDefiningOp<ConstantOp>();
+
   // It is cheap to inline extract op.
   if (isa<comb::ExtractOp, hw::StructExtractOp>(op))
     return true;
