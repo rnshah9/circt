@@ -138,12 +138,16 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
     output.erase();
     // while (!oldOperand.empty()) {
     //   auto op = oldOperand.pop_back_val().getDefiningOp();
-    //   if (op->use_empty()) {
-    //     op->erase();
-    //     for (auto op : op->getOperands()) {
-    //       if (op.use_empty())
-    //         oldOperand.push_back(op);
+    //   if (op && op->use_empty()) {
+    //     auto operand = op->getOperands();
+    //     while (op->getNumOperands()) {
+    //       auto operand = op->getOperand(0);
+    //       op->eraseOperand(0);
+    //       if (operand.use_empty()) {
+    //         oldOperand.push_back(operand);
+    //       }
     //     }
+    //     op->erase();
     //   }
     // }
   }
