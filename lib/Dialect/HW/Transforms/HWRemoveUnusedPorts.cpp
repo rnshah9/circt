@@ -1,6 +1,7 @@
 #include "PassDetails.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/APSInt.h"
@@ -44,153 +45,87 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
 
   // This tracks constant values of output ports. None indicates an
   // uninitialized value.
-  SmallVector<llvm::Optional<APSInt>> outputPortConstants;
+  SmallVector<llvm::Optional<APInt>> outputPortConstants;
   auto ports = module.getPorts();
+
+  // Traverse input ports.
   for (auto e : llvm::enumerate(ports.inputs)) {
     unsigned index = e.index();
     auto port = e.value();
-    // If the port is don't touch or has unprocessed annotations, we cannot
-    // remove the port. Maybe we can allow annotations though.
-    if (port.sym && !port.sym.getValue().empty())
+    auto arg = module.getArgument(port.argNum);
+
+    if (port.isInOut() || (port.sym && !port.sym.getValue().empty()))
       continue;
+    // If the port is not dead, skip.
+    if (!arg.use_empty())
+      continue;
+    removalInputPortIndexes.push_back(index);
   }
 
-  for (auto e : llvm::enumerate(ports)) {
+  // Traverse output ports.
+  auto output = cast<OutputOp>(module.getBodyBlock()->getTerminator());
+  for (auto e : llvm::enumerate(ports.outputs)) {
     unsigned index = e.index();
     auto port = e.value();
-    auto arg = module.getArgument(index);
-
-    // If the port is don't touch or has unprocessed annotations, we cannot
-    // remove the port. Maybe we can allow annotations though.
     if (port.sym && !port.sym.getValue().empty())
-      continue;
-
-    // TODO: Handle inout ports.
-    if (port.isInOut())
-      continue;
-
-    // If the port is input and has an user, we cannot remove the
-    // port.
-    if (port.isInput() && !arg.use_empty())
       continue;
 
     auto portIsUnused = [&](InstanceRecord *a) -> bool {
-      auto port = a->getInstance()->getResult(arg.getArgNumber());
+      auto port = a->getInstance()->getResult(index);
       return port.getUses().empty();
     };
 
-    // Output port.
-    if (port.isOutput()) {
-      if (arg.use_empty()) {
-        // Sometimes the connection is already removed possibly by IMCP.
-        // In that case, regard the port value as an invalid value.
-        outputPortConstants.push_back(None);
-      } else if (llvm::all_of(instanceGraphNode->uses(), portIsUnused)) {
-        // Replace the port with a wire if it is unused.
-        auto builder =
-            ImplicitLocOpBuilder::atBlockBegin(arg.getLoc(), module.getBody());
-        auto wire = builder.create<sv::WireOp>(arg.getType());
-        arg.replaceAllUsesWith(wire);
-        outputPortConstants.push_back(None);
-      } else if (arg.hasOneUse()) {
-        // If the port has a single use, check the port is only connected to
-        // invalid or constant
-        Operation *op = arg.use_begin().getUser();
-        auto connectLike = dyn_cast<FConnectLike>(op);
-        if (!connectLike)
-          continue;
-        auto *srcOp = connectLike.src().getDefiningOp();
-        if (!isa_and_nonnull<InvalidValueOp, ConstantOp>(srcOp))
-          continue;
-
-        if (auto constant = dyn_cast<ConstantOp>(srcOp))
-          outputPortConstants.push_back(constant.value());
-        else {
-          assert(isa<InvalidValueOp>(srcOp) && "only expect invalid");
-          outputPortConstants.push_back(None);
-        }
-
-        // Erase connect op because we are going to remove this output ports.
-        op->erase();
-
-        if (srcOp->use_empty())
-          srcOp->erase();
-      } else {
-        // Otherwise, we cannot remove the port.
-        continue;
-      }
+    if (llvm::all_of(instanceGraphNode->uses(), portIsUnused)) {
+      // Replace the port with a wire if it is unused.
+      outputPortConstants.push_back(None);
+      removalOutputPortIndexes.push_back(index);
+      continue;
     }
 
-    removalPortIndexes.push_back(index);
+    auto src = output.getOperand(index).getDefiningOp();
+    if (!isa_and_nonnull<hw::ConstantOp, sv::ConstantXOp>(src))
+      continue;
+
+    if (auto constant = dyn_cast<hw::ConstantOp>(src))
+      outputPortConstants.push_back(constant.value());
+    else {
+      outputPortConstants.push_back(None);
+    }
+
+    removalOutputPortIndexes.push_back(index);
   }
 
   // If there is nothing to remove, abort.
-  if (removalPortIndexes.empty())
+  if (removalInputPortIndexes.empty() && removalOutputPortIndexes.empty())
     return;
 
   // Delete ports from the module.
-  module.erasePorts(removalPortIndexes);
-  LLVM_DEBUG(llvm::for_each(removalPortIndexes, [&](unsigned index) {
-               llvm::dbgs() << "Delete port: " << ports[index].name << "\n";
-             }););
+  module.erasePorts(removalInputPortIndexes, removalOutputPortIndexes);
 
   // Rewrite all uses.
   for (auto *use : instanceGraphNode->uses()) {
     auto instance = ::cast<InstanceOp>(*use->getInstance());
     ImplicitLocOpBuilder builder(instance.getLoc(), instance);
-    unsigned outputPortIndex = 0;
-    for (auto index : removalPortIndexes) {
+    for (auto [index, constant] :
+         llvm::zip(removalOutputPortIndexes, outputPortConstants)) {
       auto result = instance.getResult(index);
-      assert(!ports[index].isInOut() && "don't expect inout ports");
-
-      // If the port is input, replace the port with an unwritten wire
-      // so that we can remove use-chains in SV dialect canonicalization.
-      if (ports[index].isInput()) {
-        WireOp wire = builder.create<WireOp>(result.getType());
-
-        // Check that the input port is only written. Sometimes input ports are
-        // used as temporary wires. In that case, we cannot erase connections.
-        bool onlyWritten = llvm::all_of(result.getUsers(), [&](Operation *op) {
-          if (auto connect = dyn_cast<FConnectLike>(op))
-            return connect.dest() == result;
-          return false;
-        });
-
-        result.replaceUsesWithIf(wire, [&](OpOperand &op) -> bool {
-          // Connects can be deleted directly.
-          if (onlyWritten && isa<FConnectLike>(op.getOwner())) {
-            op.getOwner()->erase();
-            return false;
-          }
-          return true;
-        });
-
-        // If the wire doesn't have an user, just erase it.
-        if (wire.use_empty())
-          wire.erase();
-
+      if (result.use_empty())
         continue;
-      }
-
-      // Output port. Replace with the output port with an invalid or constant
-      // value.
-      auto portConstant = outputPortConstants[outputPortIndex++];
       Value value;
-      if (portConstant)
-        value = builder.create<ConstantOp>(*portConstant);
+      if (constant)
+        value = builder.create<hw::ConstantOp>(*constant);
       else
-        value = builder.create<InvalidValueOp>(result.getType());
-
+        value = builder.create<sv::ConstantXOp>(result.getType());
       result.replaceAllUsesWith(value);
     }
-
     // Create a new instance op without unused ports.
-    instance.erasePorts(builder, removalPortIndexes);
+    instance.erasePorts(builder, module, removalInputPortIndexes,
+                        removalOutputPortIndexes);
     // Remove old one.
     instance.erase();
   }
-
-  numRemovedPorts += removalPortIndexes.size();
+  numRemovedPorts += removalInputPortIndexes.size();
+  numRemovedPorts += removalOutputPortIndexes.size();
 }
 std::unique_ptr<mlir::Pass> createHWRemoveUnusedPortsPass() {
   return std::make_unique<HWRemoveUnusedPortsPass>();

@@ -36,6 +36,9 @@ def HWSpecialize : Pass<"hw-specialize", "mlir::ModuleOp"> {
 def HWRemoveUnusedPorts : Pass<"hw-remove-unused-ports", "mlir::ModuleOp"> {
   let summary = "Specializes instances of parametric hw.modules";
   let constructor = "circt::hw::createHWRemoveUnusedPortsPass()";
+  let statistics = [
+    Statistic<"numRemovedPorts", "num-removed-ports", "Number of ports erased">,
+  ];
 }
 
 #endif // CIRCT_DIALECT_HW_PASSES_TD
