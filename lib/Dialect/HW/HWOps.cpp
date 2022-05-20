@@ -21,6 +21,7 @@
 #include "mlir/IR/FunctionImplementation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/Debug.h"
 
 using namespace circt;
 using namespace hw;
@@ -1523,26 +1524,41 @@ InstanceOp InstanceOp::erasePorts(OpBuilder &builder, HWModuleOp newModuleOp,
                                   ArrayRef<unsigned> outputPortsIndices) {
   if (inputPortsIndices.empty() && outputPortsIndices.empty())
     return *this;
+  llvm::errs() << getNumResults() << " " << inputPortsIndices.size() << " "
+               << outputPortsIndices.size() << "\n";
+  dump();
 
-  SmallVector<Type> newResultTypes = removeElementsAtIndices<Type>(
-      SmallVector<Type>(result_type_begin(), result_type_end()),
-      outputPortsIndices);
-  SmallVector<Value> newInputs = removeElementsAtIndices<Value>(
-      SmallVector<Value>(inputs()), inputPortsIndices);
+  // SmallVector<Type> newResultTypes = removeElementsAtIndices<Type>(
+  //     SmallVector<Type>(result_type_begin(), result_type_end()),
+  //     outputPortsIndices);
+  // llvm::dbgs() << "shine" << newResultTypes.size() << "\n";
+  // assert(false);
+  SmallVector<Value> newInputs =
+      inputPortsIndices.empty()
+          ? inputs()
+          : removeElementsAtIndices<Value>(SmallVector<Value>(inputs()),
+                                           inputPortsIndices);
+  dump();
 
   auto newOp =
-      builder.create<InstanceOp>(getLoc(), newModuleOp, moduleName(), newInputs,
-                                 parameters(), inner_symAttr());
-
+      builder.create<InstanceOp>(getLoc(), newModuleOp, instanceName(),
+                                 newInputs, parameters(), inner_symAttr());
+  llvm::dbgs() << "NEW";
+  newOp.dump();
   // Replace outputs.
   llvm::SmallDenseSet<unsigned> portSet(outputPortsIndices.begin(),
-                                  outputPortsIndices.end());
+                                        outputPortsIndices.end());
+
+  llvm::errs() << "BAAAA" << getNumResults() << "\n";
+  llvm::errs().flush();
   for (unsigned oldIdx = 0, newIdx = 0, numOldPorts = getNumResults();
        oldIdx != numOldPorts; ++oldIdx) {
     if (portSet.contains(oldIdx)) {
       assert(getResult(oldIdx).use_empty() && "removed instance port has uses");
       continue;
     }
+    llvm::dbgs() << oldIdx << " " << getNumResults() << " " << newIdx << " "
+                 << newOp.getNumResults() << "\n";
     getResult(oldIdx).replaceAllUsesWith(newOp.getResult(newIdx));
     ++newIdx;
   }

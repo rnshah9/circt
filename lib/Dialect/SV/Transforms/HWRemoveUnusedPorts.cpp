@@ -1,7 +1,8 @@
-#include "PassDetails.h"
+#include "PassDetail.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/SV/SVOps.h"
+#include "circt/Dialect/SV/SVPasses.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/APSInt.h"
@@ -14,11 +15,9 @@ using namespace llvm;
 using namespace mlir;
 using namespace circt;
 using namespace hw;
-
-namespace circt {
-namespace hw {
+namespace {
 struct HWRemoveUnusedPortsPass
-    : public hw::HWRemoveUnusedPortsBase<HWRemoveUnusedPortsPass> {
+    : public sv::HWRemoveUnusedPortsBase<HWRemoveUnusedPortsPass> {
   void removeUnusedModulePorts(HWModuleOp module,
                                InstanceGraphNode *instanceGraphNode);
 
@@ -28,13 +27,60 @@ struct HWRemoveUnusedPortsPass
                             << "\n");
     // Iterate in the reverse order of instance graph iterator, i.e. from leaves
     // to top.
-    for (auto *node : llvm::post_order(&instanceGraph))
-      if (auto module = dyn_cast<HWModuleOp>(*node->getModule()))
+    for (auto *node : llvm::post_order(&instanceGraph)) {
+      assert(node && "bar");
+      if (!node->getModule())
+        continue;
+      if (auto module = dyn_cast_or_null<HWModuleOp>(node->getModule()))
         // Don't prune the main module.
         if (!module.isPublic())
           removeUnusedModulePorts(module, node);
+    }
   }
 };
+} // namespace
+
+/// Remove elements at the specified indices from the input array, returning the
+/// elements not mentioned.  The indices array is expected to be sorted and
+/// unique.
+template <typename T>
+static SmallVector<T>
+removeElementsAtIndices(ArrayRef<T> input, ArrayRef<unsigned> indicesToDrop) {
+#ifndef NDEBUG // Check sortedness.
+  if (!input.empty()) {
+    for (size_t i = 1, e = indicesToDrop.size(); i != e; ++i)
+      assert(indicesToDrop[i - 1] < indicesToDrop[i] &&
+             "indicesToDrop isn't sorted and unique");
+    assert(indicesToDrop.back() < input.size() && "index out of range");
+  }
+#endif
+
+  // If the input is empty (which is an optimization we do for certain array
+  // attributes), simply return an empty vector.
+  if (input.empty())
+    return {};
+
+  // Copy over the live chunks.
+  size_t lastCopied = 0;
+  SmallVector<T> result;
+  result.reserve(input.size() - indicesToDrop.size());
+
+  for (unsigned indexToDrop : indicesToDrop) {
+    // If we skipped over some valid elements, copy them over.
+    if (indexToDrop > lastCopied) {
+      result.append(input.begin() + lastCopied, input.begin() + indexToDrop);
+      lastCopied = indexToDrop;
+    }
+    // Ignore this value so we don't copy it in the next iteration.
+    ++lastCopied;
+  }
+
+  // If there are live elements at the end, copy them over.
+  if (lastCopied < input.size())
+    result.append(input.begin() + lastCopied, input.end());
+
+  return result;
+}
 void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
     HWModuleOp module, InstanceGraphNode *instanceGraphNode) {
   LLVM_DEBUG(llvm::dbgs() << "Prune ports of module: " << module.getName()
@@ -42,31 +88,19 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
   // These track port indexes that can be erased.
   SmallVector<unsigned> removalInputPortIndexes;
   SmallVector<unsigned> removalOutputPortIndexes;
+  llvm::dbgs() << "bar!";
 
   // This tracks constant values of output ports. None indicates an
   // uninitialized value.
   SmallVector<llvm::Optional<APInt>> outputPortConstants;
   auto ports = module.getPorts();
 
-  // Traverse input ports.
-  for (auto e : llvm::enumerate(ports.inputs)) {
-    unsigned index = e.index();
-    auto port = e.value();
-    auto arg = module.getArgument(port.argNum);
-
-    if (port.isInOut() || (port.sym && !port.sym.getValue().empty()))
-      continue;
-    // If the port is not dead, skip.
-    if (!arg.use_empty())
-      continue;
-    removalInputPortIndexes.push_back(index);
-  }
-
   // Traverse output ports.
   auto output = cast<OutputOp>(module.getBodyBlock()->getTerminator());
   for (auto e : llvm::enumerate(ports.outputs)) {
     unsigned index = e.index();
     auto port = e.value();
+    llvm::dbgs() << "output: " << index << " " << port.argNum << "\n";
     if (port.sym && !port.sym.getValue().empty())
       continue;
 
@@ -95,12 +129,66 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
     removalOutputPortIndexes.push_back(index);
   }
 
+  ImplicitLocOpBuilder builder(output.getLoc(), output);
+  if (!removalOutputPortIndexes.empty()) {
+    SmallVector<Value> oldOperand(output.operands());
+    auto newOutput =
+        removeElementsAtIndices<Value>(oldOperand, removalOutputPortIndexes);
+    builder.create<hw::OutputOp>(newOutput);
+    output.erase();
+    // while (!oldOperand.empty()) {
+    //   auto op = oldOperand.pop_back_val().getDefiningOp();
+    //   if (op->use_empty()) {
+    //     op->erase();
+    //     for (auto op : op->getOperands()) {
+    //       if (op.use_empty())
+    //         oldOperand.push_back(op);
+    //     }
+    //   }
+    // }
+  }
+
+  // Traverse input ports.
+  for (auto e : llvm::enumerate(ports.inputs)) {
+    unsigned index = e.index();
+    auto port = e.value();
+    auto arg = module.getArgument(port.argNum);
+    llvm::dbgs() << "input: " << index << " " << port.argNum << "\n";
+
+    if (port.isInOut() || (port.sym && !port.sym.getValue().empty()))
+      continue;
+    // If the port is not dead, skip.
+    if (!arg.use_empty())
+      continue;
+    removalInputPortIndexes.push_back(index);
+  }
+
   // If there is nothing to remove, abort.
   if (removalInputPortIndexes.empty() && removalOutputPortIndexes.empty())
     return;
+  LLVM_DEBUG({
+    for (auto c : removalInputPortIndexes) {
+      llvm::dbgs() << "remove input: " << c << "\n";
+    }
+    for (auto c : removalOutputPortIndexes) {
+      llvm::dbgs() << "remove output: " << c << "\n";
+    }
+  });
 
   // Delete ports from the module.
   module.erasePorts(removalInputPortIndexes, removalOutputPortIndexes);
+
+  module.dump();
+  for (auto c : llvm::reverse(removalInputPortIndexes)) {
+    module.getBody().eraseArgument(c);
+  }
+
+  module.dump();
+
+  // auto newOutput = removeElementsAtIndices<Value>(
+  //     SmallVector<Value>(output.operands()), removalOutputPortIndexes);
+  // builder.create<hw::OutputOp>(newOutput);
+  // output.erase();
 
   // Rewrite all uses.
   for (auto *use : instanceGraphNode->uses()) {
@@ -127,8 +215,7 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
   numRemovedPorts += removalInputPortIndexes.size();
   numRemovedPorts += removalOutputPortIndexes.size();
 }
-std::unique_ptr<mlir::Pass> createHWRemoveUnusedPortsPass() {
+
+std::unique_ptr<mlir::Pass> circt::sv::createHWRemoveUnusedPortsPass() {
   return std::make_unique<HWRemoveUnusedPortsPass>();
 }
-} // namespace hw
-} // namespace circt

@@ -583,9 +583,6 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
   if (!disableOptimization) {
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
         createSimpleCanonicalizerPass());
-    if (removeUnusedPorts)
-      pm.nest<firrtl::CircuitOp>().addPass(
-          firrtl::createRemoveUnusedPortsPass());
   }
 
   if (emitOMIR)
@@ -646,6 +643,8 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
     if (!disableOptimization) {
       auto &modulePM = exportPm.nest<hw::HWModuleOp>();
       modulePM.addPass(sv::createPrettifyVerilogPass());
+      if (removeUnusedPorts)
+        exportPm.addPass(circt::sv::createHWRemoveUnusedPortsPass());
     }
 
     if (stripDebugInfo)
