@@ -88,7 +88,7 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
   // These track port indexes that can be erased.
   SmallVector<unsigned> removalInputPortIndexes;
   SmallVector<unsigned> removalOutputPortIndexes;
-  llvm::dbgs() << "bar!";
+  // llvm::dbgs() << "bar!";
 
   // This tracks constant values of output ports. None indicates an
   // uninitialized value.
@@ -100,7 +100,7 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
   for (auto e : llvm::enumerate(ports.outputs)) {
     unsigned index = e.index();
     auto port = e.value();
-    llvm::dbgs() << "output: " << index << " " << port.argNum << "\n";
+    // llvm::dbgs() << "output: " << index << " " << port.argNum << "\n";
     if (port.sym && !port.sym.getValue().empty())
       continue;
 
@@ -153,7 +153,7 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
     unsigned index = e.index();
     auto port = e.value();
     auto arg = module.getArgument(port.argNum);
-    llvm::dbgs() << "input: " << index << " " << port.argNum << "\n";
+    // llvm::dbgs() << "input: " << index << " " << port.argNum << "\n";
 
     if (port.isInOut() || (port.sym && !port.sym.getValue().empty()))
       continue;
@@ -178,12 +178,12 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
   // Delete ports from the module.
   module.erasePorts(removalInputPortIndexes, removalOutputPortIndexes);
 
-  module.dump();
+  // module.dump();
   for (auto c : llvm::reverse(removalInputPortIndexes)) {
     module.getBody().eraseArgument(c);
   }
 
-  module.dump();
+  // module.dump();
 
   // auto newOutput = removeElementsAtIndices<Value>(
   //     SmallVector<Value>(output.operands()), removalOutputPortIndexes);

@@ -1524,9 +1524,9 @@ InstanceOp InstanceOp::erasePorts(OpBuilder &builder, HWModuleOp newModuleOp,
                                   ArrayRef<unsigned> outputPortsIndices) {
   if (inputPortsIndices.empty() && outputPortsIndices.empty())
     return *this;
-  llvm::errs() << getNumResults() << " " << inputPortsIndices.size() << " "
-               << outputPortsIndices.size() << "\n";
-  dump();
+  // llvm::errs() << getNumResults() << " " << inputPortsIndices.size() << " "
+               // << outputPortsIndices.size() << "\n";
+  // dump();
 
   // SmallVector<Type> newResultTypes = removeElementsAtIndices<Type>(
   //     SmallVector<Type>(result_type_begin(), result_type_end()),
@@ -1538,27 +1538,27 @@ InstanceOp InstanceOp::erasePorts(OpBuilder &builder, HWModuleOp newModuleOp,
           ? inputs()
           : removeElementsAtIndices<Value>(SmallVector<Value>(inputs()),
                                            inputPortsIndices);
-  dump();
+  // dump();
 
   auto newOp =
       builder.create<InstanceOp>(getLoc(), newModuleOp, instanceName(),
                                  newInputs, parameters(), inner_symAttr());
-  llvm::dbgs() << "NEW";
-  newOp.dump();
+  // llvm::dbgs() << "NEW";
+  // newOp.dump();
   // Replace outputs.
   llvm::SmallDenseSet<unsigned> portSet(outputPortsIndices.begin(),
                                         outputPortsIndices.end());
 
-  llvm::errs() << "BAAAA" << getNumResults() << "\n";
-  llvm::errs().flush();
+  // llvm::errs() << "BAAAA" << getNumResults() << "\n";
+  // llvm::errs().flush();
   for (unsigned oldIdx = 0, newIdx = 0, numOldPorts = getNumResults();
        oldIdx != numOldPorts; ++oldIdx) {
     if (portSet.contains(oldIdx)) {
       assert(getResult(oldIdx).use_empty() && "removed instance port has uses");
       continue;
     }
-    llvm::dbgs() << oldIdx << " " << getNumResults() << " " << newIdx << " "
-                 << newOp.getNumResults() << "\n";
+    // llvm::dbgs() << oldIdx << " " << getNumResults() << " " << newIdx << " "
+    //              << newOp.getNumResults() << "\n";
     getResult(oldIdx).replaceAllUsesWith(newOp.getResult(newIdx));
     ++newIdx;
   }
