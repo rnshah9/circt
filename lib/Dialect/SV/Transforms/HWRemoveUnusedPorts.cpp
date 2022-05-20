@@ -15,19 +15,51 @@ using namespace llvm;
 using namespace mlir;
 using namespace circt;
 using namespace hw;
+
 namespace {
 struct HWRemoveUnusedPortsPass
     : public sv::HWRemoveUnusedPortsBase<HWRemoveUnusedPortsPass> {
   void removeUnusedModulePorts(HWModuleOp module,
                                InstanceGraphNode *instanceGraphNode);
 
+  void visit(InstanceGraphNode *node, InstanceGraph &instanceGraph,
+             llvm::DenseSet<InstanceGraphNode *> &visited,
+             llvm::SmallVector<InstanceGraphNode *> &order) {
+    if (!node)
+      return;
+
+    visited.insert(node);
+
+    SmallVector<InstanceRecord *> rev(node->begin(), node->end());
+    // SmallVector<node>  node->uses();
+    for (InstanceRecord *node : llvm::reverse(rev)) {
+      // auto instance = node->getInstance();
+      // if (!instance)
+      //   continue;
+      // auto name = instance.referencedModuleNameAttr();
+      // node->getTarget();
+
+      if (auto nextNode = node->getTarget()) {
+        if (!visited.contains(nextNode)) {
+          visit(nextNode, instanceGraph, visited, order);
+        }
+      }
+    }
+    order.push_back(node);
+  }
+
   void runOnOperation() override {
     auto &instanceGraph = getAnalysis<InstanceGraph>();
+    llvm::DenseSet<InstanceGraphNode *> visited;
+    llvm::SmallVector<InstanceGraphNode *> order;
+    visit(instanceGraph.getTopLevelNode(), instanceGraph, visited, order);
+
     LLVM_DEBUG(llvm::dbgs() << "===----- Remove unused ports -----==="
-                            << "\n");
+
+                            << order.size() << "\n");
     // Iterate in the reverse order of instance graph iterator, i.e. from leaves
     // to top.
-    for (auto *node : llvm::post_order(&instanceGraph)) {
+    for (auto *node : order) {
       assert(node && "bar");
       if (!node->getModule())
         continue;

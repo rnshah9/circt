@@ -42,6 +42,7 @@ void RemoveUnusedPortsPass::runOnOperation() {
                           << "\n");
   // Iterate in the reverse order of instance graph iterator, i.e. from leaves
   // to top.
+  SmallVector<StringAttr> order;
   for (auto *node : llvm::post_order(&instanceGraph))
     if (auto module = dyn_cast<FModuleOp>(*node->getModule()))
       // Don't prune the main module.
