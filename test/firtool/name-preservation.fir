@@ -13,9 +13,9 @@ circuit Foo:
     wire _x: {a: UInt<1>, flip b: UInt<1>}
     _x <= a
 
-    ; Default behavior is to preserve named wires.
-    ; CHECK:        wire x_a;
-    ; CHECK:        wire x_b;
+    ; Default behavior is to preserve named wires unless they are dead.
+    ; CHECK-NOT:        wire x_a;
+    ; CHECK-NOT:        wire x_b;
     wire x: {a: UInt<1>, flip b: UInt<1>}
     x <= _x
 
