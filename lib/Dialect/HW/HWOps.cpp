@@ -1525,7 +1525,7 @@ InstanceOp InstanceOp::erasePorts(OpBuilder &builder, HWModuleOp newModuleOp,
   if (inputPortsIndices.empty() && outputPortsIndices.empty())
     return *this;
   // llvm::errs() << getNumResults() << " " << inputPortsIndices.size() << " "
-               // << outputPortsIndices.size() << "\n";
+  // << outputPortsIndices.size() << "\n";
   // dump();
 
   // SmallVector<Type> newResultTypes = removeElementsAtIndices<Type>(
@@ -1533,6 +1533,11 @@ InstanceOp InstanceOp::erasePorts(OpBuilder &builder, HWModuleOp newModuleOp,
   //     outputPortsIndices);
   // llvm::dbgs() << "shine" << newResultTypes.size() << "\n";
   // assert(false);
+  SmallVector<Value> mightBeDead;
+  mightBeDead.push_back(0);
+  for (auto c : inputPortsIndices) {
+    getOperand(c);
+  }
   SmallVector<Value> newInputs =
       inputPortsIndices.empty()
           ? inputs()

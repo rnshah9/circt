@@ -135,20 +135,23 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
     auto newOutput =
         removeElementsAtIndices<Value>(oldOperand, removalOutputPortIndexes);
     builder.create<hw::OutputOp>(newOutput);
+    SmallPtrSet<Operation *, 4> mightBeDead;
+    for (auto c : oldOperand)
+      mightBeDead.insert(c.getDefiningOp());
     output.erase();
-    // while (!oldOperand.empty()) {
-    //   auto op = oldOperand.pop_back_val().getDefiningOp();
-    //   if (op && op->use_empty()) {
-    //     auto operand = op->getOperands();
-    //     while (op->getNumOperands()) {
-    //       auto operand = op->getOperand(0);
-    //       op->eraseOperand(0);
-    //       if (operand.use_empty()) {
-    //         oldOperand.push_back(operand);
-    //       }
+    for (auto op : mightBeDead)
+      if (op && isOpTriviallyDead(op))
+        op->erase();
+    // while (!oldOperands.empty()) {
+    //   Operation* op = oldOperands.pop_back_val();
+    //   if (!op || !isOpTriviallyDead(op))
+    //     continue;
+    //   for (auto operand : op->getOperands()) {
+    //     if (operand.hasOneUse()) {
+    //       oldOperands.push_back(operand.getDefiningOp());
     //     }
-    //     op->erase();
     //   }
+    //   op->erase();
     // }
   }
 
@@ -210,11 +213,22 @@ void HWRemoveUnusedPortsPass::removeUnusedModulePorts(
         value = builder.create<sv::ConstantXOp>(result.getType());
       result.replaceAllUsesWith(value);
     }
+    SmallPtrSet<Operation *, 4> mightBeDead;
+    for (auto c : removalInputPortIndexes)
+      mightBeDead.insert(instance.getOperand(c).getDefiningOp());
+
     // Create a new instance op without unused ports.
     instance.erasePorts(builder, module, removalInputPortIndexes,
                         removalOutputPortIndexes);
     // Remove old one.
     instance.erase();
+    for_each(mightBeDead, [](Operation *op) {
+      if (op) {
+        if (isOpTriviallyDead(op)) {
+          op->erase();
+        }
+      }
+    });
   }
   numRemovedPorts += removalInputPortIndexes.size();
   numRemovedPorts += removalOutputPortIndexes.size();
