@@ -4295,6 +4295,10 @@ void SharedEmitterState::gatherFiles(bool separateModules) {
 void SharedEmitterState::collectOpsForFile(const FileInfo &file,
                                            EmissionList &thingsToEmit,
                                            bool emitHeader) {
+  // Include the version string comment when replicated ops are emitted.
+  if (file.emitReplicatedOps)
+    thingsToEmit.emplace_back(circt::getCirctVersionComment());
+
   // If we're emitting replicated ops, keep track of where we are in the list.
   size_t lastReplicatedOp = 0;
 
