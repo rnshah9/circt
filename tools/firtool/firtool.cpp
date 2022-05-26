@@ -646,6 +646,8 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
     if (!disableOptimization) {
       auto &modulePM = exportPm.nest<hw::HWModuleOp>();
       modulePM.addPass(sv::createPrettifyVerilogPass());
+      if (removeUnusedPorts)
+        exportPm.addPass(circt::sv::createHWRemoveUnusedPortsPass());
     }
 
     if (stripDebugInfo)
