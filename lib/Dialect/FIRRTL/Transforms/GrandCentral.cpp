@@ -1219,26 +1219,6 @@ bool GrandCentralPass::traverseField(Attribute field, IntegerAttr id,
                 StringAttr::get(&getContext(),
                                 "assign " + path.getString() + ";"),
                 ValueRange{}, ArrayAttr::get(&getContext(), path.getSymbols()));
-            // Delete any NLAs on the dead wire tap if as we are going to delete
-            // the symbol.  This deals with the situation where there is a
-            // non-local DontTouchAnnotation.
-            //
-            // TODO: If we knew that this annotation was the lone user of this
-            // symbol, then we could delete the symbol.  However, there is no
-            // way, currently, to know this.
-            if (auto blockArg = leafValue.dyn_cast<BlockArgument>()) {
-              auto module = cast<FModuleOp>(blockArg.getOwner()->getParentOp());
-              for (auto anno :
-                   AnnotationSet::forPort(module, blockArg.getArgNumber()))
-                if (auto sym =
-                        anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
-                  deadNLAs.insert(sym.getAttr());
-            } else {
-              for (auto anno : AnnotationSet(leafValue.getDefiningOp()))
-                if (auto sym =
-                        anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
-                  deadNLAs.insert(sym.getAttr());
-            }
             return true;
           }
         }
