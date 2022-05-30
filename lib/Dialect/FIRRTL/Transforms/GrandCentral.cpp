@@ -958,7 +958,7 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
     // non-local and local targets are totally equivalent.
     auto target = maybeTarget.getValue();
 
-    NamedAttrList elementIface, elementScattered, dontTouch;
+    NamedAttrList elementIface, elementScattered;
 
     // Generate annotations for the ground type.  When possible, generate a dead
     // wire "tap" on the actual ground type to not block optimizations.  The
@@ -981,51 +981,7 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
     Operation *op = path.ref.getOp();
     ImplicitLocOpBuilder builder(UnknownLoc::get(op->getContext()), op);
 
-    auto newTarget =
-        TypeSwitch<Operation *, TokenAnnoTarget>(op)
-            // Case (1): ground type is an external module port.
-            .Case<FExtModuleOp>([&](FExtModuleOp extModule) {
-              return tokenizePath(target).getValue();
-            })
-            // Case (2): ground type is a module port.
-            .Case<FModuleOp>([&](FModuleOp module) {
-              Value src = module.getArgument(path.ref.getImpl().getPortNo());
-              auto fieldIdx = path.fieldIdx;
-              builder.setInsertionPointToStart(module.getBody());
-              WireOp tap = builder.create<WireOp>(
-                  builder.getUnknownLoc(),
-                  path.ref.getType()
-                      .getFinalTypeByFieldID(fieldIdx)
-                      .getPassiveType(),
-                  state.getNamespace(module).newName("_gctTap"));
-              src = getValueByFieldID(builder, src, fieldIdx);
-              emitConnect(builder, tap, src);
-              auto newTarget = tokenizePath(target).getValue();
-              newTarget.name = tap.name();
-              newTarget.component.clear();
-              return newTarget;
-            })
-            // Case (3): ground type is inside a module.
-            .Default([&](Operation *op) {
-              auto module = op->getParentOfType<FModuleOp>();
-              Value src = op->getResult(0);
-              auto fieldIdx = path.fieldIdx;
-              builder.setInsertionPoint(op);
-              WireOp tap = builder.create<WireOp>(
-                  builder.getUnknownLoc(),
-                  path.ref.getType()
-                      .getFinalTypeByFieldID(fieldIdx)
-                      .getPassiveType(),
-                  state.getNamespace(module).newName("_gctTap"));
-              builder.setInsertionPointAfter(op);
-              src = getValueByFieldID(builder, src, fieldIdx);
-              builder.setInsertionPointAfterValue(src);
-              emitConnect(builder, tap, src);
-              auto newTarget = tokenizePath(target).getValue();
-              newTarget.name = tap.name();
-              newTarget.component.clear();
-              return newTarget;
-            });
+    auto newTarget = tokenizePath(target).getValue();
 
     // Populate the annotation for the interface element.
     elementIface.append("class", classAttr);
@@ -1040,12 +996,8 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
     auto targetAttr = StringAttr::get(context, newTarget.str());
     elementScattered.append("target", targetAttr);
 
-    dontTouch.append("class", StringAttr::get(context, dontTouchAnnoClass));
-    dontTouch.append("target", targetAttr);
-
     state.addToWorklistFn(
         DictionaryAttr::getWithSorted(context, elementScattered));
-    state.addToWorklistFn(DictionaryAttr::getWithSorted(context, dontTouch));
 
     return DictionaryAttr::getWithSorted(context, elementIface);
   }
@@ -1270,11 +1222,14 @@ bool GrandCentralPass::traverseField(Attribute field, IntegerAttr id,
             // Delete any NLAs on the dead wire tap if as we are going to delete
             // the symbol.  This deals with the situation where there is a
             // non-local DontTouchAnnotation.
+            //
+            // TODO: If we knew that this annotation was the lone user of this
+            // symbol, then we could delete the symbol.  However, there is no
+            // way, currently, to know this.
             for (auto anno : AnnotationSet(leafValue.getDefiningOp()))
               if (auto sym =
                       anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
                 deadNLAs.insert(sym.getAttr());
-            leafValue.getDefiningOp()->removeAttr("inner_sym");
             return true;
           }
         }
