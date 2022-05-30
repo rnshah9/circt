@@ -1025,21 +1025,23 @@ void GrandCentralTapsPass::processAnnotation(AnnotatedPort &portAnno,
             instancePaths.getAbsolutePaths(op->getParentOfType<FModuleOp>());
 
       // Set the literal member if this wire or node is driven by a constant.
-      auto driver = getDriverFromConnect(op->getResult(0));
-      if (driver)
-        if (auto constant =
-                dyn_cast_or_null<ConstantOp>(driver.getDefiningOp())) {
-          wiring.literal = {
-              IntegerAttr::get(constant.getContext(), constant.value()),
-              constant.getType()};
-          // Delete any NLAs on the dead wire tap if as we are going to delete
-          // the symbol.  This deals with the situation where there is a
-          // non-local DontTouchAnnotation.
-          for (auto anno : AnnotationSet(op))
-            if (auto sym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
-              deadNLAs.insert(sym.getAttr());
-          op->removeAttr("inner_sym");
-        }
+      //
+      // TODO: Fix this so that it works if the tapped thing is a port.
+      //
+      // auto driver = getDriverFromConnect(op->getResult(0));
+      // if (driver)
+      //   if (auto constant =
+      //           dyn_cast_or_null<ConstantOp>(driver.getDefiningOp())) {
+      //     wiring.literal = {
+      //         IntegerAttr::get(constant.getContext(), constant.value()),
+      //         constant.getType()};
+      //     // Delete any NLAs on the dead wire tap if as we are going to delete
+      //     // the symbol.  This deals with the situation where there is a
+      //     // non-local DontTouchAnnotation.
+      //     for (auto anno : AnnotationSet(op))
+      //       if (auto sym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
+      //         deadNLAs.insert(sym.getAttr());
+      //   }
 
       wiring.target = PortWiring::Target(op);
       portWiring.push_back(std::move(wiring));
