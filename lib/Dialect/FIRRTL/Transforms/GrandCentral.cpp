@@ -1226,10 +1226,19 @@ bool GrandCentralPass::traverseField(Attribute field, IntegerAttr id,
             // TODO: If we knew that this annotation was the lone user of this
             // symbol, then we could delete the symbol.  However, there is no
             // way, currently, to know this.
-            for (auto anno : AnnotationSet(leafValue.getDefiningOp()))
-              if (auto sym =
-                      anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
-                deadNLAs.insert(sym.getAttr());
+            if (auto blockArg = leafValue.dyn_cast<BlockArgument>()) {
+              auto module = cast<FModuleOp>(blockArg.getOwner()->getParentOp());
+              for (auto anno :
+                   AnnotationSet::forPort(module, blockArg.getArgNumber()))
+                if (auto sym =
+                        anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
+                  deadNLAs.insert(sym.getAttr());
+            } else {
+              for (auto anno : AnnotationSet(leafValue.getDefiningOp()))
+                if (auto sym =
+                        anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
+                  deadNLAs.insert(sym.getAttr());
+            }
             return true;
           }
         }
