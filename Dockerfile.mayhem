@@ -1,0 +1,21 @@
+FROM --platform=linux/amd64 ubuntu:22.04
+
+RUN apt-get update
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git ninja-build
+
+COPY . /circt
+WORKDIR /circt/llvm/build
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y python-is-python3
+RUN cmake -G Ninja ../llvm -DLLVM_ENABLE_PROJECTS="mlir" \
+    -DLLVM_TARGETS_TO_BUILD="X86;RISCV" \
+    -DLLVM_ENABLE_ASSERTIONS=ON \
+    -DCMAKE_BUILD_TYPE=Release
+RUN ninja
+
+WORKDIR /circt/build
+RUN cmake -G Ninja .. \
+    -DMLIR_DIR=/circt/llvm/build/lib/cmake/mlir \
+    -DLLVM_DIR=/circt/llvm/build/lib/cmake/llvm \
+    -DLLVM_ENABLE_ASSERTIONS=ON \
+    -DCMAKE_BUILD_TYPE=Release
+RUN ninja
