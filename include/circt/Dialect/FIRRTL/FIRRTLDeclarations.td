@@ -178,6 +178,18 @@ def MemOp : FIRRTLOp<"mem", [HasCustomSSAName]> {
   }];
 }
 
+def UselessName: I32EnumAttrCase<"UselessName", 0, "useless_name">;
+def InterestingName: I32EnumAttrCase<"InterestingName", 1, "interesting_name">;
+def WeakInterestingName: I32EnumAttrCase<"WeakInterestingName", 2, "weak_interesting_name">;
+
+def NameKindEnumImpl: I32EnumAttr<"NameKindEnum", "validation qualifier type",
+              [UselessName, InterestingName, WeakInterestingName]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::circt::firrtl";
+}
+
+def NameKindAttr: EnumAttr<FIRRTLDialect, NameKindEnumImpl, "name_kind">;
+
 def NodeOp : FIRRTLOp<"node",
       [SameOperandsAndResultType, InferTypeOpInterface, HasCustomSSAName, InnerSymbol]> {
   let summary = "No-op to name a value";
@@ -193,8 +205,10 @@ def NodeOp : FIRRTLOp<"node",
     }];
 
   let arguments = (ins PassiveType:$input, StrAttr:$name,
+                       NameKindAttr: $namKind,
                        AnnotationArrayAttr:$annotations,
-                       OptionalAttr<SymbolNameAttr>:$inner_sym);
+                       OptionalAttr<SymbolNameAttr>:$inner_sym
+                       );
   let results = (outs FIRRTLType:$result);
 
   let builders = [
