@@ -1,5 +1,5 @@
-project: rnshah9/circt
-target: circt
+project: circt
+target: circt-translate
 
 cmds:
   - cmd: /circt/build/bin/circt-translate @@ --export-calyx
