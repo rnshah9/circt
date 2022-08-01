@@ -1,11 +1,10 @@
 FROM --platform=linux/amd64 ubuntu:22.04 as builder
 
 RUN apt-get update
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git ninja-build
+RUN DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake git ninja-build python-is-python3
 
 COPY . /circt
 WORKDIR /circt/llvm/build
-RUN DEBIAN_FRONTEND=noninteractive apt-get install -y python-is-python3
 RUN cmake -G Ninja ../llvm -DLLVM_ENABLE_PROJECTS="mlir" \
     -DLLVM_TARGETS_TO_BUILD="X86;RISCV" \
     -DLLVM_ENABLE_ASSERTIONS=ON \
@@ -17,14 +16,9 @@ RUN cmake -G Ninja .. \
     -DMLIR_DIR=/circt/llvm/build/lib/cmake/mlir \
     -DLLVM_DIR=/circt/llvm/build/lib/cmake/llvm \
     -DLLVM_ENABLE_ASSERTIONS=ON \
-    -DCMAKE_BUILD_TYPE=Release
-RUN ninja
-
-RUN mkdir -p /deps
-RUN ldd /circt/build/bin/circt-translate | tr -s '[:blank:]' '\n' | grep '^/' | xargs -I % sh -c 'cp % /deps;'
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/install
+RUN ninja install
 
 FROM ubuntu:22.04 as package
-
-COPY --from=builder /deps /deps
-COPY --from=builder /circt/build/bin/circt-translate /circt/build/bin/circt-translate
-ENV LD_LIBRARY_PATH=/deps
+COPY --from=builder /install /install

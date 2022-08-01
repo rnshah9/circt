@@ -2,4 +2,4 @@ project: circt
 target: circt-translate
 
 cmds:
-  - cmd: /circt/build/bin/circt-translate @@ --export-calyx
+  - cmd: /install/bin/circt-translate @@ --export-calyx
