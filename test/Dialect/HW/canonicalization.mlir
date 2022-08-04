@@ -1071,6 +1071,13 @@ hw.module @struct_extract1(%a0: i3, %a1: i5) -> (r0: i3) {
   hw.output %r0 : i3
 }
 
+// Ensure that canonicalizer works with hw.enum.constant.
+
+hw.module @enum_constant() -> () {
+  %0 = hw.enum.constant A : !hw.enum<A, B, C>
+}
+
+
 // == Begin: test cases from LowerToHW ==
 
 // CHECK-LABEL:  hw.module @instance_ooo(%arg0: i2, %arg1: i2, %arg2: i3) -> (out0: i8) {
@@ -1309,3 +1316,38 @@ hw.module @MemDepth1(%clock: i1, %en: i1, %addr: i1) -> (data: i32) {
 }
 
 // == End: test cases from LowerToHW ==
+
+// CHECK-LABEL: hw.module @ExtractOfInject
+hw.module @ExtractOfInject(%a: !hw.struct<a: i1>, %v: i1) -> (result: i1) {
+  %b = hw.struct_inject %a["a"], %v : !hw.struct<a: i1>
+  %c = hw.struct_extract %b["a"] : !hw.struct<a: i1>
+  // CHECK: hw.output %v
+  hw.output %c : i1
+}
+
+// CHECK-LABEL: hw.module @ExtractCycle
+hw.module @ExtractCycle(%a: !hw.struct<a: i1>, %v: i1) -> (result: i1) {
+  %b = hw.struct_inject %b["a"], %v : !hw.struct<a: i1>
+  %c = hw.struct_extract %b["a"] : !hw.struct<a: i1>
+  // CHECK: hw.output %v
+  hw.output %c : i1
+}
+
+// CHECK-LABEL: hw.module @ExtractOfUnrelatedInject
+hw.module @ExtractOfUnrelatedInject(%a: !hw.struct<a: i1, b: i1>, %v: i1) -> (result: i1) {
+  %b = hw.struct_inject %a["b"], %v : !hw.struct<a: i1, b: i1>
+  %c = hw.struct_extract %b["a"] : !hw.struct<a: i1, b: i1>
+  // CHECK: [[STRUCT:%.+]] = hw.struct_extract %a["a"] : !hw.struct<a: i1, b: i1>
+  // CHECK-NEXT: hw.output [[STRUCT]]
+  hw.output %c : i1
+}
+
+// CHECK-LABEL: hw.module @InjectOnInject
+hw.module @InjectOnInject(%a: !hw.struct<a: i1>, %p: i1, %q: i1) -> (result: !hw.struct<a: i1>) {
+  %b = hw.struct_inject %a["a"], %p : !hw.struct<a: i1>
+  %c = hw.struct_inject %b["a"], %q : !hw.struct<a: i1>
+  // CHECK: [[STRUCT:%.+]] = hw.struct_inject %a["a"], %q
+  // CHECK-NEXT: hw.output [[STRUCT]]
+  hw.output %c : !hw.struct<a: i1>
+}
+

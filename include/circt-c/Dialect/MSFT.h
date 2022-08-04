@@ -14,7 +14,6 @@
 #include "circt/Dialect/MSFT/MSFTDialect.h"
 #include "mlir-c/IR.h"
 #include "mlir-c/Pass.h"
-#include "mlir-c/Registration.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +58,13 @@ MLIR_CAPI_EXPORTED
 intptr_t circtMSFTLocationVectorAttrGetNumElements(MlirAttribute);
 MLIR_CAPI_EXPORTED MlirAttribute
 circtMSFTLocationVectorAttrGetElement(MlirAttribute attr, intptr_t pos);
+
+MLIR_CAPI_EXPORTED bool circtMSFTAttributeIsAnAppIDAttr(MlirAttribute);
+MLIR_CAPI_EXPORTED
+MlirAttribute circtMSFTAppIDAttrGet(MlirContext, MlirStringRef name,
+                                    uint64_t index);
+MLIR_CAPI_EXPORTED MlirStringRef circtMSFTAppIDAttrGetName(MlirAttribute attr);
+MLIR_CAPI_EXPORTED uint64_t circtMSFTAppIDAttrGetIndex(MlirAttribute attr);
 
 //===----------------------------------------------------------------------===//
 // PrimitiveDB.

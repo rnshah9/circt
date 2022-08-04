@@ -9,7 +9,8 @@ from pycde.devicedb import (PhysLocation, PrimitiveDB, PrimitiveType)
 
 import sys
 
-from pycde.instance import InstanceDoesNotExistError, Instance
+from pycde.instance import InstanceDoesNotExistError, Instance, RegInstance
+from pycde.module import AppID
 
 
 @pycde.externmodule
@@ -18,27 +19,85 @@ class Nothing:
 
 
 @pycde.module
+class Delay:
+  clk = pycde.Clock()
+  x = pycde.Input(pycde.types.i1)
+  y = pycde.Output(pycde.types.i1)
+
+  @pycde.generator
+  def construct(mod):
+    r = mod.x.reg(mod.clk, appid=AppID("reg", 0))
+    mod.y = r
+    # CHECK: r appid: reg[0]
+    print(f"r appid: {r.appid}")
+    r.appid = AppID("reg", 4)
+    # CHECK: r appid: reg[4]
+    print(f"r appid: {r.appid}")
+
+
+@pycde.module
 class UnParameterized:
+  clk = pycde.Clock()
   x = pycde.Input(pycde.types.i1)
   y = pycde.Output(pycde.types.i1)
 
   @pycde.generator
   def construct(mod):
     Nothing().name = "nothing_inst"
-    mod.y = mod.x
+    mod.y = Delay(clk=mod.clk, x=mod.x).y
 
 
 @pycde.module
 class Test:
-  inputs = []
-  outputs = []
+  clk = pycde.Clock()
 
   @pycde.generator
-  def build(_):
+  def build(ports):
     c1 = pycde.dialects.hw.ConstantOp(pycde.types.i1, 1)
-    UnParameterized(x=c1).name = "unparam"
-    UnParameterized(x=c1).name = "unparam"
+    UnParameterized(clk=ports.clk, x=c1, appid=AppID("unparam",
+                                                     0)).name = "unparam"
+    UnParameterized(clk=ports.clk, x=c1, appid=AppID("unparam",
+                                                     1)).name = "unparam"
 
+
+t = pycde.System([Test], name="Test", output_directory=sys.argv[1])
+t.generate(["construct"])
+t.print()
+# CHECK: msft.module @UnParameterized
+# CHECK-NOT: msft.module @UnParameterized
+Test.print()
+UnParameterized.print()
+
+print(PhysLocation(PrimitiveType.DSP, 39, 25))
+# CHECK: PhysLocation<PrimitiveType.DSP, x:39, y:25, num:0>
+
+# CHECK-LABEL: === Hierarchy
+print("=== Hierarchy")
+# CHECK-NEXT: <instance: []>
+# CHECK-NEXT: <instance: [UnParameterized]>
+# CHECK-NEXT: <instance: [UnParameterized, Nothing]>
+# CHECK-NEXT: <instance: [UnParameterized, Delay]>
+# CHECK-NEXT: <instance: [UnParameterized, Delay, x__reg1]>
+# CHECK-NEXT: <instance: [UnParameterized_1]>
+# CHECK-NEXT: <instance: [UnParameterized_1, Nothing]>
+# CHECK-NEXT: <instance: [UnParameterized_1, Delay]>
+# CHECK-NEXT: <instance: [UnParameterized_1, Delay, x__reg1]>
+test_inst = t.get_instance(Test)
+test_inst.walk(lambda inst: print(inst))
+
+reg = test_inst.unparam[0].reg[4]
+print(f"unparam[0].reg[4]: {reg}")
+# CHECK-NEXT: unparam[0].reg[4]: <instance: [UnParameterized, Delay, x__reg1]>
+print(f"unparam[0].reg[4] appid: {reg.appid}")
+# CHECK-NEXT: unparam[0].reg[4] appid: reg[4]
+
+for u in test_inst.unparam:
+  print(f"unparam list item: {u}")
+  print(f"unparam list item appid: {u.appid}")
+# CHECK-NEXT: unparam list item: <instance: [UnParameterized]>
+# CHECK-NEXT: unparam list item appid: unparam[0]
+# CHECK-NEXT: unparam list item: <instance: [UnParameterized_1]>
+# CHECK-NEXT: unparam list item appid: unparam[1]
 
 # Set up the primitive locations. Errors out if location is placed but doesn't
 # exist.
@@ -48,30 +107,9 @@ primdb.add_coords(PrimitiveType.M20K, 15, 25)
 primdb.add_coords(PrimitiveType.M20K, 40, 40)
 primdb.add_coords("DSP", 0, 10)
 primdb.add_coords(PrimitiveType.DSP, 1, 12)
+primdb.add_coords(PrimitiveType.DSP, 39, 90)
 primdb.add(PhysLocation(PrimitiveType.DSP, 39, 25))
-
-print(PhysLocation(PrimitiveType.DSP, 39, 25))
-# CHECK: PhysLocation<PrimitiveType.DSP, x:39, y:25, num:0>
-
-# CHECK: msft.module @UnParameterized
-# CHECK-NOT: msft.module @UnParameterized
-t = pycde.System([Test], name="Test", output_directory=sys.argv[1])
-t.generate(["construct"])
-t.print()
-
-Test.print()
-UnParameterized.print()
-
-# CHECK-LABEL: === Hierarchy
-print("=== Hierarchy")
-# CHECK-NEXT: <instance: []>
-# CHECK-NEXT: <instance: [UnParameterized]>
-# CHECK-NEXT: <instance: [UnParameterized, Nothing]>
-# CHECK-NEXT: <instance: [UnParameterized_1]>
-# CHECK-NEXT: <instance: [UnParameterized_1, Nothing]>
-test_inst = t.get_instance(Test)
 t.createdb(primdb)
-test_inst.walk(lambda inst: print(inst))
 
 # CHECK-LABEL: === Placements
 print("=== Placements")
@@ -109,12 +147,14 @@ test_inst["UnParameterized"].add_named_attribute("FOO", "OFF",
                                                  ["memory", "bank"])
 test_inst["UnParameterized"]["Nothing"].place(PrimitiveType.DSP, 39, 25, 0)
 
-test_inst.walk(lambda inst: print(inst, inst.locations))
-# CHECK: <instance: []> []
-# CHECK: <instance: [UnParameterized]> [(PhysLocation<PrimitiveType.M20K, x:15, y:25, num:0>, '|memory|bank')]
-# CHECK: <instance: [UnParameterized, Nothing]> [(PhysLocation<PrimitiveType.DSP, x:39, y:25, num:0>, None)]
-# CHECK: <instance: [UnParameterized_1]> [(PhysLocation<PrimitiveType.M20K, x:39, y:25, num:0>, '|memory|bank')]
-# CHECK: <instance: [UnParameterized_1, Nothing]> []
+test_inst.walk(lambda inst: print(
+    inst, inst.locations if not isinstance(inst, RegInstance) else "None"))
+# CHECK-DAG: <instance: []> []
+# CHECK-DAG: <instance: [UnParameterized]> [(PhysLocation<PrimitiveType.M20K, x:15, y:25, num:0>, '|memory|bank')]
+# CHECK-DAG: <instance: [UnParameterized, Nothing]> [(PhysLocation<PrimitiveType.DSP, x:39, y:25, num:0>, None)]
+# CHECK-DAG: <instance: [UnParameterized_1]> [(PhysLocation<PrimitiveType.M20K, x:39, y:25, num:0>, '|memory|bank')]
+# CHECK-DAG: <instance: [UnParameterized_1, Nothing]> []
+# CHECK-DAG: <instance: [UnParameterized_1, Delay, x__reg1]>
 
 # TODO: add back anonymous reservations
 
@@ -134,7 +174,8 @@ assert t.placedb.get_instance_at(PhysLocation(PrimitiveType.M20K, 0, 0,
 print("=== Force-clean all the caches and test rebuilds")
 t._op_cache.release_ops()
 
-test_inst.walk(lambda inst: print(inst, inst.locations))
+test_inst.walk(lambda inst: print(
+    inst, inst.locations if not isinstance(inst, RegInstance) else "None"))
 # CHECK: <instance: []> []
 # CHECK: <instance: [UnParameterized]> [(PhysLocation<PrimitiveType.M20K, x:15, y:25, num:0>, '|memory|bank')]
 # CHECK: <instance: [UnParameterized, Nothing]> [(PhysLocation<PrimitiveType.DSP, x:39, y:25, num:0>, None)]
@@ -143,6 +184,9 @@ test_inst.walk(lambda inst: print(inst, inst.locations))
 
 # CHECK: PhysLocation<PrimitiveType.DSP, x:39, y:25, num:0> has (<instance: [UnParameterized, Nothing]>, None)
 print(f"{loc} has {t.placedb.get_instance_at(loc)}")
+
+foo_inst = t.get_instance(Test, "foo_inst")
+foo_inst["UnParameterized"]["Nothing"].place(PrimitiveType.DSP, 39, 90, 0)
 
 print("=== Pre-pass mlir dump")
 t.print()
@@ -168,4 +212,7 @@ t.print()
 # OUTPUT-DAG:  set_instance_assignment -name FOO TRUE -to $parent|UnParameterized|Nothing
 # OUTPUT-NOT:  set_location_assignment
 # OUTPUT-NEXT: }
+# OUTPUT-LABEL: proc Test_foo_inst_config { parent } {
+# OUTPUT:         set_location_assignment MPDSP_X39_Y90_N0 -to $parent|UnParameterized|Nothing
+# OUTPUT:       }
 t.emit_outputs()

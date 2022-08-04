@@ -11,7 +11,7 @@
 #ifndef CIRCT_C_DIALECT_ESI_H
 #define CIRCT_C_DIALECT_ESI_H
 
-#include "mlir-c/Registration.h"
+#include "mlir-c/IR.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +27,9 @@ circtESIExportCosimSchema(MlirModule, MlirStringCallback, void *userData);
 MLIR_CAPI_EXPORTED bool circtESITypeIsAChannelType(MlirType type);
 MLIR_CAPI_EXPORTED MlirType circtESIChannelTypeGet(MlirType inner);
 MLIR_CAPI_EXPORTED MlirType circtESIChannelGetInner(MlirType channelType);
+
+MLIR_CAPI_EXPORTED bool circtESITypeIsAnAnyType(MlirType type);
+MLIR_CAPI_EXPORTED MlirType circtESIAnyTypeGet(MlirContext);
 
 MLIR_CAPI_EXPORTED MlirOperation circtESIWrapModule(MlirOperation cModOp,
                                                     long numPorts,

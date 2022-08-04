@@ -21,6 +21,7 @@
 #include "circt/Support/LLVM.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/StringMap.h"
 
 using namespace circt;
 using namespace firrtl;
@@ -58,8 +59,7 @@ static PrefixInfo getPrefixInfo(Operation *module) {
   AnnotationSet annotations(module);
 
   // Get the annotation from the module.
-  auto anno = annotations.getAnnotation(
-      "sifive.enterprise.firrtl.NestedPrefixModulesAnnotation");
+  auto anno = annotations.getAnnotation(prefixModulesAnnoClass);
   if (!anno)
     return {"", false};
 
@@ -107,7 +107,9 @@ class PrefixModulesPass : public PrefixModulesBase<PrefixModulesPass> {
   /// This is a map from a module name to new prefixes to be applied.
   PrefixMap prefixMap;
 
-  DenseMap<StringRef, uint32_t> prefixIdMap;
+  /// Map prefix to group ID.
+  /// Store strings in the map, they may not stay alive.
+  llvm::StringMap<uint32_t> prefixIdMap;
 
   /// A map of Grand Central interface ID to prefix.
   DenseMap<Attribute, std::string> interfacePrefixMap;
@@ -140,7 +142,7 @@ void PrefixModulesPass::removeDeadAnnotations(StringAttr moduleName,
     auto nlaName = nla.cast<FlatSymbolRefAttr>().getAttr();
     auto nlaOp = nlaTable->getNLA(nlaName);
     if (!nlaOp) {
-      op->emitError("cannot find NonLocalAnchor :" + nlaName.getValue());
+      op->emitError("cannot find HierPathOp :" + nlaName.getValue());
       signalPassFailure();
       return false;
     }
@@ -168,7 +170,7 @@ void PrefixModulesPass::renameModuleBody(std::string prefix, FModuleOp module) {
     groupID = prefixIdMap.size() + 1;
     prefixIdMap[prefix] = groupID;
   } else
-    groupID = iter->getSecond();
+    groupID = iter->second;
 
   // If we are renaming the body of this module, we need to mark that we have
   // changed the IR. If we are prefixing with the empty string, then nothing has
@@ -182,14 +184,14 @@ void PrefixModulesPass::renameModuleBody(std::string prefix, FModuleOp module) {
   // on the instance.
   removeDeadAnnotations(thisMod, module);
 
-  module.body().walk([&](Operation *op) {
+  module.getBody().walk([&](Operation *op) {
     // Remove spurious NLA references either on a leaf op, or the InstanceOp.
     removeDeadAnnotations(thisMod, op);
 
     if (auto memOp = dyn_cast<MemOp>(op)) {
       // Memories will be turned into modules and should be prefixed.
-      memOp.nameAttr(StringAttr::get(context, prefix + memOp.name()));
-      memOp.groupIDAttr(IntegerAttr::get(
+      memOp.setNameAttr(StringAttr::get(context, prefix + memOp.getName()));
+      memOp.setGroupIDAttr(IntegerAttr::get(
           IntegerType::get(context, 32, IntegerType::Unsigned), groupID));
     } else if (auto instanceOp = dyn_cast<InstanceOp>(op)) {
       auto target = dyn_cast<FModuleLike>(
@@ -216,10 +218,10 @@ void PrefixModulesPass::renameModuleBody(std::string prefix, FModuleOp module) {
       auto newTarget = StringAttr::get(context, prefix + getPrefix(target) +
                                                     target.moduleName());
       AnnotationSet instAnnos(instanceOp);
-      // If the instance has NonLocalAnchor, then update its module name also.
-      // There can be multiple NonLocalAnchors attached to the instance op.
+      // If the instance has HierPathOp, then update its module name also.
+      // There can be multiple HierPathOps attached to the instance op.
 
-      StringAttr oldModName = instanceOp.moduleNameAttr().getAttr();
+      StringAttr oldModName = instanceOp.getModuleNameAttr().getAttr();
       // Update the NLAs that apply on this InstanceOp.
       for (Annotation anno : instAnnos) {
         if (auto nla = anno.getMember("circt.nonlocal")) {
@@ -228,12 +230,12 @@ void PrefixModulesPass::renameModuleBody(std::string prefix, FModuleOp module) {
         }
       }
       // Now get the NLAs that pass through the InstanceOp and update them also.
-      DenseSet<NonLocalAnchor> instNLAs;
+      DenseSet<HierPathOp> instNLAs;
       nlaTable->getInstanceNLAs(instanceOp, instNLAs);
       for (auto nla : instNLAs)
         nlaTable->updateModuleInNLA(nla, oldModName, newTarget);
 
-      instanceOp.moduleNameAttr(FlatSymbolRefAttr::get(context, newTarget));
+      instanceOp.setModuleNameAttr(FlatSymbolRefAttr::get(context, newTarget));
     }
   });
 }
@@ -247,8 +249,7 @@ void PrefixModulesPass::renameModule(FModuleOp module) {
   auto innerPrefix = prefixInfo.prefix;
 
   // Remove the annotation from the module.
-  AnnotationSet::removeAnnotations(
-      module, "sifive.enterprise.firrtl.NestedPrefixModulesAnnotation");
+  AnnotationSet::removeAnnotations(module, prefixModulesAnnoClass);
 
   // We only add the annotated prefix to the module name if it is inclusive.
   auto moduleName = module.getName().str();
@@ -267,7 +268,7 @@ void PrefixModulesPass::renameModule(FModuleOp module) {
   auto &firstPrefix = prefixes.front();
 
   auto fixNLAsRootedAt = [&](StringAttr oldModName, StringAttr newModuleName) {
-    DenseSet<NonLocalAnchor> nlas;
+    DenseSet<HierPathOp> nlas;
     nlaTable->getNLAsInModule(oldModName, nlas);
     for (auto n : nlas)
       if (n.root() == oldModName)
@@ -358,9 +359,8 @@ void PrefixModulesPass::renameExtModule(FExtModuleOp extModule) {
   auto applyPrefixToNameAndDefName = [&](FExtModuleOp &extModule,
                                          StringRef prefix) {
     extModule.setName((prefix + extModule.getName()).str());
-    if (auto defname = extModule.defname())
-      extModule->setAttr("defname",
-                         builder.getStringAttr(prefix + defname.getValue()));
+    if (auto defname = extModule.getDefname())
+      extModule->setAttr("defname", builder.getStringAttr(prefix + *defname));
   };
 
   // Duplicate the external module if there is more than one prefix.
@@ -414,7 +414,7 @@ void PrefixModulesPass::prefixGrandCentralInterfaces() {
     // Only mutate this annotation if it is an AugmentedBundleType and
     // interfacePrefixMap has prefix information for it.
     StringRef prefix;
-    if (anno.isClass("sifive.enterprise.grandcentral.AugmentedBundleType")) {
+    if (anno.isClass(augmentedBundleTypeClass)) {
       if (auto id = anno.getMember<IntegerAttr>("id"))
         prefix = interfacePrefixMap[id];
     }
@@ -451,8 +451,8 @@ void PrefixModulesPass::runOnOperation() {
   if (!prefix.empty()) {
     auto oldModName = mainModule.moduleNameAttr();
     auto newMainModuleName =
-        StringAttr::get(context, (prefix + circuitOp.name()).str());
-    circuitOp.nameAttr(newMainModuleName);
+        StringAttr::get(context, (prefix + circuitOp.getName()).str());
+    circuitOp.setNameAttr(newMainModuleName);
 
     // Now update all the NLAs that have the top level module symbol.
     nlaTable->renameModule(oldModName, newMainModuleName);
@@ -479,6 +479,7 @@ void PrefixModulesPass::runOnOperation() {
   prefixGrandCentralInterfaces();
 
   prefixMap.clear();
+  prefixIdMap.clear();
   interfacePrefixMap.clear();
   if (!anythingChanged)
     markAllAnalysesPreserved();

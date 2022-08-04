@@ -6,6 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/MSFT/MSFTPasses.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
@@ -66,7 +67,8 @@ namespace {
 struct LowerInstancesPass : public LowerInstancesBase<LowerInstancesPass> {
   void runOnOperation() override;
 
-  LogicalResult lower(DynamicInstanceOp inst, OpBuilder &b);
+  LogicalResult lower(DynamicInstanceOp inst, InstanceHierarchyOp hier,
+                      OpBuilder &b);
 
   // Aggregation of the global ref attributes populated as a side-effect of the
   // conversion.
@@ -100,7 +102,9 @@ const SymbolCache &LowerInstancesPass::getSyms(MSFTModuleOp mod) {
   return syms;
 }
 
-LogicalResult LowerInstancesPass::lower(DynamicInstanceOp inst, OpBuilder &b) {
+LogicalResult LowerInstancesPass::lower(DynamicInstanceOp inst,
+                                        InstanceHierarchyOp hier,
+                                        OpBuilder &b) {
 
   hw::GlobalRefOp ref = nullptr;
 
@@ -155,11 +159,12 @@ LogicalResult LowerInstancesPass::lower(DynamicInstanceOp inst, OpBuilder &b) {
   }
 
   // Relocate all my children.
+  OpBuilder hierBlock(&hier.body().getBlocks().front().front());
   for (Operation &op : llvm::make_early_inc_range(inst.getOps())) {
     // Child instances should have been lowered already.
     assert(!isa<DynamicInstanceOp>(op));
     op.remove();
-    b.insert(&op);
+    hierBlock.insert(&op);
 
     // Assign a ref for ops which need it.
     if (auto specOp = dyn_cast<DynInstDataOpInterface>(op)) {
@@ -183,16 +188,16 @@ void LowerInstancesPass::runOnOperation() {
 
   // Find all of the InstanceHierarchyOps.
   for (Operation &op : llvm::make_early_inc_range(top.getOps())) {
-    if (!isa<InstanceHierarchyOp>(op))
+    auto instHierOp = dyn_cast<InstanceHierarchyOp>(op);
+    if (!instHierOp)
       continue;
     builder.setInsertionPoint(&op);
     // Walk the child dynamic instances in _post-order_ so we lower and delete
     // the children first.
-    op.walk<mlir::WalkOrder::PostOrder>([&](DynamicInstanceOp inst) {
-      if (failed(lower(inst, builder)))
+    instHierOp->walk<mlir::WalkOrder::PostOrder>([&](DynamicInstanceOp inst) {
+      if (failed(lower(inst, instHierOp, builder)))
         ++numFailed;
     });
-    op.erase();
   }
   if (numFailed)
     signalPassFailure();
@@ -305,7 +310,8 @@ ModuleOpLowering::matchAndRewrite(MSFTModuleOp mod, OpAdaptor adaptor,
   }
 
   ArrayAttr params = rewriter.getArrayAttr({hw::ParamDeclAttr::get(
-      rewriter.getStringAttr("__INST_HIER"), rewriter.getNoneType())});
+      rewriter.getStringAttr("__INST_HIER"),
+      rewriter.getStringAttr("INSTANTIATE_WITH_INSTANCE_PATH"))});
   auto hwmod = rewriter.replaceOpWithNewOp<hw::HWModuleOp>(
       mod, mod.getNameAttr(), mod.getPorts(), params);
   rewriter.eraseBlock(hwmod.getBodyBlock());
@@ -347,7 +353,7 @@ LogicalResult ModuleExternOpLowering::matchAndRewrite(
     MSFTModuleExternOp mod, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   auto hwMod = rewriter.replaceOpWithNewOp<hw::HWModuleExternOp>(
-      mod, mod.getNameAttr(), mod.getPorts(), mod.verilogName().getValueOr(""),
+      mod, mod.getNameAttr(), mod.getPorts(), mod.verilogName().value_or(""),
       mod.parameters());
 
   if (!outputFile.empty()) {
@@ -423,7 +429,8 @@ void LowerToHWPass::runOnOperation() {
 
   // Then, convert the InstanceOps
   target.addDynamicallyLegalDialect<MSFTDialect>([](Operation *op) {
-    return isa<DynInstDataOpInterface, DeclPhysicalRegionOp>(op);
+    return isa<DynInstDataOpInterface, DeclPhysicalRegionOp,
+               InstanceHierarchyOp>(op);
   });
   RewritePatternSet instancePatterns(ctxt);
   instancePatterns.insert<InstanceOpLowering>(ctxt);
@@ -446,24 +453,15 @@ std::unique_ptr<Pass> createLowerToHWPass() {
 namespace {
 template <typename PhysOpTy>
 struct RemovePhysOpLowering : public OpConversionPattern<PhysOpTy> {
+  using OpConversionPattern<PhysOpTy>::OpConversionPattern;
   using OpAdaptor = typename OpConversionPattern<PhysOpTy>::OpAdaptor;
-
-  RemovePhysOpLowering(MLIRContext *ctxt, DenseSet<SymbolRefAttr> &refsUsed)
-      : OpConversionPattern<PhysOpTy>::OpConversionPattern(ctxt),
-        refsUsed(refsUsed) {}
 
   LogicalResult
   matchAndRewrite(PhysOpTy op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
-    SymbolRefAttr refSym = op->template getAttrOfType<FlatSymbolRefAttr>("ref");
-    if (refSym)
-      refsUsed.insert(refSym);
     rewriter.eraseOp(op);
     return success();
   }
-
-private:
-  DenseSet<SymbolRefAttr> &refsUsed;
 };
 } // anonymous namespace
 
@@ -501,18 +499,17 @@ void ExportTclPass::runOnOperation() {
   target.addLegalDialect<sv::SVDialect>();
 
   RewritePatternSet patterns(ctxt);
-  DenseSet<SymbolRefAttr> refsUsed;
-  patterns.insert<RemovePhysOpLowering<PDPhysLocationOp>>(ctxt, refsUsed);
-  patterns.insert<RemovePhysOpLowering<PDRegPhysLocationOp>>(ctxt, refsUsed);
-  patterns.insert<RemovePhysOpLowering<PDPhysRegionOp>>(ctxt, refsUsed);
-  patterns.insert<RemovePhysOpLowering<DynamicInstanceVerbatimAttrOp>>(
-      ctxt, refsUsed);
+  patterns.insert<RemovePhysOpLowering<PDPhysLocationOp>>(ctxt);
+  patterns.insert<RemovePhysOpLowering<PDRegPhysLocationOp>>(ctxt);
+  patterns.insert<RemovePhysOpLowering<PDPhysRegionOp>>(ctxt);
+  patterns.insert<RemovePhysOpLowering<InstanceHierarchyOp>>(ctxt);
+  patterns.insert<RemovePhysOpLowering<DynamicInstanceVerbatimAttrOp>>(ctxt);
   patterns.insert<RemoveOpLowering<DeclPhysicalRegionOp>>(ctxt);
   if (failed(applyPartialConversion(top, target, std::move(patterns))))
     signalPassFailure();
 
   target.addDynamicallyLegalOp<hw::GlobalRefOp>([&](hw::GlobalRefOp ref) {
-    return !refsUsed.contains(SymbolRefAttr::get(ref));
+    return !emitter.getRefsUsed().contains(ref);
   });
   patterns.clear();
   patterns.insert<RemoveOpLowering<hw::GlobalRefOp>>(ctxt);
@@ -533,28 +530,21 @@ std::unique_ptr<Pass> createExportTclPass() {
 //===----------------------------------------------------------------------===//
 
 namespace {
-struct PassCommon {
+struct MSFTPassCommon : PassCommon {
 protected:
-  SymbolCache topLevelSyms;
-  DenseMap<MSFTModuleOp, SmallVector<InstanceOp, 1>> moduleInstantiations;
-
-  LogicalResult verifyInstances(ModuleOp topMod);
-
-  // Find all the modules and use the partial order of the instantiation DAG
-  // to sort them. If we use this order when "bubbling" up operations, we
-  // guarantee one-pass completeness. As a side-effect, populate the module to
-  // instantiation sites mapping.
-  //
-  // Assumption (unchecked): there is not a cycle in the instantiation graph.
-  void getAndSortModules(ModuleOp topMod, SmallVectorImpl<MSFTModuleOp> &mods);
-  void getAndSortModulesVisitor(MSFTModuleOp mod,
-                                SmallVectorImpl<MSFTModuleOp> &mods,
-                                DenseSet<MSFTModuleOp> &modsSeen);
-
-  SmallVector<InstanceOp, 1> &updateInstances(
+  /// Update all the instantiations of 'mod' to match the port list. For any
+  /// output ports which survived, automatically map the result according to
+  /// `newToOldResultMap`. Calls 'getOperandsFunc' with the new instance op, the
+  /// old instance op, and expects the operand vector to return filled.
+  /// `getOperandsFunc` can (and often does) modify other operations. The update
+  /// call deletes the original instance op, so all references are invalidated
+  /// after this call.
+  SmallVector<InstanceOp, 1> updateInstances(
       MSFTModuleOp mod, ArrayRef<unsigned> newToOldResultMap,
       llvm::function_ref<void(InstanceOp, InstanceOp, SmallVectorImpl<Value> &)>
           getOperandsFunc);
+
+  void getAndSortModules(ModuleOp topMod, SmallVectorImpl<MSFTModuleOp> &mods);
 
   void bubbleWiresUp(MSFTModuleOp mod);
   void dedupOutputs(MSFTModuleOp mod);
@@ -571,21 +561,21 @@ static bool isWireManipulationOp(Operation *op) {
              hw::ConstantOp>(op);
 }
 
-/// Update all the instantiations of 'mod' to match the port list. For any
-/// output ports which survived, automatically map the result according to
-/// `newToOldResultMap`. Calls 'getOperandsFunc' with the new instance op, the
-/// old instance op, and expects the operand vector to return filled.
-/// `getOperandsFunc` can (and often does) modify other operations. The update
-/// call deletes the original instance op, so all references are invalidated
-/// after this call.
-SmallVector<InstanceOp, 1> &PassCommon::updateInstances(
+SmallVector<InstanceOp, 1> MSFTPassCommon::updateInstances(
     MSFTModuleOp mod, ArrayRef<unsigned> newToOldResultMap,
     llvm::function_ref<void(InstanceOp, InstanceOp, SmallVectorImpl<Value> &)>
         getOperandsFunc) {
 
-  SmallVector<InstanceOp, 1> newInstances;
-  for (InstanceOp inst : moduleInstantiations[mod]) {
-    assert(inst->getParentOp());
+  SmallVector<hw::HWInstanceLike, 1> newInstances;
+  SmallVector<InstanceOp, 1> newMsftInstances;
+  for (hw::HWInstanceLike instLike : moduleInstantiations[mod]) {
+    assert(instLike->getParentOp());
+    auto inst = dyn_cast<InstanceOp>(instLike.getOperation());
+    if (!inst) {
+      instLike.emitWarning("Can not update hw.instance ops");
+      continue;
+    }
+
     OpBuilder b(inst);
     auto newInst = b.create<InstanceOp>(inst.getLoc(), mod.getResultTypes(),
                                         inst.getOperands(), inst->getAttrs());
@@ -600,41 +590,55 @@ SmallVector<InstanceOp, 1> &PassCommon::updateInstances(
             .replaceAllUsesWith(newInst.getResult(oldResult.index()));
 
     newInstances.push_back(newInst);
+    newMsftInstances.push_back(newInst);
     inst->dropAllUses();
     inst->erase();
   }
   moduleInstantiations[mod].swap(newInstances);
-  return moduleInstantiations[mod];
+  return newMsftInstances;
 }
 
 // Run a post-order DFS.
-void PassCommon::getAndSortModulesVisitor(MSFTModuleOp mod,
-                                          SmallVectorImpl<MSFTModuleOp> &mods,
-                                          DenseSet<MSFTModuleOp> &modsSeen) {
+void PassCommon::getAndSortModulesVisitor(
+    hw::HWModuleLike mod, SmallVectorImpl<hw::HWModuleLike> &mods,
+    DenseSet<Operation *> &modsSeen) {
   if (modsSeen.contains(mod))
     return;
   modsSeen.insert(mod);
 
-  mod.walk([&](InstanceOp inst) {
-    Operation *modOp = topLevelSyms.getDefinition(inst.moduleNameAttr());
-    auto mod = dyn_cast_or_null<MSFTModuleOp>(modOp);
-    if (!mod)
-      return;
-    moduleInstantiations[mod].push_back(inst);
-    getAndSortModulesVisitor(mod, mods, modsSeen);
+  mod.walk([&](hw::HWInstanceLike inst) {
+    Operation *modOp =
+        topLevelSyms.getDefinition(inst.referencedModuleNameAttr());
+    assert(modOp);
+    moduleInstantiations[modOp].push_back(inst);
+    if (auto modLike = dyn_cast<hw::HWModuleLike>(modOp))
+      getAndSortModulesVisitor(modLike, mods, modsSeen);
   });
 
   mods.push_back(mod);
 }
 
+void MSFTPassCommon::getAndSortModules(ModuleOp topMod,
+                                       SmallVectorImpl<MSFTModuleOp> &mods) {
+  SmallVector<hw::HWModuleLike, 16> moduleLikes;
+  PassCommon::getAndSortModules(topMod, moduleLikes);
+  mods.clear();
+  for (auto modLike : moduleLikes) {
+    auto mod = dyn_cast<MSFTModuleOp>(modLike.getOperation());
+    if (mod)
+      mods.push_back(mod);
+  }
+}
+
 void PassCommon::getAndSortModules(ModuleOp topMod,
-                                   SmallVectorImpl<MSFTModuleOp> &mods) {
+                                   SmallVectorImpl<hw::HWModuleLike> &mods) {
   // Add here _before_ we go deeper to prevent infinite recursion.
-  DenseSet<MSFTModuleOp> modsSeen;
+  DenseSet<Operation *> modsSeen;
   mods.clear();
   moduleInstantiations.clear();
-  topMod.walk(
-      [&](MSFTModuleOp mod) { getAndSortModulesVisitor(mod, mods, modsSeen); });
+  topMod.walk([&](hw::HWModuleLike mod) {
+    getAndSortModulesVisitor(mod, mods, modsSeen);
+  });
 }
 
 LogicalResult PassCommon::verifyInstances(mlir::ModuleOp mod) {
@@ -652,7 +656,7 @@ LogicalResult PassCommon::verifyInstances(mlir::ModuleOp mod) {
 }
 
 namespace {
-struct PartitionPass : public PartitionBase<PartitionPass>, PassCommon {
+struct PartitionPass : public PartitionBase<PartitionPass>, MSFTPassCommon {
   void runOnOperation() override;
 
 private:
@@ -918,7 +922,7 @@ static StringRef getValueName(Value v, const SymbolCache &syms,
   }
   if (auto constOp = dyn_cast<hw::ConstantOp>(defOp)) {
     buff.clear();
-    llvm::raw_string_ostream(buff) << "c" << constOp.value();
+    llvm::raw_string_ostream(buff) << "c" << constOp.getValue();
     return buff;
   }
 
@@ -992,7 +996,7 @@ void PartitionPass::bubbleUpGlobalRefs(
     auto globalRefOp = dyn_cast_or_null<hw::GlobalRefOp>(
         topLevelSyms.getDefinition(refSymbol));
     assert(globalRefOp && "symbol must reference a GlobalRefOp");
-    auto oldPath = globalRefOp.namepath().getValue();
+    auto oldPath = globalRefOp.getNamepath().getValue();
     assert(!oldPath.empty());
 
     // If the path already points to the target design partition, we are done.
@@ -1038,7 +1042,7 @@ void PartitionPass::bubbleUpGlobalRefs(
 
     // Update the path on the GlobalRefOp.
     auto newPathAttr = ArrayAttr::get(op->getContext(), newPath);
-    globalRefOp.namepathAttr(newPathAttr);
+    globalRefOp.setNamepathAttr(newPathAttr);
 
     refsMoved.insert(globalRef);
   }
@@ -1058,7 +1062,7 @@ void PartitionPass::pushDownGlobalRefs(
     auto globalRefOp = dyn_cast_or_null<hw::GlobalRefOp>(
         topLevelSyms.getDefinition(refSymbol));
     assert(globalRefOp && "symbol must reference a GlobalRefOp");
-    auto oldPath = globalRefOp.namepath().getValue();
+    auto oldPath = globalRefOp.getNamepath().getValue();
     assert(!oldPath.empty());
 
     // Get the module containing the partition and the partition's name.
@@ -1107,7 +1111,7 @@ void PartitionPass::pushDownGlobalRefs(
 
     // Update the path on the GlobalRefOp.
     auto newPathAttr = ArrayAttr::get(op->getContext(), newPath);
-    globalRefOp.namepathAttr(newPathAttr);
+    globalRefOp.setNamepathAttr(newPathAttr);
 
     // Ensure the part instance will have this GlobalRefAttr.
     // global refs if not.
@@ -1398,9 +1402,8 @@ MSFTModuleOp PartitionPass::partition(DesignPartitionOp partOp,
   SmallVector<Type> instRetTypes(
       llvm::map_range(newOutputs, [](Value v) { return v.getType(); }));
   auto partInst = OpBuilder(partOp).create<InstanceOp>(
-      loc, instRetTypes, partOp.getNameAttr(),
-      SymbolTable::getSymbolName(partMod), instInputs, ArrayAttr(),
-      SymbolRefAttr());
+      loc, instRetTypes, partOp.getNameAttr(), FlatSymbolRefAttr::get(partMod),
+      instInputs);
   moduleInstantiations[partMod].push_back(partInst);
 
   // And set the outputs properly.
@@ -1433,7 +1436,8 @@ std::unique_ptr<Pass> createPartitionPass() {
 } // namespace circt
 
 namespace {
-struct WireCleanupPass : public WireCleanupBase<WireCleanupPass>, PassCommon {
+struct WireCleanupPass : public WireCleanupBase<WireCleanupPass>,
+                         MSFTPassCommon {
   void runOnOperation() override;
 };
 } // anonymous namespace
@@ -1461,7 +1465,7 @@ void WireCleanupPass::runOnOperation() {
 }
 
 /// Remove outputs driven by the same value.
-void PassCommon::dedupOutputs(MSFTModuleOp mod) {
+void MSFTPassCommon::dedupOutputs(MSFTModuleOp mod) {
   Block *body = mod.getBodyBlock();
   Operation *terminator = body->getTerminator();
 
@@ -1493,7 +1497,7 @@ void PassCommon::dedupOutputs(MSFTModuleOp mod) {
 }
 
 /// Push up any wires which are simply passed-through.
-void PassCommon::bubbleWiresUp(MSFTModuleOp mod) {
+void MSFTPassCommon::bubbleWiresUp(MSFTModuleOp mod) {
   Block *body = mod.getBodyBlock();
   Operation *terminator = body->getTerminator();
   hw::ModulePortInfo ports = mod.getPorts();
@@ -1558,13 +1562,16 @@ void PassCommon::bubbleWiresUp(MSFTModuleOp mod) {
   updateInstances(mod, newToOldResult, setPassthroughsGetOperands);
 }
 
-void PassCommon::dedupInputs(MSFTModuleOp mod) {
-  auto instantiations = moduleInstantiations[mod];
+void MSFTPassCommon::dedupInputs(MSFTModuleOp mod) {
+  const auto &instantiations = moduleInstantiations[mod];
   // TODO: remove this limitation. This would involve looking at the common
   // loopbacks for all the instances.
   if (instantiations.size() != 1)
     return;
-  InstanceOp inst = instantiations[0];
+  InstanceOp inst =
+      dyn_cast<InstanceOp>(static_cast<Operation *>(instantiations[0]));
+  if (!inst)
+    return;
 
   // Find all the arguments which are driven by the same signal. Remap them
   // appropriately within the module, and mark that input port for deletion.
@@ -1595,8 +1602,7 @@ void PassCommon::dedupInputs(MSFTModuleOp mod) {
       if (!argsToErase.test(argNum))
         newOperands.push_back(oldInst.getOperand(argNum));
   };
-  instantiations = updateInstances(mod, remappedResults, getOperands);
-  inst = instantiations[0];
+  inst = updateInstances(mod, remappedResults, getOperands)[0];
 
   SmallVector<Attribute, 32> newArgNames;
   std::string buff;
@@ -1608,13 +1614,16 @@ void PassCommon::dedupInputs(MSFTModuleOp mod) {
 }
 
 /// Sink all the instance connections which are loops.
-void PassCommon::sinkWiresDown(MSFTModuleOp mod) {
-  auto instantiations = moduleInstantiations[mod];
+void MSFTPassCommon::sinkWiresDown(MSFTModuleOp mod) {
+  const auto &instantiations = moduleInstantiations[mod];
   // TODO: remove this limitation. This would involve looking at the common
   // loopbacks for all the instances.
   if (instantiations.size() != 1)
     return;
-  InstanceOp inst = instantiations[0];
+  InstanceOp inst =
+      dyn_cast<InstanceOp>(static_cast<Operation *>(instantiations[0]));
+  if (!inst)
+    return;
 
   // Find all the "loopback" connections in the instantiation. Populate
   // 'inputToOutputLoopback' with a mapping of input port to output port which
@@ -1852,6 +1861,95 @@ std::unique_ptr<Pass> createLowerConstructsPass() {
 } // namespace msft
 } // namespace circt
 
+//===----------------------------------------------------------------------===//
+// Discover AppIDs pass
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct DiscoverAppIDsPass : public DiscoverAppIDsBase<DiscoverAppIDsPass>,
+                            MSFTPassCommon {
+  void runOnOperation() override;
+  void processMod(MSFTModuleOp);
+};
+} // anonymous namespace
+
+void DiscoverAppIDsPass::runOnOperation() {
+  ModuleOp topMod = getOperation();
+  topLevelSyms.addDefinitions(topMod);
+  if (failed(verifyInstances(topMod))) {
+    signalPassFailure();
+    return;
+  }
+
+  // Sort modules in partial order be use. Enables single-pass processing.
+  SmallVector<MSFTModuleOp> sortedMods;
+  getAndSortModules(topMod, sortedMods);
+
+  for (MSFTModuleOp mod : sortedMods)
+    processMod(mod);
+}
+
+/// Find the AppIDs in a given module.
+void DiscoverAppIDsPass::processMod(MSFTModuleOp mod) {
+  SmallDenseMap<StringAttr, uint64_t> appBaseCounts;
+  SmallPtrSet<StringAttr, 32> localAppIDBases;
+  SmallDenseMap<AppIDAttr, Operation *> localAppIDs;
+
+  mod.walk([&](Operation *op) {
+    // If an operation has an "appid" dialect attribute, it is considered a
+    // "local" appid.
+    if (auto appid = op->getAttrOfType<AppIDAttr>("msft.appid")) {
+      if (localAppIDs.find(appid) != localAppIDs.end()) {
+        op->emitOpError("Found multiple identical AppIDs in same module")
+                .attachNote(localAppIDs[appid]->getLoc())
+            << "first AppID located here";
+        signalPassFailure();
+      } else {
+        localAppIDs[appid] = op;
+      }
+      localAppIDBases.insert(appid.getName());
+    }
+
+    // Instance ops should expose their module's AppIDs recursively. Track the
+    // number of instances which contain a base name.
+    if (auto inst = dyn_cast<InstanceOp>(op)) {
+      auto targetMod = dyn_cast<MSFTModuleOp>(
+          topLevelSyms.getDefinition(inst.moduleNameAttr()));
+      if (targetMod && targetMod.childAppIDBases())
+        for (auto base :
+             targetMod.childAppIDBasesAttr().getAsRange<StringAttr>())
+          appBaseCounts[base] += 1;
+    }
+  });
+
+  // Collect the list of AppID base names with which to annotate 'mod'.
+  SmallVector<Attribute, 32> finalModBases;
+  for (auto baseCount : appBaseCounts) {
+    // If multiple instances expose the same base name, don't expose them
+    // through this module. If any of the instances expose basenames which are
+    // exposed locally, also don't expose them up.
+    if (baseCount.getSecond() == 1 &&
+        !localAppIDBases.contains(baseCount.getFirst()))
+      finalModBases.push_back(baseCount.getFirst());
+  }
+
+  // Add all of the local base names.
+  for (StringAttr lclBase : localAppIDBases)
+    finalModBases.push_back(lclBase);
+
+  if (finalModBases.empty())
+    return;
+  ArrayAttr childrenBases = ArrayAttr::get(mod.getContext(), finalModBases);
+  mod.childAppIDBasesAttr(childrenBases);
+}
+
+namespace circt {
+namespace msft {
+std::unique_ptr<Pass> createDiscoverAppIDsPass() {
+  return std::make_unique<DiscoverAppIDsPass>();
+}
+} // namespace msft
+} // namespace circt
 namespace {
 #define GEN_PASS_REGISTRATION
 #include "circt/Dialect/MSFT/MSFTPasses.h.inc"

@@ -1,7 +1,7 @@
-// RUN: circt-opt %s -verify-diagnostics | circt-opt -verify-diagnostics | FileCheck %s
+// RUN: circt-opt %s --verify-diagnostics --split-input-file | circt-opt --verify-diagnostics | FileCheck %s
 
-// CHECK: calyx.program "main" {
-calyx.program "main" {
+// CHECK: module attributes {calyx.entrypoint = "main"} {
+module attributes {calyx.entrypoint = "main"} {
   // CHECK-LABEL: calyx.component @A(%in: i8, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out: i8, %done: i1 {done}) {
   calyx.component @A(%in: i8, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out: i8, %done: i1 {done}) {
     %c1_1 = hw.constant 1 : i1
@@ -21,7 +21,7 @@ calyx.program "main" {
     // CHECK:      %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
     // CHECK-NEXT: %r2.in, %r2.write_en, %r2.clk, %r2.reset, %r2.out, %r2.done = calyx.register @r2 : i1, i1, i1, i1, i1, i1
     // CHECK-NEXT: %mu.clk, %mu.reset, %mu.go, %mu.left, %mu.right, %mu.out, %mu.done = calyx.std_mult_pipe @mu : i1, i1, i1, i32, i32, i32, i1
-    // CHECK-NEXT: %du.clk, %du.reset, %du.go, %du.left, %du.right, %du.out_quotient, %du.out_remainder, %du.done = calyx.std_div_pipe @du : i1, i1, i1, i32, i32, i32, i32, i1
+    // CHECK-NEXT: %du.clk, %du.reset, %du.go, %du.left, %du.right, %du.out_quotient, %du.done = calyx.std_divu_pipe @du : i1, i1, i1, i32, i32, i32, i1
     // CHECK-NEXT: %m.addr0, %m.addr1, %m.write_data, %m.write_en, %m.clk, %m.read_data, %m.done = calyx.memory @m <[64, 64] x 8> [6, 6] : i6, i6, i8, i1, i1, i8, i1
     // CHECK-NEXT: %c0.in, %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i8, i1, i1, i1, i8, i1
     // CHECK-NEXT: %c1.in, %c1.go, %c1.clk, %c1.reset, %c1.out, %c1.done = calyx.instance @c1 of @A : i8, i1, i1, i1, i8, i1
@@ -35,7 +35,7 @@ calyx.program "main" {
     %r.in, %r.write_en, %r.clk, %r.reset, %r.out, %r.done = calyx.register @r : i8, i1, i1, i1, i8, i1
     %r2.in, %r2.write_en, %r2.clk, %r2.reset, %r2.out, %r2.done = calyx.register @r2 : i1, i1, i1, i1, i1, i1
     %mu.clk, %mu.reset, %mu.go, %mu.lhs, %mu.rhs, %mu.out, %mu.done = calyx.std_mult_pipe @mu : i1, i1, i1, i32, i32, i32, i1
-    %du.clk, %du.reset, %du.go, %du.left, %du.right, %du.out_quotient, %du.out_remainder, %du.done = calyx.std_div_pipe @du : i1, i1, i1, i32, i32, i32, i32, i1
+    %du.clk, %du.reset, %du.go, %du.left, %du.right, %du.out, %du.done = calyx.std_divu_pipe @du : i1, i1, i1, i32, i32, i32, i1
     %m.addr0, %m.addr1, %m.write_data, %m.write_en, %m.clk, %m.read_data, %m.done = calyx.memory @m <[64, 64] x 8> [6, 6] : i6, i6, i8, i1, i1, i8, i1
     %c0.in, %c0.go, %c0.clk, %c0.reset, %c0.out, %c0.done = calyx.instance @c0 of @A : i8, i1, i1, i1, i8, i1
     %c1.in, %c1.go, %c1.clk, %c1.reset, %c1.out, %c1.done = calyx.instance @c1 of @A : i8, i1, i1, i1, i8, i1
@@ -133,4 +133,63 @@ calyx.program "main" {
       }
     }
   }
+}
+
+// -----
+// CHECK: module attributes {calyx.entrypoint = "A"} {
+module attributes {calyx.entrypoint = "A"} {
+  // CHECK: hw.module.extern @prim(%in: i32) -> (out: i32) attributes {filename = "test.v"}
+  hw.module.extern @prim(%in: i32) -> (out: i32) attributes {filename = "test.v"}
+
+  // CHECK: hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>) attributes {filename = "test.v"}
+  hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>) attributes {filename = "test.v"}
+
+  // CHECK-LABEL: calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done})
+  calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done}) {
+    // CHECK: %true = hw.constant true
+    %c1_1 = hw.constant 1 : i1
+    // CHECK-NEXT: %params_0.in, %params_0.out = calyx.primitive @params_0 of @params<WIDTH: i32 = 32> : i32, i32
+    %params_0.in, %params_0.out = calyx.primitive @params_0 of @params<WIDTH: i32 = 32> : i32, i32
+    // CHECK-NEXT: %prim_0.in, %prim_0.out = calyx.primitive @prim_0 of @prim : i32, i32
+    %prim_0.in, %prim_0.out = calyx.primitive @prim_0 of @prim : i32, i32
+
+    calyx.wires {
+      // CHECK: calyx.assign %done = %true : i1
+      calyx.assign %done = %c1_1 : i1
+      // CHECK-NEXT: calyx.assign %params_0.in = %in_0 : i32
+      calyx.assign %params_0.in = %in_0 : i32
+      // CHECK-NEXT: calyx.assign %out_0 = %params_0.out : i32
+      calyx.assign %out_0 = %params_0.out : i32
+      // CHECK-NEXT: calyx.assign %prim_0.in = %in_1 : i32
+      calyx.assign %prim_0.in = %in_1 : i32
+      // CHECK-NEXT: calyx.assign %out_1 = %prim_0.out : i32
+      calyx.assign %out_1 = %prim_0.out : i32
+    }
+    calyx.control {}
+  } {static = 1}
+}
+
+// -----
+// CHECK: module attributes {calyx.entrypoint = "A"} {
+module attributes {calyx.entrypoint = "A"} {
+  // CHECK: hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>, %clk: i1 {calyx.clk}, %go: i1 {calyx.go}) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>, done: i1 {calyx.done}) attributes {filename = "test.v"}
+  hw.module.extern @params<WIDTH: i32>(%in: !hw.int<#hw.param.decl.ref<"WIDTH">>, %clk: i1 {calyx.clk}, %go: i1 {calyx.go}) -> (out: !hw.int<#hw.param.decl.ref<"WIDTH">>, done: i1 {calyx.done}) attributes {filename = "test.v"}
+
+  // CHECK-LABEL: calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done})
+  calyx.component @A(%in_0: i32, %in_1: i32, %go: i1 {go}, %clk: i1 {clk}, %reset: i1 {reset}) -> (%out_0: i32, %out_1: i32, %done: i1 {done}) {
+    // CHECK: %true = hw.constant true
+    %c1_1 = hw.constant 1 : i1
+    // CHECK-NEXT: %params_0.in, %params_0.clk, %params_0.go, %params_0.out, %params_0.done = calyx.primitive @params_0 of @params<WIDTH: i32 = 32> : i32, i1, i1, i32, i1
+    %params_0.in, %params_0.clk, %params_0.go, %params_0.out, %params_0.done = calyx.primitive @params_0 of @params<WIDTH: i32 = 32> : i32, i1, i1, i32, i1
+
+    calyx.wires {
+      // CHECK: calyx.assign %done = %true : i1
+      calyx.assign %done = %c1_1 : i1
+      // CHECK-NEXT: calyx.assign %params_0.in = %in_0 : i32
+      calyx.assign %params_0.in = %in_0 : i32
+      // CHECK-NEXT: calyx.assign %out_0 = %params_0.out : i32
+      calyx.assign %out_0 = %params_0.out : i32
+    }
+    calyx.control {}
+  } {static = 1}
 }

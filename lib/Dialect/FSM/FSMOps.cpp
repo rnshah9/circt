@@ -13,6 +13,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/FunctionImplementation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "llvm/Support/FormatVariadic.h"
 
 using namespace mlir;
 using namespace circt;
@@ -23,12 +24,11 @@ using namespace fsm;
 //===----------------------------------------------------------------------===//
 
 void MachineOp::build(OpBuilder &builder, OperationState &state, StringRef name,
-                      StringRef initialStateName, Type stateType,
-                      FunctionType type, ArrayRef<NamedAttribute> attrs,
+                      StringRef initialStateName, FunctionType type,
+                      ArrayRef<NamedAttribute> attrs,
                       ArrayRef<DictionaryAttr> argAttrs) {
   state.addAttribute(mlir::SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(name));
-  state.addAttribute("stateType", TypeAttr::get(stateType));
   state.addAttribute(getTypeAttrName(), TypeAttr::get(type));
   state.addAttribute("initialState",
                      StringAttr::get(state.getContext(), initialStateName));
@@ -52,15 +52,27 @@ StateOp MachineOp::getInitialStateOp() {
   return dyn_cast_or_null<StateOp>(lookupSymbol(initialState()));
 }
 
+StringAttr MachineOp::getArgName(size_t i) {
+  if (auto args = argNames())
+    return (*args)[i].cast<StringAttr>();
+  else
+    return StringAttr::get(getContext(), "in" + std::to_string(i));
+}
+
+StringAttr MachineOp::getResName(size_t i) {
+  if (auto resNameAttrs = resNames())
+    return (*resNameAttrs)[i].cast<StringAttr>();
+  else
+    return StringAttr::get(getContext(), "out" + std::to_string(i));
+}
+
 /// Get the port information of the machine.
 void MachineOp::getHWPortInfo(SmallVectorImpl<hw::PortInfo> &ports) {
   ports.clear();
   auto machineType = getFunctionType();
-  auto builder = Builder(*this);
-
   for (unsigned i = 0, e = machineType.getNumInputs(); i < e; ++i) {
     hw::PortInfo port;
-    port.name = builder.getStringAttr("in" + std::to_string(i));
+    port.name = getArgName(i);
     port.direction = circt::hw::PortDirection::INPUT;
     port.type = machineType.getInput(i);
     port.argNum = i;
@@ -69,7 +81,7 @@ void MachineOp::getHWPortInfo(SmallVectorImpl<hw::PortInfo> &ports) {
 
   for (unsigned i = 0, e = machineType.getNumResults(); i < e; ++i) {
     hw::PortInfo port;
-    port.name = builder.getStringAttr("out" + std::to_string(i));
+    port.name = getResName(i);
     port.direction = circt::hw::PortDirection::OUTPUT;
     port.type = machineType.getResult(i);
     port.argNum = i;
@@ -110,9 +122,6 @@ LogicalResult MachineOp::verify() {
   if (isExternal())
     return success();
 
-  if (!stateType().isa<IntegerType>())
-    return emitOpError("state must be integer type");
-
   // Verify that the argument list of the function and the arg list of the entry
   // block line up.  The trait already verified that the number of arguments is
   // the same between the signature and the block.
@@ -128,6 +137,22 @@ LogicalResult MachineOp::verify() {
   if (!getInitialStateOp())
     return emitOpError("initial state '" + initialState() +
                        "' was not defined in the machine");
+
+  if (argNames() && argNames()->size() != getArgumentTypes().size())
+    return emitOpError() << "number of machine arguments ("
+                         << getArgumentTypes().size()
+                         << ") does "
+                            "not match the provided number "
+                            "of argument names ("
+                         << argNames()->size() << ")";
+
+  if (resNames() && resNames()->size() != getResultTypes().size())
+    return emitOpError() << "number of machine results ("
+                         << getResultTypes().size()
+                         << ") does "
+                            "not match the provided number "
+                            "of result names ("
+                         << resNames()->size() << ")";
 
   return success();
 }
@@ -200,6 +225,8 @@ LogicalResult TriggerOp::verify() { return verifyCallerTypes(*this); }
 // HWInstanceOp
 //===----------------------------------------------------------------------===//
 
+Operation *HWInstanceOp::getReferencedModule() { return getMachine(); }
+
 /// Lookup the machine for the symbol.  This returns null on invalid IR.
 MachineOp HWInstanceOp::getMachine() {
   auto module = (*this)->getParentOfType<ModuleOp>();
@@ -214,12 +241,14 @@ LogicalResult HWInstanceOp::verify() { return verifyCallerTypes(*this); }
 
 void StateOp::build(OpBuilder &builder, OperationState &state,
                     StringRef stateName) {
+  OpBuilder::InsertionGuard guard(builder);
   Region *output = state.addRegion();
+  output->push_back(new Block());
+  builder.setInsertionPointToEnd(&output->back());
+  builder.create<fsm::OutputOp>(state.location);
   Region *transitions = state.addRegion();
+  transitions->push_back(new Block());
   state.addAttribute("sym_name", builder.getStringAttr(stateName));
-
-  ensureTerminator(*output, builder, state.location);
-  ensureTerminator(*transitions, builder, state.location);
 }
 
 SetVector<StateOp> StateOp::getNextStates() {
@@ -246,6 +275,34 @@ LogicalResult StateOp::canonicalize(StateOp op, PatternRewriter &rewriter) {
     rewriter.eraseOp(transition);
 
   return failure(transitionsToErase.empty());
+}
+
+LogicalResult StateOp::verify() {
+  MachineOp parent = getOperation()->getParentOfType<MachineOp>();
+
+  if (parent.getNumResults() != 0 && (output().empty()))
+    return emitOpError("state must have a non-empty output region when the "
+                       "machine has results.");
+
+  if (!output().empty()) {
+    // Ensure that the output block has a single OutputOp terminator.
+    Block *outputBlock = &output().front();
+    if (outputBlock->empty() || !isa<fsm::OutputOp>(outputBlock->back()))
+      return emitOpError("output block must have a single OutputOp terminator");
+  }
+
+  return success();
+}
+
+Block *StateOp::ensureOutput(OpBuilder &builder) {
+  if (output().empty()) {
+    OpBuilder::InsertionGuard g(builder);
+    auto *block = new Block();
+    output().push_back(block);
+    builder.setInsertionPointToStart(block);
+    builder.create<fsm::OutputOp>(getLoc());
+  }
+  return &output().front();
 }
 
 //===----------------------------------------------------------------------===//
@@ -275,18 +332,32 @@ LogicalResult OutputOp::verify() {
 
 void TransitionOp::build(OpBuilder &builder, OperationState &state,
                          StringRef nextState) {
-  Region *guard = state.addRegion();
-  Region *action = state.addRegion();
+  state.addRegion(); // guard
+  state.addRegion(); // action
   state.addAttribute("nextState",
                      FlatSymbolRefAttr::get(builder.getStringAttr(nextState)));
-
-  ensureTerminator(*guard, builder, state.location);
-  ensureTerminator(*action, builder, state.location);
 }
 
 void TransitionOp::build(OpBuilder &builder, OperationState &state,
                          StateOp nextState) {
   build(builder, state, nextState.getName());
+}
+
+Block *TransitionOp::ensureGuard(OpBuilder &builder) {
+  if (guard().empty()) {
+    OpBuilder::InsertionGuard g(builder);
+    auto *block = new Block();
+    guard().push_back(block);
+    builder.setInsertionPointToStart(block);
+    builder.create<fsm::ReturnOp>(getLoc());
+  }
+  return &guard().front();
+}
+
+Block *TransitionOp::ensureAction(OpBuilder &builder) {
+  if (action().empty())
+    action().push_back(new Block());
+  return &action().front();
 }
 
 /// Lookup the next state for the symbol. This returns null on invalid IR.
@@ -344,9 +415,12 @@ LogicalResult TransitionOp::verify() {
     return emitOpError("cannot find the definition of the next state `")
            << nextState() << "`";
 
-  // Verify the action region.
-  if (hasAction() && action().front().getTerminator()->getNumOperands() != 0)
-    return emitOpError("action region must not return any value");
+  // Verify the action region, if present.
+  if (hasGuard()) {
+    if (guard().front().empty() ||
+        !isa_and_nonnull<fsm::ReturnOp>(&guard().front().back()))
+      return emitOpError("guard region must terminate with a ReturnOp");
+  }
 
   // Verify the transition is located in the correct region.
   if ((*this)->getParentRegion() != &getCurrentState().transitions())
@@ -391,6 +465,16 @@ LogicalResult UpdateOp::verify() {
   if (!(*this)->getParentOfType<TransitionOp>().action().isAncestor(
           (*this)->getParentRegion()))
     return emitOpError("must only be located in the action region");
+
+  auto transition = (*this)->getParentOfType<TransitionOp>();
+  for (auto otherUpdateOp : transition.action().getOps<UpdateOp>()) {
+    if (otherUpdateOp == *this)
+      continue;
+    if (otherUpdateOp.getVariable() == getVariable())
+      return otherUpdateOp.emitOpError(
+          "multiple updates to the same variable within a single action region "
+          "is disallowed");
+  }
 
   return success();
 }

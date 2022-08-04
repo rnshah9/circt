@@ -2,22 +2,30 @@
 ; RUN: firtool %s --format=fir --ir-fir --annotation-file %s.anno.json,%s.anno.1.json | circt-opt | FileCheck %s --check-prefix=ANNOTATIONS
 ; RUN: firtool %s --format=fir --ir-fir --annotation-file %s.anno.json --annotation-file %s.anno.1.json | circt-opt | FileCheck %s --check-prefix=ANNOTATIONS
 ; RUN: firtool %s --format=fir --ir-hw | circt-opt | FileCheck %s --check-prefix=MLIRLOWER
-; RUN: firtool %s --format=fir -verilog |             FileCheck %s --check-prefix=VERILOG
-; RUN: firtool %s --annotation-file %s.anno.json,%s.anno.1.json --parse-only | FileCheck %s --check-prefix=ANNOTATIONS
-; RUN: firtool %s --omir-file %s.omir.anno.json --parse-only | FileCheck %s --check-prefix=OMIR
+; RUN: firtool %s --format=fir -verilog | FileCheck %s --check-prefix=VERILOG
+; RUN: firtool %s --annotation-file %s.anno.json,%s.anno.1.json --parse-only | FileCheck %s --check-prefix=RAWANNOTATIONS
+; RUN: firtool %s --omir-file %s.omir.anno.json --parse-only | circt-opt -firrtl-lower-annotations | FileCheck %s --check-prefix=OMIR
 ; RUN: firtool %s --omir-file %s.omir.anno.json --output-omir meta.omir.json --verilog | FileCheck %s --check-prefix=OMIROUT
 ; RUN: firtool %s --format=fir --ir-verilog | circt-opt | FileCheck %s --check-prefix=VERILOG-IR
 
 
-circuit test_mod : %[[{"a": "a"}]]
+circuit test_mod : %[[{"class": "circt.testNT", "data": "a"}]]
 
 ; MLIR: firrtl.circuit "test_mod"
 
 ; ANNOTATIONS-LABEL: firrtl.circuit "test_mod"
-; ANNOTATIONS-SAME: a = "a"
-; ANNOTATIONS-SAME: info = "a NoTargetAnnotation"
-; ANNOTATIONS-SAME: info = "a CircuitTarget Annotation
-; ANNOTATIONS-SAME: info = "a CircuitName Annotation"
+; ANNOTATIONS-SAME: {class = "circt.testNT", data = "a"}
+; ANNOTATIONS-SAME: {class = "circt.testNT", info = "a NoTargetAnnotation"}
+; ANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitTarget Annotation"}
+; ANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitName Annotation"}
+
+; RAWANNOTATIONS-LABEL: firrtl.circuit "test_mod"
+; RAWANNOTATIONS-SAME: {class = "circt.testNT", data = "a"}
+; RAWANNOTATIONS-SAME: {class = "circt.testNT", info = "a NoTargetAnnotation"}
+; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitTarget Annotation", target = "~test_mod"}
+; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a ModuleTarget Annotation", target = "~test_mod|test_mod"}
+; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitName Annotation", target = "test_mod"}
+; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a ModuleName Annotation", target = "test_mod.test_mod"}
 
 ; OMIR:       #loc0 = loc(fused["Foo.scala":64:64, "Bar.scala":128:128])
 ; OMIR-NEXT:  #loc1 = loc("Foo.scala":32:32)
@@ -118,14 +126,14 @@ circuit test_mod : %[[{"a": "a"}]]
 ; MLIR-NEXT:    firrtl.strictconnect %multibitMux_a_1, %vec_1 : !firrtl.uint<1>
 ; MLIR-NEXT:    firrtl.strictconnect %multibitMux_a_2, %vec_2 : !firrtl.uint<1>
 ; MLIR-NEXT:    firrtl.strictconnect %multibitMux_sel, %b : !firrtl.uint<2>
-; MLIR-NEXT:    %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
-; MLIR-NEXT:    firrtl.instance unusedPortsMod @UnusedPortsMod()
 
 ; ANNOTATIONS-LABEL: firrtl.module @test_mod
-; ANNOTATIONS-SAME: info = "a ModuleTarget Annotation"
-; ANNOTATIONS-SAME: info = "a ModuleName Annotation"
+; ANNOTATIONS-SAME: {class = "circt.test", info = "a ModuleTarget Annotation"}
+; ANNOTATIONS-SAME: {class = "circt.test", info = "a ModuleName Annotation"}
 
 ; VERILOG-LABEL: module test_mod(
+; Check that a fir location is stripped.
+; VERILOG-NOT:   .fir
 ; VERILOG-NEXT:    input        clock,
 ; VERILOG-NEXT:                 a,
 ; VERILOG-NEXT:    input  [1:0] b,
@@ -174,7 +182,6 @@ circuit test_mod : %[[{"a": "a"}]]
 ; VERILOG-NEXT:     .sel (b),
 ; VERILOG-NEXT:     .b   (out_multibitMux)
 ; VERILOG-NEXT:    );
-; VERILOG-NEXT:    UnusedPortsMod unusedPortsMod ();
 ; VERILOG:       endmodule
 
 ; Check that we canonicalize the HW output of lowering.
@@ -259,7 +266,7 @@ circuit test_mod : %[[{"a": "a"}]]
 ; VERILOG-NEXT:    output a_q);
 ; VERILOG:         always @(posedge clock)
 ; VERILOG-NEXT:      r <= a_d;
-; VERILOG-NEXT:    assign a_q = r;
+; VERILOG:         assign a_q = r;
 
   module MultibitMux :
     input a : UInt<1>[3]
@@ -267,11 +274,14 @@ circuit test_mod : %[[{"a": "a"}]]
     output b : UInt<1>
     b <= a[sel]
 ; VERILOG-LABEL: module MultibitMux(
-; VERILOG-CHECK: wire [2:0] [[T:.*]] = {{a_2}, {a_1}, {a_0}};
-; VERILOG-CHECK-NEXT: assign b = [[T]][sel];
+; VERILOG:       wire [[T1:.*]];
+; VERILOG-EMPTY:
+; VERILOG-NEXT:  wire [2:0] [[T2:.*]] =
+; VERILOG-SAME{LITERAL}: {{a_2}, {a_1}, {a_0}};
+; VERILOG-NEXT:  assign [[T1]] = [[T2]][sel] /* cadence map_to_mux */; /* synopsys infer_mux_override */
+; VERILOG-NEXT:  assign b = &sel ? a_0 : [[T1]];
 
   module UnusedPortsMod :
     input in : UInt<1>
     output out : UInt<1>
     out is invalid
-; VERILOG-LABEL: module UnusedPortsMod();

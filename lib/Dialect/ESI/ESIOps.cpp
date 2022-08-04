@@ -23,10 +23,11 @@ using namespace circt;
 using namespace circt::esi;
 
 //===----------------------------------------------------------------------===//
-// ChannelBuffer functions.
+// ChannelBufferOp functions.
 //===----------------------------------------------------------------------===//
 
-ParseResult ChannelBuffer::parse(OpAsmParser &parser, OperationState &result) {
+ParseResult ChannelBufferOp::parse(OpAsmParser &parser,
+                                   OperationState &result) {
   llvm::SMLoc inputOperandsLoc = parser.getCurrentLocation();
 
   llvm::SmallVector<OpAsmParser::UnresolvedOperand, 4> operands;
@@ -34,18 +35,12 @@ ParseResult ChannelBuffer::parse(OpAsmParser &parser, OperationState &result) {
                               /*delimiter=*/OpAsmParser::Delimiter::None))
     return failure();
 
-  ChannelBufferOptions optionsAttr;
-  if (parser.parseAttribute(optionsAttr,
-                            parser.getBuilder().getType<NoneType>(), "options",
-                            result.attributes))
-    return failure();
-
   Type innerOutputType;
   if (parser.parseOptionalAttrDict(result.attributes) || parser.parseColon() ||
       parser.parseType(innerOutputType))
     return failure();
   auto outputType =
-      ChannelPort::get(parser.getBuilder().getContext(), innerOutputType);
+      ChannelType::get(parser.getBuilder().getContext(), innerOutputType);
   result.addTypes({outputType});
 
   auto i1 = IntegerType::get(result.getContext(), 1);
@@ -55,18 +50,22 @@ ParseResult ChannelBuffer::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
-void ChannelBuffer::print(OpAsmPrinter &p) {
-  p << " " << clk() << ", " << rstn() << ", " << input() << " ";
-  p.printAttributeWithoutType(options());
-  p.printOptionalAttrDict((*this)->getAttrs(), /*elidedAttrs=*/{"options"});
-  p << " : " << output().getType().cast<ChannelPort>().getInner();
+void ChannelBufferOp::print(OpAsmPrinter &p) {
+  p << " " << clk() << ", " << rst() << ", " << input() << " ";
+  p.printOptionalAttrDict((*this)->getAttrs());
+  p << " : " << innerType();
+}
+
+circt::esi::ChannelType ChannelBufferOp::channelType() {
+  return input().getType().cast<circt::esi::ChannelType>();
 }
 
 //===----------------------------------------------------------------------===//
-// PipelineStage functions.
+// PipelineStageOp functions.
 //===----------------------------------------------------------------------===//
 
-ParseResult PipelineStage::parse(OpAsmParser &parser, OperationState &result) {
+ParseResult PipelineStageOp::parse(OpAsmParser &parser,
+                                   OperationState &result) {
   llvm::SMLoc inputOperandsLoc = parser.getCurrentLocation();
 
   SmallVector<OpAsmParser::UnresolvedOperand, 4> operands;
@@ -76,7 +75,7 @@ ParseResult PipelineStage::parse(OpAsmParser &parser, OperationState &result) {
       parser.parseType(innerOutputType))
     return failure();
   auto type =
-      ChannelPort::get(parser.getBuilder().getContext(), innerOutputType);
+      ChannelType::get(parser.getBuilder().getContext(), innerOutputType);
   result.addTypes({type});
 
   auto i1 = IntegerType::get(result.getContext(), 1);
@@ -86,17 +85,22 @@ ParseResult PipelineStage::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
-void PipelineStage::print(OpAsmPrinter &p) {
-  p << " " << clk() << ", " << rstn() << ", " << input() << " ";
+void PipelineStageOp::print(OpAsmPrinter &p) {
+  p << " " << clk() << ", " << rst() << ", " << input() << " ";
   p.printOptionalAttrDict((*this)->getAttrs());
-  p << " : " << output().getType().cast<ChannelPort>().getInner();
+  p << " : " << innerType();
+}
+
+circt::esi::ChannelType PipelineStageOp::channelType() {
+  return input().getType().cast<circt::esi::ChannelType>();
 }
 
 //===----------------------------------------------------------------------===//
 // Wrap / unwrap.
 //===----------------------------------------------------------------------===//
 
-ParseResult WrapValidReady::parse(OpAsmParser &parser, OperationState &result) {
+ParseResult WrapValidReadyOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
   llvm::SMLoc inputOperandsLoc = parser.getCurrentLocation();
 
   llvm::SmallVector<OpAsmParser::UnresolvedOperand, 2> opList;
@@ -108,7 +112,7 @@ ParseResult WrapValidReady::parse(OpAsmParser &parser, OperationState &result) {
 
   auto boolType = parser.getBuilder().getI1Type();
   auto outputType =
-      ChannelPort::get(parser.getBuilder().getContext(), innerOutputType);
+      ChannelType::get(parser.getBuilder().getContext(), innerOutputType);
   result.addTypes({outputType, boolType});
   if (parser.resolveOperands(opList, {innerOutputType, boolType},
                              inputOperandsLoc, result.operands))
@@ -116,20 +120,20 @@ ParseResult WrapValidReady::parse(OpAsmParser &parser, OperationState &result) {
   return success();
 }
 
-void WrapValidReady::print(OpAsmPrinter &p) {
+void WrapValidReadyOp::print(OpAsmPrinter &p) {
   p << " " << rawInput() << ", " << valid();
   p.printOptionalAttrDict((*this)->getAttrs());
-  p << " : " << chanOutput().getType().cast<ChannelPort>().getInner();
+  p << " : " << innerType();
 }
 
-void WrapValidReady::build(OpBuilder &b, OperationState &state, Value data,
-                           Value valid) {
-  build(b, state, ChannelPort::get(state.getContext(), data.getType()),
+void WrapValidReadyOp::build(OpBuilder &b, OperationState &state, Value data,
+                             Value valid) {
+  build(b, state, ChannelType::get(state.getContext(), data.getType()),
         b.getI1Type(), data, valid);
 }
 
-ParseResult UnwrapValidReady::parse(OpAsmParser &parser,
-                                    OperationState &result) {
+ParseResult UnwrapValidReadyOp::parse(OpAsmParser &parser,
+                                      OperationState &result) {
   llvm::SMLoc inputOperandsLoc = parser.getCurrentLocation();
 
   llvm::SmallVector<OpAsmParser::UnresolvedOperand, 2> opList;
@@ -140,7 +144,7 @@ ParseResult UnwrapValidReady::parse(OpAsmParser &parser,
     return failure();
 
   auto inputType =
-      ChannelPort::get(parser.getBuilder().getContext(), outputType);
+      ChannelType::get(parser.getBuilder().getContext(), outputType);
 
   auto boolType = parser.getBuilder().getI1Type();
 
@@ -151,16 +155,24 @@ ParseResult UnwrapValidReady::parse(OpAsmParser &parser,
   return success();
 }
 
-void UnwrapValidReady::print(OpAsmPrinter &p) {
+void UnwrapValidReadyOp::print(OpAsmPrinter &p) {
   p << " " << chanInput() << ", " << ready();
   p.printOptionalAttrDict((*this)->getAttrs());
   p << " : " << rawOutput().getType();
 }
 
-void UnwrapValidReady::build(OpBuilder &b, OperationState &state, Value inChan,
-                             Value ready) {
-  auto inChanType = inChan.getType().cast<ChannelPort>();
+circt::esi::ChannelType WrapValidReadyOp::channelType() {
+  return chanOutput().getType().cast<circt::esi::ChannelType>();
+}
+
+void UnwrapValidReadyOp::build(OpBuilder &b, OperationState &state,
+                               Value inChan, Value ready) {
+  auto inChanType = inChan.getType().cast<ChannelType>();
   build(b, state, inChanType.getInner(), b.getI1Type(), inChan, ready);
+}
+
+circt::esi::ChannelType UnwrapValidReadyOp::channelType() {
+  return chanInput().getType().cast<circt::esi::ChannelType>();
 }
 
 /// If 'iface' looks like an ESI interface, return the inner data type.
@@ -173,7 +185,7 @@ static Type getEsiDataType(circt::sv::InterfaceOp iface) {
   auto dataSig = iface.lookupSymbol<InterfaceSignalOp>("data");
   if (!dataSig)
     return Type();
-  return dataSig.type();
+  return dataSig.getType();
 }
 
 /// Verify that the modport type of 'modportArg' points to an interface which
@@ -181,7 +193,7 @@ static Type getEsiDataType(circt::sv::InterfaceOp iface) {
 /// the chan type's inner data type.
 static LogicalResult verifySVInterface(Operation *op,
                                        circt::sv::ModportType modportType,
-                                       ChannelPort chanType) {
+                                       ChannelType chanType) {
   auto modport =
       SymbolTable::lookupNearestSymbolFrom<circt::sv::InterfaceModportOp>(
           op, modportType.getModport());
@@ -199,16 +211,76 @@ static LogicalResult verifySVInterface(Operation *op,
   return success();
 }
 
-LogicalResult WrapSVInterface::verify() {
+LogicalResult WrapSVInterfaceOp::verify() {
   auto modportType = interfaceSink().getType().cast<circt::sv::ModportType>();
-  auto chanType = output().getType().cast<ChannelPort>();
+  auto chanType = output().getType().cast<ChannelType>();
   return verifySVInterface(*this, modportType, chanType);
 }
 
-LogicalResult UnwrapSVInterface::verify() {
+circt::esi::ChannelType WrapSVInterfaceOp::channelType() {
+  return output().getType().cast<circt::esi::ChannelType>();
+}
+
+LogicalResult UnwrapSVInterfaceOp::verify() {
   auto modportType = interfaceSource().getType().cast<circt::sv::ModportType>();
-  auto chanType = chanInput().getType().cast<ChannelPort>();
+  auto chanType = chanInput().getType().cast<ChannelType>();
   return verifySVInterface(*this, modportType, chanType);
+}
+
+circt::esi::ChannelType UnwrapSVInterfaceOp::channelType() {
+  return chanInput().getType().cast<circt::esi::ChannelType>();
+}
+
+/// Get the port declaration op for the specified service decl, port name.
+template <class OpType>
+static OpType getServicePortDecl(Operation *op,
+                                 SymbolTableCollection &symbolTable,
+                                 hw::InnerRefAttr servicePort) {
+  ModuleOp top = op->getParentOfType<mlir::ModuleOp>();
+  SymbolTable topSyms = symbolTable.getSymbolTable(top);
+
+  StringAttr modName = servicePort.getModule();
+  ServiceDeclOp serviceDeclOp = topSyms.lookup<ServiceDeclOp>(modName);
+  if (!serviceDeclOp) {
+    op->emitOpError("Cannot find module ") << modName;
+    return {};
+  }
+
+  StringAttr innerSym = servicePort.getName();
+  for (auto portDecl : serviceDeclOp.getOps<OpType>())
+    if (portDecl.inner_symAttr() == innerSym)
+      return portDecl;
+  op->emitOpError("Cannot find port named ") << innerSym;
+  return {};
+}
+
+/// Check that the type of a given service request matches the services port
+/// type.
+template <class PortTypeOp, class OpType>
+static LogicalResult
+reqPortMatches(OpType op, SymbolTableCollection &symbolTable, Type t) {
+  auto portDecl =
+      getServicePortDecl<PortTypeOp>(op, symbolTable, op.servicePort());
+  if (!portDecl)
+    return failure();
+
+  auto *ctxt = op.getContext();
+  if (portDecl.type() != t &&
+      portDecl.type() != ChannelType::get(ctxt, AnyType::get(ctxt)))
+    return op.emitOpError("Request type does not match port type ")
+           << portDecl.type();
+
+  return success();
+}
+
+LogicalResult RequestToClientConnectionOp::verifySymbolUses(
+    SymbolTableCollection &symbolTable) {
+  return reqPortMatches<ToClientOp>(*this, symbolTable, receiving().getType());
+}
+
+LogicalResult RequestToServerConnectionOp::verifySymbolUses(
+    SymbolTableCollection &symbolTable) {
+  return reqPortMatches<ToServerOp>(*this, symbolTable, sending().getType());
 }
 
 #define GET_OP_CLASSES

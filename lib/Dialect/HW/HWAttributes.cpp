@@ -43,9 +43,7 @@ void HWDialect::registerAttributes() {
 Attribute HWDialect::parseAttribute(DialectAsmParser &p, Type type) const {
   StringRef attrName;
   Attribute attr;
-  if (p.parseKeyword(&attrName))
-    return Attribute();
-  auto parseResult = generatedAttributeParser(p, attrName, type, attr);
+  auto parseResult = generatedAttributeParser(p, &attrName, type, attr);
   if (parseResult.hasValue())
     return attr;
 
@@ -169,6 +167,42 @@ FileListAttr FileListAttr::getFromFilename(MLIRContext *context,
 }
 
 //===----------------------------------------------------------------------===//
+// EnumFieldAttr
+//===----------------------------------------------------------------------===//
+
+Attribute EnumFieldAttr::parse(AsmParser &p, Type) {
+  StringRef field;
+  Type type;
+  if (p.parseLess() || p.parseKeyword(&field) || p.parseComma() ||
+      p.parseType(type) || p.parseGreater())
+    return Attribute();
+  return EnumFieldAttr::get(p.getEncodedSourceLoc(p.getCurrentLocation()),
+                            StringAttr::get(p.getContext(), field), type);
+}
+
+void EnumFieldAttr::print(AsmPrinter &p) const {
+  p << "<" << getField().getValue() << ", ";
+  p.printType(getType().getValue());
+  p << ">";
+}
+
+EnumFieldAttr EnumFieldAttr::get(Location loc, StringAttr value,
+                                 mlir::Type type) {
+  if (!hw::isHWEnumType(type))
+    emitError(loc) << "expected enum type";
+
+  // Check whether the provided value is a member of the enum type.
+  EnumType enumType = getCanonicalType(type).cast<EnumType>();
+  if (!enumType.contains(value.getValue())) {
+    emitError(loc) << "enum value '" << value.getValue()
+                   << "' is not a member of enum type " << enumType;
+    return nullptr;
+  }
+
+  return Base::get(value.getContext(), value, TypeAttr::get(type));
+}
+
+//===----------------------------------------------------------------------===//
 // InnerRefAttr
 //===----------------------------------------------------------------------===//
 
@@ -190,18 +224,12 @@ void InnerRefAttr::print(AsmPrinter &p) const {
   p << ">";
 }
 
-/// Get an InnerRefAttr, and add the sym to the op if not already
-/// there. Also reponsibility of client to ensure the symName is unique.
-InnerRefAttr InnerRefAttr::getFromOperation(mlir::Operation *op,
-                                            mlir::StringAttr symName,
-                                            mlir::StringAttr moduleName) {
-  char attrName[] = "inner_sym";
-  auto attr = op->getAttrOfType<StringAttr>(attrName);
-  if (!attr) {
-    attr = symName;
-    op->setAttr(attrName, attr);
-  }
-  return InnerRefAttr::get(moduleName, attr);
+Attribute
+InnerRefAttr::replaceImmediateSubElements(ArrayRef<Attribute> replAttrs,
+                                          ArrayRef<Type> replTypes) const {
+  assert(replAttrs.size() == 2);
+  return get(getContext(), replAttrs[0].cast<FlatSymbolRefAttr>(),
+             replAttrs[1].cast<StringAttr>());
 }
 
 //===----------------------------------------------------------------------===//
@@ -738,7 +766,7 @@ static Attribute parseParamExprWithOpcode(StringRef opcodeStr,
     return {};
 
   Optional<PEO> opcode = symbolizePEO(opcodeStr);
-  if (!opcode.hasValue()) {
+  if (!opcode.has_value()) {
     p.emitError(p.getNameLoc(), "unknown parameter expr operator name");
     return {};
   }
@@ -779,7 +807,7 @@ replaceDeclRefInExpr(Location loc,
       auto res = replaceDeclRefInExpr(loc, parameters, operand);
       if (failed(res))
         return {failure()};
-      replacedOperands.push_back(res.getValue());
+      replacedOperands.push_back(*res);
     }
     return {
         hw::ParamExprAttr::get(paramExprAttr.getOpcode(), replacedOperands)};
@@ -803,7 +831,7 @@ FailureOr<Attribute> hw::evaluateParametricAttr(Location loc,
   auto paramAttrRes = replaceDeclRefInExpr(loc, parameterMap, paramAttr);
   if (failed(paramAttrRes))
     return {failure()};
-  paramAttr = paramAttrRes.getValue();
+  paramAttr = *paramAttrRes;
 
   // Then, evaluate the parametric attribute.
   if (paramAttr.isa<IntegerAttr>() || paramAttr.isa<hw::ParamDeclRefAttr>())
@@ -822,7 +850,7 @@ FailureOr<Attribute> hw::evaluateParametricAttr(Location loc,
 
 FailureOr<Type> hw::evaluateParametricType(Location loc, ArrayAttr parameters,
                                            Type type) {
-  return llvm::TypeSwitch<Type, Type>(type)
+  return llvm::TypeSwitch<Type, FailureOr<Type>>(type)
       .Case<hw::IntType>([&](hw::IntType t) -> FailureOr<Type> {
         auto evaluatedWidth =
             evaluateParametricAttr(loc, parameters, t.getWidth());
@@ -835,7 +863,7 @@ FailureOr<Type> hw::evaluateParametricType(Location loc, ArrayAttr parameters,
                                    intAttr.getValue().getSExtValue())};
 
         // Otherwise parameter references are still involved
-        return hw::IntType::get(evaluatedWidth.getValue());
+        return hw::IntType::get(*evaluatedWidth);
       })
       .Case<hw::ArrayType>([&](hw::ArrayType arrayType) -> FailureOr<Type> {
         auto size =
@@ -851,13 +879,12 @@ FailureOr<Type> hw::evaluateParametricType(Location loc, ArrayAttr parameters,
         // attribute version of it
         if (auto intAttr = size->dyn_cast<IntegerAttr>())
           return hw::ArrayType::get(
-              arrayType.getContext(), elementType.getValue(),
+              arrayType.getContext(), *elementType,
               IntegerAttr::get(IntegerType::get(type.getContext(), 64),
                                intAttr.getValue().getSExtValue()));
 
         // Otherwise parameter references are still involved
-        return hw::ArrayType::get(arrayType.getContext(),
-                                  elementType.getValue(), size.getValue());
+        return hw::ArrayType::get(arrayType.getContext(), *elementType, *size);
       })
       .Default([&](auto) { return type; });
 }

@@ -14,6 +14,7 @@
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/SV/SVOps.h"
@@ -48,7 +49,7 @@ using namespace firrtl;
 // Signal driver annotations are needed when processing both circuits:
 //
 // First the original annotations are used with the main circuit, in order to
-// emit extra wires around forced inputs and to emit updated annotations
+// emit extra wires around forced ports and to emit updated annotations
 // pointing to the values across naming or hierarchy changes performed.
 //
 // Second these updated annotations are used when processing the subcircuit
@@ -116,18 +117,155 @@ static T &operator<<(T &os, const SignalMapping &mapping) {
   return os;
 }
 
+//===----------------------------------------------------------------------===//
+// Code related to annotation handling
+//===----------------------------------------------------------------------===//
+
+LogicalResult circt::firrtl::applyGCTSignalMappings(const AnnoPathValue &target,
+                                                    DictionaryAttr anno,
+                                                    ApplyState &state) {
+  auto id = state.newID();
+  auto *context = state.circuit.getContext();
+  auto loc = state.circuit.getLoc();
+
+  // Rework the circuit-level annotation to no longer include the
+  // information we are scattering away anyway.
+  NamedAttrList fields;
+  auto annotationsAttr = tryGetAs<ArrayAttr>(anno, anno, "annotations", loc,
+                                             signalDriverAnnoClass);
+  auto circuitAttr =
+      tryGetAs<StringAttr>(anno, anno, "circuit", loc, signalDriverAnnoClass);
+  auto circuitPackageAttr = tryGetAs<StringAttr>(anno, anno, "circuitPackage",
+                                                 loc, signalDriverAnnoClass);
+  if (!annotationsAttr || !circuitAttr || !circuitPackageAttr)
+    return failure();
+  fields.append("class", StringAttr::get(context, signalDriverAnnoClass));
+  fields.append("id", id);
+  fields.append("annotations", annotationsAttr);
+  fields.append("circuit", circuitAttr);
+  fields.append("circuitPackage", circuitPackageAttr);
+
+  // Handle the source and sink targets.
+  auto sourcesAttr = tryGetAs<ArrayAttr>(anno, anno, "sourceTargets", loc,
+                                         signalDriverAnnoClass);
+  auto sinksAttr = tryGetAs<ArrayAttr>(anno, anno, "sinkTargets", loc,
+                                       signalDriverAnnoClass);
+  if (!sourcesAttr || !sinksAttr)
+    return failure();
+
+  // Add field indicating if we're the subcircuit or not.  Do this by looking at
+  // the first source or sink and seeing what its circuit target is.
+  DictionaryAttr firstSourceOrSink;
+  if (!sourcesAttr.empty())
+    firstSourceOrSink = sourcesAttr.begin()->dyn_cast<DictionaryAttr>();
+  else if (!sinksAttr.empty())
+    firstSourceOrSink = sinksAttr.begin()->dyn_cast<DictionaryAttr>();
+  else
+    return success();
+  if (!firstSourceOrSink)
+    return failure();
+  auto prefix = tryGetAs<StringAttr>(firstSourceOrSink, anno, "_1", loc,
+                                     signalDriverAnnoClass)
+                    .getValue();
+  bool isSubCircuit = !(prefix.consume_front("~") &&
+                        prefix.consume_front(state.circuit.getName()) &&
+                        prefix.consume_front("|"));
+  fields.append("isSubCircuit", BoolAttr::get(context, isSubCircuit));
+
+  auto dontTouch = [&](StringRef targetStr) {
+    NamedAttrList anno;
+    anno.append("class", StringAttr::get(context, dontTouchAnnoClass));
+    anno.append("target", StringAttr::get(context, targetStr));
+    state.addToWorklistFn(DictionaryAttr::get(context, anno));
+  };
+
+  StringSet<> modules;
+  auto buildSourceOrSinkAnno = [&](Attribute attr,
+                                   bool isSource) -> DictionaryAttr {
+    auto dict = attr.dyn_cast<DictionaryAttr>();
+    if (!dict)
+      return {};
+    NamedAttrList fields;
+    fields.append("class",
+                  StringAttr::get(context, signalDriverTargetAnnoClass));
+    StringAttr targetAttr = tryGetAs<StringAttr>(
+        dict, dict, isSubCircuit ? "_2" : "_1", loc, signalDriverAnnoClass);
+    StringAttr peer = tryGetAs<StringAttr>(
+        dict, dict, isSubCircuit ? "_1" : "_2", loc, signalDriverAnnoClass);
+    if (!targetAttr || !peer)
+      return {};
+
+    auto target = tokenizePath(targetAttr);
+    if (!target)
+      return {};
+    target->component.clear();
+    target->name = "";
+    modules.insert(target->str());
+
+    auto targetId = state.newID();
+    fields.append("dir",
+                  StringAttr::get(context, isSource ? "source" : "sink"));
+    fields.append("id", id);
+    fields.append("peer", peer);
+    fields.append("side",
+                  StringAttr::get(context, isSubCircuit ? "local" : "remote"));
+    fields.append("target", targetAttr);
+    fields.append("targetId", targetId);
+
+    // TODO: Always applying DontTouchAnnotation to a target is too restrictive.
+    // This should only be necessary if this is a sink (which will produce a
+    // force) and we are in the circuit where the force will be applied.  Relax
+    // this restriction in the future.
+    dontTouch(targetAttr.getValue());
+
+    return DictionaryAttr::get(context, fields);
+  };
+
+  // Add any sinks or sources to the worklist for later processing.
+  for (auto attr : sourcesAttr) {
+    auto sourceAnno = buildSourceOrSinkAnno(attr, true);
+    if (!sourceAnno)
+      return failure();
+    state.addToWorklistFn(sourceAnno);
+  }
+  for (auto attr : sinksAttr) {
+    auto sinkAnno = buildSourceOrSinkAnno(attr, false);
+    if (!sinkAnno)
+      return failure();
+    state.addToWorklistFn(sinkAnno);
+  }
+
+  AnnotationSet annotations(state.circuit);
+  annotations.addAnnotations({DictionaryAttr::get(context, fields)});
+  annotations.applyToOperation(state.circuit);
+
+  for (auto &module : modules) {
+    NamedAttrList fields;
+    fields.append("class",
+                  StringAttr::get(context, signalDriverModuleAnnoClass));
+    fields.append("id", id);
+    fields.append("target", StringAttr::get(context, module.getKey()));
+    state.addToWorklistFn(DictionaryAttr::get(context, fields));
+  }
+
+  return success();
+}
+
 /// Analyze the `module` of this `ModuleSignalMappings` and generate the
 /// corresponding auxiliary `FModuleOp` with the necessary cross-module
 /// references and `ForceOp`s to probe and drive remote signals. This is
-/// dictated by the presence of `SignalDriverAnnotation` on the module and
-/// individual operations inside it.
-/// If the module is the "remote" (main) circuit, gather those mappings
-/// for use handling forced input ports and creating updated mappings.
+/// dictated by the presence of `SignalDriverAnnotation.module` on the module
+/// and individual operations inside it. Anything targeted by a source/sink will
+/// show up with a `SignalDriverAnnotation.target`. Global circuit-level
+/// information lives in a circuit-level `SignalDriverAnnotation`.
+///
+/// If the module is the "remote" (main) circuit, gather those mappings for use
+/// handling forced ports and creating updated mappings.
 void ModuleSignalMappings::run() {
-  // Check whether this module has any `SignalDriverAnnotation`s. These indicate
-  // whether the module contains any operations with such annotations and
-  // requires processing.
-  if (!AnnotationSet::removeAnnotations(module, signalDriverAnnoClass)) {
+  // Check whether this module has any `SignalDriverAnnotation.module`s. These
+  // indicate whether the module contains any operations with such annotations
+  // and requires processing.
+  if (!AnnotationSet::removeAnnotations(module, signalDriverModuleAnnoClass)) {
     LLVM_DEBUG(llvm::dbgs() << "Skipping `" << module.getName()
                             << "` (has no annotations)\n");
     return;
@@ -135,21 +273,22 @@ void ModuleSignalMappings::run() {
   LLVM_DEBUG(llvm::dbgs() << "Running on module `" << module.getName()
                           << "`\n");
 
-  // Gather the signal driver annotations on the ports of this module.
+  // Gather the `SignalDriverAnnotation.target`s on the ports of this module.
   LLVM_DEBUG(llvm::dbgs() << "- Gather port annotations\n");
   AnnotationSet::removePortAnnotations(
       module, [&](unsigned i, Annotation anno) {
-        if (!anno.isClass(signalDriverAnnoClass))
+        if (!anno.isClass(signalDriverTargetAnnoClass))
           return false;
         addTarget(module.getArgument(i), anno);
         return true;
       });
 
-  // Gather the signal driver annotations of the operations within this module.
+  // Gather the `SignalDriverAnnotation.target`s of the operations within this
+  // module.
   LLVM_DEBUG(llvm::dbgs() << "- Gather operation annotations\n");
   module.walk([&](Operation *op) {
     AnnotationSet::removeAnnotations(op, [&](Annotation anno) {
-      if (!anno.isClass(signalDriverAnnoClass))
+      if (!anno.isClass(signalDriverTargetAnnoClass))
         return false;
       for (auto result : op->getResults())
         addTarget(result, anno);
@@ -167,7 +306,7 @@ void ModuleSignalMappings::run() {
     if (mapping.dir == MappingDirection::ProbeRemote) {
       for (auto &use : llvm::make_early_inc_range(mapping.localValue.getUses()))
         if (auto connect = dyn_cast<FConnectLike>(use.getOwner()))
-          if (connect.dest() == mapping.localValue) {
+          if (connect.getDest() == mapping.localValue) {
             connect.erase();
             allAnalysesPreserved = false;
           };
@@ -258,7 +397,7 @@ FModuleOp ModuleSignalMappings::emitMappingsModule() {
       StringAttr::get(module.getContext(), mappingsModuleName), ports);
 
   // Generate the connect and force statements inside the module.
-  builder.setInsertionPointToStart(mappingsModule.getBody());
+  builder.setInsertionPointToStart(mappingsModule.getBodyBlock());
   unsigned portIdx = 0;
   for (auto &mapping : localMappings) {
     // TODO: Actually generate a proper XMR here. For now just do some textual
@@ -319,7 +458,7 @@ void ModuleSignalMappings::instantiateMappingsModule(FModuleOp mappingsModule) {
                           << "`\n");
   // Create the actual module.
   auto builder =
-      ImplicitLocOpBuilder::atBlockEnd(module.getLoc(), module.getBody());
+      ImplicitLocOpBuilder::atBlockEnd(module.getLoc(), module.getBodyBlock());
   auto inst = builder.create<InstanceOp>(mappingsModule, "signal_mappings");
 
   // Generate the connections to and from the instance.
@@ -347,8 +486,8 @@ struct ExtModules {
   SmallVector<FExtModuleOp> json;
 };
 
-/// Information gathered about mappings, used for identifying forced input ports
-/// and generating updated mappings for the remote side (main circuit).
+/// Information gathered about mappings, used for identifying forced ports and
+/// generating updated mappings for the remote side (main circuit).
 struct ModuleMappingResult {
   /// Were changes made that invalidate analyses?
   bool allAnalysesPreserved;
@@ -367,7 +506,7 @@ class GrandCentralSignalMappingsPass
                           StringRef outputFilename,
                           const ExtModules &extmodules);
 
-  /// Fixup forced input ports and emit updated mappings
+  /// Fixup forced ports and emit updated mappings.
   /// Used when processing the main (remote) circuit.
   FailureOr<bool>
   emitUpdatedMappings(CircuitOp circuit, StringAttr circuitPackage,
@@ -418,10 +557,10 @@ void GrandCentralSignalMappingsPass::runOnOperation() {
   SmallVector<FModuleOp> modules;
   ExtModules extmodules;
 
-  for (auto op : circuit.body().getOps<FModuleLike>()) {
+  for (auto op : circuit.getBody().getOps<FModuleLike>()) {
     if (auto *extModule = dyn_cast<FExtModuleOp>(&op)) {
       AnnotationSet annotations(*extModule);
-      if (annotations.hasAnnotation("firrtl.transforms.BlackBoxInlineAnno")) {
+      if (annotations.hasAnnotation(blackBoxInlineAnnoClass)) {
         extmodules.vsrc.push_back(*extModule);
         continue;
       }
@@ -435,11 +574,31 @@ void GrandCentralSignalMappingsPass::runOnOperation() {
   SmallVector<ModuleMappingResult> results;
   results.resize(modules.size());
 
-  mlir::parallelForEachN(
+  auto updateStats = [this](auto &mappings) {
+    size_t sources = 0, sinks = 0;
+    for (auto &mapping : mappings) {
+      if (mapping.dir == MappingDirection::ProbeRemote)
+        ++sources;
+      else
+        ++sinks;
+    }
+    if (sources)
+      numSources += sources;
+    if (sinks)
+      numSinks += sinks;
+    if (sources || sinks)
+      ++numModules;
+  };
+
+  mlir::parallelFor(
       circuit.getContext(), 0, modules.size(),
-      [&modules, &results](size_t index) {
+      [&modules, &results, &updateStats](size_t index) {
         ModuleSignalMappings mapper(modules[index]);
         mapper.run();
+
+        // Update statistics
+        updateStats(mapper.mappings);
+
         results[index] = {
             mapper.allAnalysesPreserved, modules[index],
             SmallVector<SignalMapping>{llvm::make_filter_range(
@@ -450,7 +609,7 @@ void GrandCentralSignalMappingsPass::runOnOperation() {
 
   // If this is a subcircuit, then emit JSON information necessary to drive
   // SiFive tools.
-  // Otherwise handle any forced input ports and emit updated mappings.
+  // Otherwise handle any forced ports and emit updated mappings.
   if (isSubCircuit) {
     emitSubCircuitJSON(circuit, circuitPackage, outputFilename, extmodules);
   } else {
@@ -474,7 +633,7 @@ void GrandCentralSignalMappingsPass::emitSubCircuitJSON(
     j.attributeObject("vendor", [&]() {
       j.attributeObject("vcs", [&]() {
         j.attributeArray("vsrcs", [&]() {
-          for (FModuleOp module : circuit.body().getOps<FModuleOp>()) {
+          for (FModuleOp module : circuit.getBody().getOps<FModuleOp>()) {
             SmallVector<char> file(outputFilename.begin(),
                                    outputFilename.end());
             llvm::sys::fs::make_absolute(file);
@@ -503,7 +662,7 @@ void GrandCentralSignalMappingsPass::emitSubCircuitJSON(
         j.value((Twine(extModule.moduleName()) + ".json").str());
     });
   });
-  auto b = OpBuilder::atBlockEnd(circuit.getBody());
+  auto b = OpBuilder::atBlockEnd(circuit.getBodyBlock());
   auto jsonOp = b.create<sv::VerbatimOp>(b.getUnknownLoc(), jsonString);
   jsonOp->setAttr(
       "output_file",
@@ -519,30 +678,20 @@ FailureOr<bool> GrandCentralSignalMappingsPass::emitUpdatedMappings(
   // 1) Sanity checking
   // 2) Fixup ports that are driven from subcircuit
   // 3) Generate new remote references
-  //    For now, just drive/probe using `module.name` XMR's,
-  //    it's much simpler than emitting hierarchical paths
-  //    from the top module/DUT, and works for now.
   // 4) Emit updated mappings as SignalDriverAnnotations
   //    for consumption when processing the subcircuit
   //    (as replacements for the original annotations)
 
   // Helper to instantiate module namespaces as-needed
-  DenseMap<FModuleOp, ModuleNamespace> moduleNamespaces;
+  DenseMap<Operation *, ModuleNamespace> moduleNamespaces;
   auto getModuleNamespace =
-      [&moduleNamespaces](FModuleOp module) -> ModuleNamespace & {
+      [&moduleNamespaces](Operation *module) -> ModuleNamespace & {
     return moduleNamespaces.try_emplace(module, module).first->second;
   };
 
   // (1) Scan mappings for unexpected or unsupported values
   for (auto const &[_, mod, mappings] : results) {
     for (auto &mapping : mappings) {
-      // This isn't handled yet, error out instead of doing wrong thing
-      if (mapping.nlaSym) {
-        emitError(mapping.localValue.getLoc())
-            << "non-local value targeted by SignalDriverAnnotation, "
-               "unsupported (NLA found)";
-        return failure();
-      }
       // No local-side mappings on main circuit side
       if (mapping.isLocal) {
         emitError(mapping.localValue.getLoc())
@@ -553,47 +702,87 @@ FailureOr<bool> GrandCentralSignalMappingsPass::emitUpdatedMappings(
     }
   }
 
-  // (2) Find input ports that are sinks, insert wires at instantiation points
+  // (2) Find ports that are sinks, insert buffer wires to break the net.
+  // Input ports are buffered at instantiation points, outputs in the module.
   auto *instanceGraph = &getAnalysis<InstanceGraph>();
-  DenseSet<unsigned> forcedInputPorts;
+  llvm::SmallVector<unsigned, 32> forcedInputPorts;
+  llvm::SmallVector<unsigned, 32> forcedOutputPorts;
   for (auto &[_, mod, mappings] : results) {
     // Walk mappings looking for module ports that are being driven,
     // and gather their indices for fixing up.
     forcedInputPorts.clear();
+    forcedOutputPorts.clear();
     for (auto &mapping : mappings) {
       if (mapping.dir == MappingDirection::DriveRemote /* Sink */) {
         if (auto blockArg = mapping.localValue.dyn_cast<BlockArgument>()) {
           auto portIdx = blockArg.getArgNumber();
+          // Port may be driven multiple times along different instance paths
           if (mod.getPortDirection(portIdx) == Direction::In) {
-            if (!forcedInputPorts.insert(portIdx).second) {
-              emitError(blockArg.getLoc())
-                  << "module port driven more than once, unsupported "
-                     "SignalDriverAnnotation";
-              return failure();
-            }
+            forcedInputPorts.push_back(portIdx);
+          } else {
+            forcedOutputPorts.push_back(portIdx);
           }
         }
       }
     }
+    llvm::sort(forcedInputPorts);
+    forcedInputPorts.erase(
+        std::unique(forcedInputPorts.begin(), forcedInputPorts.end()),
+        forcedInputPorts.end());
+    llvm::sort(forcedOutputPorts);
+    forcedOutputPorts.erase(
+        std::unique(forcedOutputPorts.begin(), forcedOutputPorts.end()),
+        forcedOutputPorts.end());
 
-    // Find all instantiations of this module, and replace uses of each driven
-    // port with a wire that's connected to a wire that is connected to the
-    // port. This is done to cause an 'assign' to be created, disconnecting
-    // the forced input port's net from its uses.
+    // Replace uses of each driven port with a wire that's connected to a wire
+    // that is connected to the port. This is done to cause an 'assign' to be
+    // created, disconnecting the forced port's net from its uses.
+    auto breakNet = [modName = mod.moduleName()](
+                        OpBuilder &builder, Value port,
+                        ModuleNamespace &moduleNamespace, StringRef portName) {
+      // Create chain like:
+      // port_result <= foo_dataIn_x_buffer
+      // foo_dataIn_x_buffer <= foo_dataIn_x
+      auto replacementWireName = builder.getStringAttr(
+          moduleNamespace.newName(modName + "_" + portName));
+      auto bufferWireName = builder.getStringAttr(
+          moduleNamespace.newName(replacementWireName.getValue() + "_buffer"));
+      auto bufferWire =
+          builder.create<WireOp>(builder.getUnknownLoc(), port.getType(),
+                                 bufferWireName, NameKindEnum::DroppableName,
+                                 builder.getArrayAttr({}), bufferWireName);
+      auto replacementWire = builder.create<WireOp>(
+          builder.getUnknownLoc(), port.getType(), replacementWireName,
+          NameKindEnum::DroppableName, builder.getArrayAttr({}),
+          replacementWireName);
+      port.replaceAllUsesWith(replacementWire);
+      builder.create<StrictConnectOp>(builder.getUnknownLoc(), port,
+                                      bufferWire);
+      builder.create<StrictConnectOp>(builder.getUnknownLoc(), bufferWire,
+                                      replacementWire);
+    };
+
+    // Update the forced ports statistics.
+    numForcedInputPorts += forcedInputPorts.size();
+    numForcedOutputPorts += forcedOutputPorts.size();
+
+    if (!forcedOutputPorts.empty()) {
+      ModuleNamespace &moduleNamespace = getModuleNamespace(mod);
+      auto builder = OpBuilder::atBlockBegin(mod.getBodyBlock());
+
+      // Update statistic
+      numBufferWirePairsAdded += forcedOutputPorts.size();
+
+      for (auto portIdx : forcedOutputPorts) {
+        auto port = mod.getArgument(portIdx);
+        breakNet(builder, port, moduleNamespace, mod.getPortName(portIdx));
+      }
+    }
+
     if (forcedInputPorts.empty())
       continue;
 
-    unsigned useCount = 0;
     for (auto *use : instanceGraph->lookup(mod)->uses()) {
-      // Ensure just the one use for now, this matters if we want
-      // to be able to emit a unique path from the top module.
-      if (++useCount != 1) {
-        emitError(mod.getLoc())
-            << "module with input port driven instantiated more than once, "
-               "unsupported SignalDriverAnnotation";
-
-        return failure();
-      }
       allAnalysesPreserved = false;
 
       auto inst = use->getInstance();
@@ -602,61 +791,98 @@ FailureOr<bool> GrandCentralSignalMappingsPass::emitUpdatedMappings(
       auto parentModule = inst->getParentOfType<FModuleOp>();
       ModuleNamespace &moduleNamespace = getModuleNamespace(parentModule);
 
+      // Update statistic
+      numBufferWirePairsAdded += forcedInputPorts.size();
+
       for (auto portIdx : forcedInputPorts) {
         auto port = inst->getResult(portIdx);
-
-        // Create chain like:
-        // port_result <= foo_dataIn_x_buffer
-        // foo_dataIn_x_buffer <= foo_dataIn_x
-        auto replacementWireName =
-            builder.getStringAttr(moduleNamespace.newName(
-                mod.moduleName() + "_" + mod.getPortName(portIdx)));
-        auto bufferWireName = builder.getStringAttr(moduleNamespace.newName(
-            replacementWireName.getValue() + "_buffer"));
-        auto bufferWire = builder.create<WireOp>(
-            builder.getUnknownLoc(), port.getType(), bufferWireName,
-            builder.getArrayAttr({}), bufferWireName);
-        auto replacementWire = builder.create<WireOp>(
-            builder.getUnknownLoc(), port.getType(), replacementWireName,
-            builder.getArrayAttr({}), replacementWireName);
-        port.replaceAllUsesWith(replacementWire);
-        builder.create<StrictConnectOp>(builder.getUnknownLoc(), port,
-                                        bufferWire);
-        builder.create<StrictConnectOp>(builder.getUnknownLoc(), bufferWire,
-                                        replacementWire);
+        breakNet(builder, port, moduleNamespace, mod.getPortName(portIdx));
       }
     }
   }
 
   // (3) Generate updated remote references
-  // Helpers to emit basic 'module.name' XMR's for the mappings.
-  // Use inner_sym for non-ports
+
+  // For instance path references, determine where to start.
+  // This is either the main module or the DUT if any.
+  auto dut = circuit.getMainModule();
+  for (auto op : circuit.getBody().getOps<FModuleOp>())
+    if (AnnotationSet(op).hasAnnotation(dutAnnoClass)) {
+      dut = op;
+      break;
+    }
+
+  // Helpers to emit XMR's for the mappings.
   SmallVector<Attribute> symbols;
-  auto getOrAddInnerSym = [&](Operation *op) -> StringAttr {
-    auto attr = op->getAttrOfType<StringAttr>("inner_sym");
-    if (attr)
-      return attr;
-    StringRef name = "sym";
-    if (auto nameAttr = op->getAttrOfType<StringAttr>("name"))
-      name = nameAttr.getValue();
-    auto module = op->getParentOfType<FModuleOp>();
-    name = getModuleNamespace(module).newName(name);
-    attr = StringAttr::get(op->getContext(), name);
-    op->setAttr("inner_sym", attr);
-    return attr;
+  SmallDenseMap<Attribute, size_t> symMap;
+
+  auto getSymIdx = [&](Attribute symbol) {
+    auto it = symMap.find(symbol);
+    if (it != symMap.end())
+      return it->second;
+
+    auto id = symbols.size();
+    symbols.push_back(symbol);
+    symMap.insert({symbol, id});
+    return id;
   };
   auto mkRef = [&](FModuleOp module,
                    const SignalMapping &mapping) -> std::string {
-    if (mapping.localValue.isa<BlockArgument>()) {
-      return llvm::formatv("~{0}|{1}>{2}", circuit.name(), module.getName(),
-                           mapping.localName);
+    // Generate placeholder into specified storage, return StringRef for it
+    auto mkSymPlaceholder = [&](Attribute symbol, auto &out) -> StringRef {
+      ("{{" + Twine(getSymIdx(symbol)) + "}}").toVector(out);
+      return out;
+    };
+
+    // Construct target using placeholders:
+    SmallString<32> circuitStr, moduleStr, nameStr;
+    // Storage for <mod,inst> strings along instance path
+    SmallVector<std::pair<SmallString<8>, SmallString<8>>, 16> stringStorage;
+    TokenAnnoTarget target;
+    target.circuit = mkSymPlaceholder(FlatSymbolRefAttr::get(dut), circuitStr);
+    target.module = mkSymPlaceholder(FlatSymbolRefAttr::get(module), moduleStr);
+    target.component = {};
+
+    if (auto port = mapping.localValue.dyn_cast<BlockArgument>())
+      target.name = mkSymPlaceholder(
+          ::getInnerRefTo(module, port.getArgNumber(), mapping.localName,
+                          getModuleNamespace),
+          nameStr);
+    else
+      target.name =
+          mkSymPlaceholder(::getInnerRefTo(mapping.localValue.getDefiningOp(),
+                                           "", getModuleNamespace),
+                           nameStr);
+
+    // If there's an NLA, add instance path information.
+    if (mapping.nlaSym) {
+      auto nla =
+          cast<HierPathOp>(circuit.lookupSymbol(mapping.nlaSym.getAttr()));
+      assert(!nla.getNamepath().empty());
+
+      // Start from root of NLA, or from top/DUT if through it
+      bool seenRoot = false;
+      bool usesTop = nla.hasModule(dut.moduleNameAttr());
+      ArrayRef<Attribute> path = nla.getNamepath().getValue();
+      stringStorage.resize(path.drop_back().size());
+      for (const auto &attr : llvm::enumerate(path.drop_back())) {
+        auto ref = attr.value().cast<hw::InnerRefAttr>();
+        if (usesTop && !seenRoot) {
+          if (ref.getModule() == dut.moduleNameAttr())
+            seenRoot = true;
+        }
+
+        if (!usesTop || seenRoot) {
+          auto &store = stringStorage[attr.index()];
+          auto modStr = mkSymPlaceholder(ref.getModuleRef(), store.first);
+          auto instStr = mkSymPlaceholder(
+              hw::InnerRefAttr::get(ref.getModule(), ref.getName()),
+              store.second);
+          target.instances.emplace_back(modStr, instStr);
+        }
+      };
     }
-    auto idx = symbols.size();
-    symbols.push_back(hw::InnerRefAttr::get(
-        SymbolTable::getSymbolName(module),
-        getOrAddInnerSym(mapping.localValue.getDefiningOp())));
-    return llvm::formatv("~{0}|{1}>{2}", circuit.name(), module.getName(),
-                         "{{" + Twine(idx) + "}}");
+    return target.str();
   };
 
   // Generate and sort new mappings for (better) output stability
@@ -705,7 +931,7 @@ FailureOr<bool> GrandCentralSignalMappingsPass::emitUpdatedMappings(
         j.attribute("circuitPackage", circuitPackage.getValue());
     });
   });
-  auto b = OpBuilder::atBlockEnd(circuit.getBody());
+  auto b = OpBuilder::atBlockEnd(circuit.getBodyBlock());
   auto jsonOp = b.create<sv::VerbatimOp>(b.getUnknownLoc(), jsonString,
                                          ValueRange{}, b.getArrayAttr(symbols));
   // TODO: plumb option to specify path/name?

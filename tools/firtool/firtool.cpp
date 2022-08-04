@@ -23,8 +23,11 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/SV/SVPasses.h"
+#include "circt/Dialect/Seq/SeqDialect.h"
+#include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Support/LoweringOptions.h"
 #include "circt/Support/Version.h"
+#include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -97,6 +100,11 @@ static cl::opt<bool> enableAnnotationWarning(
     cl::desc("Warn about annotations that were not removed by lower-to-hw"),
     cl::init(false), cl::cat(mainCategory));
 
+static cl::opt<bool>
+    emitChiselAssertsAsSVA("emit-chisel-asserts-as-sva",
+                           cl::desc("Convert all chisel asserts into SVA"),
+                           cl::init(false), cl::cat(mainCategory));
+
 static cl::opt<bool> disableAnnotationsClassless(
     "disable-annotation-classless",
     cl::desc("Ignore annotations without a class when parsing"),
@@ -122,15 +130,36 @@ static cl::opt<bool> replSeqMem(
         "replace the seq mem for macro replacement and emit relevant metadata"),
     cl::init(false), cl::cat(mainCategory));
 
-static cl::opt<bool>
-    preserveAggregate("preserve-aggregate",
-                      cl::desc("preserve aggregate types in lower types"),
-                      cl::init(false), cl::cat(mainCategory));
+static cl::opt<circt::firrtl::PreserveAggregate::PreserveMode>
+    preserveAggregate(
+        "preserve-aggregate", cl::desc("Specify input file format:"),
+        llvm::cl::values(clEnumValN(circt::firrtl::PreserveAggregate::None,
+                                    "none", "Preserve no aggregate"),
+                         clEnumValN(circt::firrtl::PreserveAggregate::OneDimVec,
+                                    "1d-vec",
+                                    "Preserve only 1d vectors of ground type"),
+                         clEnumValN(circt::firrtl::PreserveAggregate::Vec,
+                                    "vec", "Preserve only vectors"),
+                         clEnumValN(circt::firrtl::PreserveAggregate::All,
+                                    "all", "Preserve vectors and bundles")),
+        cl::init(circt::firrtl::PreserveAggregate::None),
+        cl::cat(mainCategory));
 
 static cl::opt<bool> preservePublicTypes(
     "preserve-public-types",
     cl::desc("force to lower ports of toplevel and external modules"),
     cl::init(true), cl::cat(mainCategory));
+
+static cl::opt<firrtl::PreserveValues::PreserveMode>
+    preserveMode("preserve-values",
+                 cl::desc("specify the values which can be optimized away"),
+                 cl::values(clEnumValN(firrtl::PreserveValues::None, "none",
+                                       "Preserve no values"),
+                            clEnumValN(firrtl::PreserveValues::Named, "named",
+                                       "Preserve values with meaningful names"),
+                            clEnumValN(firrtl::PreserveValues::All, "all",
+                                       "Preserve all values")),
+                 cl::init(firrtl::PreserveValues::None), cl::cat(mainCategory));
 
 static cl::opt<std::string>
     replSeqMemCircuit("repl-seq-mem-circuit",
@@ -154,8 +183,6 @@ static cl::opt<bool> imconstprop(
         "Enable intermodule constant propagation and dead code elimination"),
     cl::init(true), cl::cat(mainCategory));
 
-// TODO: this pass is temporarily off by default, while we migrate over to the
-// new memory lowering pipeline.
 static cl::opt<bool> lowerMemory("lower-memory",
                                  cl::desc("run the lower-memory pass"),
                                  cl::init(true), cl::cat(mainCategory));
@@ -239,11 +266,12 @@ static cl::opt<bool> exportModuleHierarchy(
 static cl::opt<bool>
     checkCombCycles("firrtl-check-comb-cycles",
                     cl::desc("check combinational cycles on firrtl"),
-                    cl::init(false), cl::cat(mainCategory));
+                    cl::init(true), cl::cat(mainCategory));
 
-static cl::opt<bool> removeUnusedPorts("remove-unused-ports",
-                                       cl::desc("enable unused ports pruning"),
-                                       cl::init(true), cl::cat(mainCategory));
+static cl::opt<bool>
+    imdeadcodeelim("imdeadcodeelim",
+                   cl::desc("inter-module dead code elimination."),
+                   cl::init(true), cl::cat(mainCategory));
 
 static cl::opt<bool> mergeConnections(
     "merge-connections",
@@ -324,10 +352,35 @@ static cl::opt<bool>
                           cl::desc("Log executions of toplevel module passes"),
                           cl::init(false), cl::cat(mainCategory));
 
+static cl::opt<bool> stripFirDebugInfo(
+    "strip-fir-debug-info",
+    cl::desc("Disable source fir locator information in output Verilog"),
+    cl::init(true), cl::cat(mainCategory));
+
 static cl::opt<bool> stripDebugInfo(
     "strip-debug-info",
     cl::desc("Disable source locator information in output Verilog"),
     cl::init(false), cl::cat(mainCategory));
+
+// Build mode options.
+enum BuildMode { BuildModeDebug, BuildModeRelease };
+static cl::opt<BuildMode> buildMode(
+    "O", cl::desc("Controls how much optimization should be performed"),
+    cl::values(clEnumValN(BuildModeDebug, "debug",
+                          "compile with only necessary optimizations"),
+               clEnumValN(BuildModeRelease, "release",
+                          "compile with optimizations")),
+    cl::init(BuildModeRelease), cl::cat(mainCategory),
+    cl::callback([](const BuildMode &buildMode) {
+      switch (buildMode) {
+      case BuildModeDebug:
+        preserveMode = firrtl::PreserveValues::Named;
+        break;
+      case BuildModeRelease:
+        preserveMode = firrtl::PreserveValues::None;
+        break;
+      }
+    }));
 
 /// Create a simple canonicalizer pass.
 static std::unique_ptr<Pass> createSimpleCanonicalizerPass() {
@@ -367,12 +420,12 @@ public:
     // is circuit or module op.
     if (isa<firrtl::CircuitOp, mlir::ModuleOp>(op)) {
       auto &os = llvm::errs();
-      auto elpased = duration<double>(TimePoint::clock::now() -
+      auto elapsed = duration<double>(TimePoint::clock::now() -
                                       timePoints.pop_back_val()) /
                      seconds(1);
       os << "[firtool] ";
       os.indent(2 * --level);
-      os << "-- Done in " << llvm::format("%.3f", elpased) << " sec\n";
+      os << "-- Done in " << llvm::format("%.3f", elapsed) << " sec\n";
     }
   }
 };
@@ -383,7 +436,7 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
               Optional<std::unique_ptr<llvm::ToolOutputFile>> &outputFile) {
   // Add the annotation file if one was explicitly specified.
   unsigned numAnnotationFiles = 0;
-  for (auto inputAnnotationFilename : inputAnnotationFilenames) {
+  for (const auto &inputAnnotationFilename : inputAnnotationFilenames) {
     std::string annotationFilenameDetermined;
     if (!sourceMgr.AddIncludeFile(inputAnnotationFilename, llvm::SMLoc(),
                                   annotationFilenameDetermined)) {
@@ -395,7 +448,7 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
     ++numAnnotationFiles;
   }
 
-  for (auto file : inputOMIRFilenames) {
+  for (const auto &file : inputOMIRFilenames) {
     std::string filename;
     if (!sourceMgr.AddIncludeFile(file, llvm::SMLoc(), filename)) {
       llvm::errs() << "cannot open input annotation file '" << file
@@ -430,10 +483,10 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
     return failure();
 
   if (verbosePassExecutions) {
-    auto elpased = std::chrono::duration<double>(
+    auto elapsed = std::chrono::duration<double>(
                        llvm::sys::TimePoint<>::clock::now() - parseStartTime) /
                    std::chrono::seconds(1);
-    llvm::errs() << "[firtool] -- Done in " << llvm::format("%.3f", elpased)
+    llvm::errs() << "[firtool] -- Done in " << llvm::format("%.3f", elapsed)
                  << " sec\n";
   }
 
@@ -441,7 +494,7 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
   if (outputFormat == OutputParseOnly) {
     mlir::ModuleOp theModule = module.release();
     auto outputTimer = ts.nest("Print .mlir output");
-    theModule->print(outputFile.getValue()->os());
+    theModule->print(outputFile.value()->os());
     return success();
   }
 
@@ -455,6 +508,10 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createLowerFIRRTLAnnotationsPass(
       disableAnnotationsUnknown, disableAnnotationsClassless));
+
+  // TODO: Move this to the O1 pipeline.
+  pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+      firrtl::createDropNamesPass(preserveMode));
 
   if (!disableOptimization)
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
@@ -555,28 +612,31 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
   pm.nest<firrtl::CircuitOp>().addPass(
       firrtl::createBlackBoxReaderPass(blackBoxRoot));
 
+  pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
+      firrtl::createDropNamesPass(preserveMode));
   // The above passes, IMConstProp in particular, introduce additional
   // canonicalization opportunities that we should pick up here before we
   // proceed to output-specific pipelines.
   if (!disableOptimization) {
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
         createSimpleCanonicalizerPass());
-    if (removeUnusedPorts)
-      pm.nest<firrtl::CircuitOp>().addPass(
-          firrtl::createRemoveUnusedPortsPass());
+    if (imdeadcodeelim)
+      pm.nest<firrtl::CircuitOp>().addPass(firrtl::createIMDeadCodeElimPass());
   }
 
   if (emitOMIR)
     pm.nest<firrtl::CircuitOp>().addPass(
         firrtl::createEmitOMIRPass(omirOutFile));
 
-  if (!disableOptimization && preserveAggregate && mergeConnections)
+  if (!disableOptimization &&
+      preserveAggregate != firrtl::PreserveAggregate::None && mergeConnections)
     pm.nest<firrtl::CircuitOp>().nest<firrtl::FModuleOp>().addPass(
         firrtl::createMergeConnectionsPass(mergeConnectionsAgggresively));
 
   // Lower if we are going to verilog or if lowering was specifically requested.
   if (outputFormat != OutputIRFir) {
-    pm.addPass(createLowerFIRRTLToHWPass(enableAnnotationWarning.getValue()));
+    pm.addPass(createLowerFIRRTLToHWPass(enableAnnotationWarning.getValue(),
+                                         emitChiselAssertsAsSVA.getValue()));
 
     if (outputFormat == OutputIRHW) {
       if (!disableOptimization) {
@@ -585,6 +645,7 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
         modulePM.addPass(createSimpleCanonicalizerPass());
       }
     } else {
+      pm.addPass(seq::createSeqLowerToSVPass());
       pm.addPass(sv::createHWMemSimImplPass(replSeqMem, ignoreReadEnableMem));
 
       if (extractTestCode)
@@ -626,6 +687,14 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
       modulePM.addPass(sv::createPrettifyVerilogPass());
     }
 
+    if (stripFirDebugInfo)
+      exportPm.addPass(
+          circt::createStripDebugInfoWithPredPass([](mlir::Location loc) {
+            if (auto fileLoc = loc.dyn_cast<FileLineColLoc>())
+              return fileLoc.getFilename().getValue().endswith(".fir");
+            return false;
+          }));
+
     if (stripDebugInfo)
       exportPm.addPass(mlir::createStripDebugInfoPass());
 
@@ -634,7 +703,7 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
     default:
       llvm_unreachable("can't reach this");
     case OutputVerilog:
-      exportPm.addPass(createExportVerilogPass(outputFile.getValue()->os()));
+      exportPm.addPass(createExportVerilogPass(outputFile.value()->os()));
       break;
     case OutputSplitVerilog:
       exportPm.addPass(createExportSplitVerilogPass(outputFilename));
@@ -661,7 +730,7 @@ processBuffer(MLIRContext &context, TimingScope &ts, llvm::SourceMgr &sourceMgr,
   if (outputFormat == OutputIRFir || outputFormat == OutputIRHW ||
       outputFormat == OutputIRSV || outputFormat == OutputIRVerilog) {
     auto outputTimer = ts.nest("Print .mlir output");
-    module->print(outputFile.getValue()->os());
+    module->print(outputFile.value()->os());
   }
 
   // If requested, print the final MLIR into mlirOutFile.
@@ -769,7 +838,7 @@ static LogicalResult executeFirtool(MLIRContext &context) {
   if (outputFormat != OutputSplitVerilog) {
     // Create an output file.
     outputFile.emplace(openOutputFile(outputFilename, &errorMessage));
-    if (!outputFile.getValue()) {
+    if (!outputFile.value()) {
       llvm::errs() << errorMessage << "\n";
       return failure();
     }
@@ -789,15 +858,16 @@ static LogicalResult executeFirtool(MLIRContext &context) {
 
   // Register our dialects.
   context.loadDialect<chirrtl::CHIRRTLDialect, firrtl::FIRRTLDialect,
-                      hw::HWDialect, comb::CombDialect, sv::SVDialect>();
+                      hw::HWDialect, comb::CombDialect, seq::SeqDialect,
+                      sv::SVDialect>();
 
   // Process the input.
   if (failed(processInput(context, ts, std::move(input), outputFile)))
     return failure();
 
   // If the result succeeded and we're emitting a file, close it.
-  if (outputFile.hasValue())
-    outputFile.getValue()->keep();
+  if (outputFile.has_value())
+    outputFile.value()->keep();
 
   return success();
 }
@@ -812,6 +882,24 @@ int main(int argc, char **argv) {
   // Hide default LLVM options, other than for this tool.
   // MLIR options are added below.
   cl::HideUnrelatedOptions(mainCategory);
+
+  // Register passes before parsing command-line options, so that they are
+  // available for use with options like `--mlir-print-ir-before`.
+  {
+    // MLIR transforms:
+    // Don't use registerTransformsPasses, pulls in too much.
+    registerCSEPass();
+    registerCanonicalizerPass();
+    registerStripDebugInfoPass();
+
+    // Dialect passes:
+    firrtl::registerPasses();
+    sv::registerPasses();
+
+    // Export passes:
+    registerExportSplitVerilogPass();
+    registerExportVerilogPass();
+  }
 
   // Register any pass manager command line options.
   registerMLIRContextCLOptions();

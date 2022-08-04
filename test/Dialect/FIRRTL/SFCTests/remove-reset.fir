@@ -76,9 +76,9 @@ circuit Example :
     baz <= bar
 
     ; CHECK: %foo0_a = firrtl.regreset %clock, %arst,
-    ; CHECK: %foo0_b = firrtl.reg %clock :
+    ; CHECK: %foo0_b = firrtl.reg %clock
     ; CHECK: %foo1_a = firrtl.regreset %clock, %srst,
-    ; CHECK: %foo1_b = firrtl.reg %clock :
+    ; CHECK: %foo1_b = firrtl.reg %clock
     reg foo0 : { a : UInt<1>, b : UInt<1> }, clock with : (reset => (arst, baz))
     reg foo1 : { a : UInt<1>, b : UInt<1> }, clock with : (reset => (srst, baz))
     foo0 <= in

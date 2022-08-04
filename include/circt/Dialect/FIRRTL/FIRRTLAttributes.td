@@ -13,45 +13,25 @@
 #ifndef CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD
 #define CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD
 
+include "mlir/IR/EnumAttr.td"
+
 //===----------------------------------------------------------------------===//
 // FIRRTL Annotations Definition
 //===----------------------------------------------------------------------===//
 
-def AnnotationArrayAttr: ArrayAttrBase<
-    And<[
-      // Guarantee this is an ArrayAttr first
-      CPred<"$_self.isa<::mlir::ArrayAttr>()">,
-      // Guarantee all elements are DictionaryAttr or SubAnnotationAttr
-      CPred<"::llvm::all_of($_self.cast<::mlir::ArrayAttr>(), "
-            "[&](::mlir::Attribute attr) { return attr.isa<"
-            "::mlir::DictionaryAttr,"
-            "::circt::firrtl::SubAnnotationAttr>();})">]>,
-    "all elements must be DictionaryAttr or SubAnnotationAttr"> {
-  let constBuilderCall = "$_builder.getArrayAttr($0)";
-}
-
-def SubAnnotationAttr : AttrDef<FIRRTLDialect, "SubAnnotation"> {
-  let summary = "An Annotation that targets part of what it's attached to";
-  let description = [{
-    An Annotation that is only applicable to part of what it is attached to.
-    This uses a field ID to indicate to which field it is applicable.
-  }];
-  let mnemonic = "subAnno";
-  let parameters = (ins "int64_t":$fieldID, "DictionaryAttr":$annotations);
-
-  let assemblyFormat = "`<` `fieldID` `=` $fieldID `,` $annotations `>`";
-}
+def AnnotationArrayAttr
+  : TypedArrayAttrBase<DictionaryAttr, "Annotation array attribute">;
 
 def PortAnnotationsAttr : ArrayAttrBase<
     And<[
       // Guarantee this is an ArrayAttr first
       CPred<"$_self.isa<::mlir::ArrayAttr>()">,
-      // Guarantee all elements are DictionaryAttr or SubAnnotationAttr
+      // Guarantee all elements are an array or a dictionary.
       CPred<"::llvm::all_of($_self.cast<::mlir::ArrayAttr>(), "
             "[&](::mlir::Attribute attr) { return attr.isa<"
             "::mlir::ArrayAttr,"
             "::mlir::DictionaryAttr>();})">]>,
-    ""> {
+    "Port annotations attribute"> {
   let constBuilderCall = "$_builder.getArrayAttr($0)";
 }
 
@@ -77,6 +57,7 @@ def InvalidValueAttr : AttrDef<FIRRTLDialect, "InvalidValue"> {
 //===----------------------------------------------------------------------===//
 
 class AugmentedType<string name> : AttrDef<FIRRTLDialect, name> {
+  let description = "Used in the GrandCentralPass.";
   let parameters = (
     ins "DictionaryAttr":$underlying
   );
@@ -108,6 +89,7 @@ class AugmentedType<string name> : AttrDef<FIRRTLDialect, name> {
 }
 
 def AugmentedBundleType : AugmentedType<"AugmentedBundleType"> {
+  let summary = "GrandCentral AugmentedBundleType";
   let extraClassDeclaration =
     defaultClassDeclaration #
     hasID #
@@ -119,37 +101,47 @@ def AugmentedBundleType : AugmentedType<"AugmentedBundleType"> {
 }
 
 def AugmentedVectorType : AugmentedType<"AugmentedVectorType"> {
+  let summary = "GrandCentral AugmentedVectorType";
   let extraClassDeclaration = defaultClassDeclaration # hasElements;
 }
 
 def AugmentedGroundType : AugmentedType<"AugmentedGroundType"> {
+  let summary = "GrandCentral AugmentedGroundType";
   let extraClassDeclaration = hasID # hasName;
 }
 
 def AugmentedStringType : AugmentedType<"AugmentedStringType"> {
+  let summary = "GrandCentral AugmentedStringType";
   let extraClassDeclaration = hasName;
 }
 def AugmentedBooleanType : AugmentedType<"AugmentedBooleanType"> {
+  let summary = "GrandCentral AugmentedBooleanType";
   let extraClassDeclaration = hasName;
 }
 def AugmentedIntegerType : AugmentedType<"AugmentedIntegerType"> {
+  let summary = "GrandCentral AugmentedIntegerType";
   let extraClassDeclaration = hasName;
 }
 def AugmentedDoubleType : AugmentedType<"AugmentedDoubleType"> {
+  let summary = "GrandCentral AugmentedDoubleType";
   let extraClassDeclaration = hasName;
 }
 def AugmentedLiteralType : AugmentedType<"AugmentedLiteralType"> {
+  let summary = "GrandCentral AugmentedLiteralType";
   let extraClassDeclaration = hasName;
 }
 def AugmentedDeletedType : AugmentedType<"AugmentedDeletedType"> {
+  let summary = "GrandCentral AugmentedDeletedType";
   let extraClassDeclaration = hasName;
 }
 
 
-/// An attribute describing a module parameter, or instance parameter
-/// specification.
 def ParamDeclAttr : AttrDef<FIRRTLDialect, "ParamDecl"> {
-  let summary = "module or instance parameter definition";
+  let summary = "Module or instance parameter definition";
+  let description = [{
+    An attribute describing a module parameter, or instance parameter
+    specification.
+  }];
 
   /// The value of the attribute - in a module, this is the default
   /// value (and may be missing).  In an instance, this is a required field that
@@ -194,5 +186,84 @@ def ParamDeclAttr : AttrDef<FIRRTLDialect, "ParamDecl"> {
 /// ensures that all the values are specified.
 def ParamDeclArrayAttr
   : TypedArrayAttrBase<ParamDeclAttr, "parameter array attribute">;
+
+/// An attribute describing a kind of a name which defines name preservation
+/// semantics. We preserve names tagged with `InterestingName`.
+def DroppableName: I32EnumAttrCase<"DroppableName", 0, "droppable_name">;
+def InterestingName: I32EnumAttrCase<"InterestingName", 1, "interesting_name">;
+
+def NameKindEnumImpl: I32EnumAttr<"NameKindEnum", "name kind",
+              [DroppableName, InterestingName]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::circt::firrtl";
+}
+
+def NameKindAttr: EnumAttr<FIRRTLDialect, NameKindEnumImpl, "name_kind">;
+
+def InnerSymProperties : AttrDef<FIRRTLDialect, "InnerSymProperties"> {
+  let mnemonic = "innerSymProps";
+  let parameters = (ins
+         "StringAttr":$name,
+         DefaultValuedParameter<"int64_t", "0">:$fieldID,
+         DefaultValuedParameter<"::mlir::StringAttr", "public">:$sym_visibility
+                     );
+  let builders = [
+    AttrBuilderWithInferredContext<(ins "::mlir::StringAttr":$sym),[{
+      return get(sym.getContext(), sym, 0,
+                        StringAttr::get(sym.getContext(), "public") );
+    }]>
+  ];
+  let hasCustomAssemblyFormat = 1;
+  // The assembly format is as follows:
+  // "`<` `@` $name `,` $fieldID `,` $sym_visibility `>`";
+}
+
+def InnerSymAttr : AttrDef<FIRRTLDialect, "InnerSym"> {
+  let summary = "Inner symbol definition";
+  let description = [{
+    Defines the properties of an inner_sym attribute. It specifies the symbol
+    name and symbol visibility for each field ID. For any ground types,
+    there are no subfields and the field ID is 0. For aggregate types, a
+    unique field ID is assigned to each field by visiting them in a 
+    depth-first pre-order. The custom assembly format ensures that for ground
+    types, only `@<sym_name>` is printed.
+  }];
+  let mnemonic = "innerSym";
+  let parameters = (ins ArrayRefParameter<"InnerSymPropertiesAttr">:$props);
+  let builders = [
+    AttrBuilderWithInferredContext<(ins "::mlir::StringAttr":$sym),[{
+      return get(sym.getContext(),
+      {InnerSymPropertiesAttr::get(sym.getContext(), sym, 0,
+                        StringAttr::get(sym.getContext(), "public"))});
+    }]>,
+    // Create an empty array, represents an invalid InnerSym.
+    AttrBuilder<(ins),[{
+      return get($_ctxt, {});
+    }]>
+  ];
+  let extraClassDeclaration = [{
+    /// Get the inner sym name for fieldID, if it exists.
+    StringAttr getSymIfExists(unsigned fieldID) const;
+    /// Get the inner sym name for fieldID=0, if it exists.
+    StringAttr getSymName() const { return getSymIfExists(0); }
+    /// Get the number of inner symbols defined.
+    size_t size() const { return getProps().size(); }
+    /// Check if this is an empty array, no sym names stored.
+    bool empty() const { return getProps().empty(); }
+    using iterator = ArrayRef<InnerSymPropertiesAttr>::iterator;
+    /// Iterator begin for all the InnerSymProperties.
+    iterator begin() const { return getProps().begin(); }
+    /// Iterator end for all the InnerSymProperties.
+    iterator end() const { return getProps().end(); }
+    /// Invoke the func, for all sym names. Return success(),
+    /// if the callback function never returns failure().
+    LogicalResult walkSymbols(llvm::function_ref<
+                              LogicalResult (StringAttr)>) const;
+  }];
+
+  let hasCustomAssemblyFormat = 1;
+  // Example format:
+  // firrtl.wire sym [<@x,1,private>, <@w,2,public>, <@syh,4,public>]
+}
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLATTRIBUTES_TD

@@ -188,7 +188,7 @@ firrtl.circuit "MemDepth1" {
 
 // CHECK-LABEL: firrtl.circuit "inferUnmaskedMemory"
 firrtl.circuit "inferUnmaskedMemory" {
-  firrtl.module @inferUnmaskedMemory(in %clock: !firrtl.clock, in %rAddr: !firrtl.uint<4>, in %rEn: !firrtl.uint<1>, out %rData: !firrtl.uint<8>, in %wMask: !firrtl.uint<1>, in %wData: !firrtl.uint<8>) {
+  firrtl.module @inferUnmaskedMemory(in %clock: !firrtl.clock, in %rAddr: !firrtl.uint<4>, in %rEn: !firrtl.uint<1>, out %rData: !firrtl.uint<8>, in %wMode: !firrtl.uint<1>, in %wMask: !firrtl.uint<1>, in %wData: !firrtl.uint<8>) {
     %tbMemoryKind1_r, %tbMemoryKind1_w = firrtl.mem Undefined  {depth = 16 : i64, modName = "tbMemoryKind1_ext", name = "tbMemoryKind1", portNames = ["r", "w"], readLatency = 1 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: uint<8>>, !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<8>, mask: uint<1>>
     %0 = firrtl.subfield %tbMemoryKind1_w(3) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<8>, mask: uint<1>>) -> !firrtl.uint<8>
     %1 = firrtl.subfield %tbMemoryKind1_w(4) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<8>, mask: uint<1>>) -> !firrtl.uint<1>
@@ -210,6 +210,17 @@ firrtl.circuit "inferUnmaskedMemory" {
     firrtl.connect %0, %wData : !firrtl.uint<8>, !firrtl.uint<8>
     // CHECK: [[AND:%.+]] = firrtl.and %wMask, %rEn
     // CHECK: firrtl.connect %tbMemoryKind1_W0_en, %0
+    %MReadWrite_readwrite = firrtl.mem Undefined {depth = 12 : i64, name = "MReadWrite", portNames = ["readwrite"], readLatency = 1 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<42>, wmode: uint<1>, wdata: uint<42>, wmask: uint<1>>
+    %rw_en = firrtl.subfield %MReadWrite_readwrite(1) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<42>, wmode: uint<1>, wdata: uint<42>, wmask: uint<1>>) -> !firrtl.uint<1>
+    %rw_wmode = firrtl.subfield %MReadWrite_readwrite(4) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<42>, wmode: uint<1>, wdata: uint<42>, wmask: uint<1>>) -> !firrtl.uint<1>
+    %rw_mask = firrtl.subfield %MReadWrite_readwrite(6) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<42>, wmode: uint<1>, wdata: uint<42>, wmask: uint<1>>) -> !firrtl.uint<1>
+    firrtl.connect %rw_en, %rEn : !firrtl.uint<1>, !firrtl.uint<1>
+    firrtl.connect %rw_wmode, %wMode : !firrtl.uint<1>, !firrtl.uint<1>
+    firrtl.connect %rw_mask, %wMask : !firrtl.uint<1>, !firrtl.uint<1>
+    // CHECK:  %[[MReadWrite_RW0_addr:.+]], %[[MReadWrite_RW0_en:.+]], %[[MReadWrite_RW0_clk:.+]], %[[MReadWrite_RW0_wmode:.+]], %[[MReadWrite_RW0_wdata:.+]], %[[MReadWrite_RW0_rdata:.+]] = firrtl.instance MReadWrite  @MReadWrite
+    // CHECK:   firrtl.connect %[[MReadWrite_RW0_en]], %rEn : !firrtl.uint<1>, !firrtl.uint<1>
+    // CHECK:   %1 = firrtl.and %wMask, %wMode : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
+    // CHECK:   firrtl.connect %[[MReadWrite_RW0_wmode]], %1 : !firrtl.uint<1>, !firrtl.uint<1>
   }
 }
 
@@ -228,22 +239,39 @@ firrtl.module @Annotations() attributes {annotations = [{class = "sifive.enterpr
 // Check that annotations are copied over to the instance.
 // CHECK-LABEL: firrtl.circuit "NonLocalAnnotation"
 firrtl.circuit "NonLocalAnnotation" {
-// CHECK:       [@NonLocalAnnotation::@dut, @DUT::@sym, @mem0::@mem0_ext]
-firrtl.nla @nla [@NonLocalAnnotation::@dut, @DUT::@sym]
+
+// CHECK:  firrtl.hierpath @[[nla_0:.+]] [@NonLocalAnnotation::@dut, @DUT::@mem0, @mem0]
+firrtl.hierpath @nla0 [@NonLocalAnnotation::@dut, @DUT::@mem0]
+// CHECK:  firrtl.hierpath @[[nla_1:.+]] [@NonLocalAnnotation::@dut, @DUT::@mem1, @mem1]
+firrtl.hierpath @nla1 [@NonLocalAnnotation::@dut, @DUT]
+
 // CHECK: firrtl.module @NonLocalAnnotation()
 firrtl.module @NonLocalAnnotation()  {
   firrtl.instance dut sym @dut @DUT()
 }
 // CHECK: firrtl.module @DUT()
 firrtl.module @DUT() {
-  // CHECK: firrtl.instance mem0 sym @sym @mem0
-  %mem0_write = firrtl.mem sym @sym Undefined {annotations = [{circt.nonlocal = @nla, class = "test0"}, {circt.nonlocal = @nla, class = "test2"}], depth = 12 : i64, name = "mem0", portNames = ["write"], readLatency = 1 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<42>, mask: uint<1>>
-// LowerMemory should ignore MemOps that are not seqmems. The following memory is a combmem with readLatency=1.
+  // This memory has a symbol and an NLA directly targetting it.
+  // CHECK: firrtl.instance mem0 sym @mem0 @mem0
+  %mem0_write = firrtl.mem sym @mem0 Undefined {annotations = [{circt.nonlocal = @nla0, class = "test0"}], depth = 12 : i64, name = "mem0", portNames = ["write"], readLatency = 1 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<42>, mask: uint<1>>
+
+  // This memory does not have a symbol already attached.
+  // CHECK: firrtl.instance mem1 sym @mem1 @mem1
+  %mem1_write = firrtl.mem Undefined {annotations = [{circt.nonlocal = @nla1, class = "test1"}], depth = 12 : i64, name = "mem1", portNames = ["write"], readLatency = 1 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<42>, mask: uint<1>>
+
+// LowerMemory should ignore MemOps that are not seqmems. The following memory is a combmem with readLatency=0.
   %MRead_read = firrtl.mem Undefined {depth = 12 : i64, name = "MRead", portNames = ["read"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: uint<42>>
 // CHECK:   %MRead_read = firrtl.mem Undefined 
 }
 
 // CHECK: firrtl.module @mem0
-// CHECK:   firrtl.instance mem0_ext sym @mem0_ext  {annotations = [{circt.nonlocal = @nla, class = "test0"}, {circt.nonlocal = @nla, class = "test2"}]} @mem0_ext
+// CHECK:   firrtl.instance mem0_ext sym @mem0_ext
+// CHECK-SAME: {annotations = [{circt.nonlocal = @[[nla_0]], class = "test0"}]}
+// CHECK-SAME:  @mem0_ext(
 // CHECK: }
+
+// CHECK: firrtl.module @mem1
+// CHECK:   firrtl.instance mem0_ext sym @mem0_ext 
+// CHECK-SAME:  {annotations = [{circt.nonlocal = @[[nla_1]], class = "test1"}]}
+// CHECK-SAME:  @mem0_ext(
 }

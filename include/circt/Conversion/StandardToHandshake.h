@@ -202,6 +202,11 @@ LogicalResult lowerRegion(HandshakeLowering &hl, bool sourceConstants,
   return success();
 }
 
+/// Remove basic blocks inside the given region. This allows the result to be
+/// a valid graph region, since multi-basic block regions are not allowed to
+/// be graph regions currently.
+void removeBasicBlocks(Region &r);
+
 } // namespace handshake
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
@@ -215,6 +220,17 @@ createHandshakeCanonicalizePass();
 
 std::unique_ptr<mlir::OperationPass<handshake::FuncOp>>
 createHandshakeRemoveBlockPass();
+
+/// Insert additional blocks that serve as counterparts to the blocks that
+/// diverged the control flow.
+/// The resulting merge block tree is guaranteed to be a binary tree.
+///
+/// This transformation does treat loops like a single block and thus does not
+/// affect them.
+mlir::LogicalResult
+insertMergeBlocks(mlir::Region &r, mlir::ConversionPatternRewriter &rewriter);
+
+std::unique_ptr<mlir::Pass> createInsertMergeBlocksPass();
 
 } // namespace circt
 

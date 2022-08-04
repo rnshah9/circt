@@ -8,52 +8,62 @@ add_llvm_tool(circt-opt
 llvm_update_compile_flags(circt-opt)
 target_link_libraries(circt-opt
   PRIVATE
-  CIRCTAffineToStaticLogic
+  CIRCTAffineToPipeline
   CIRCTAnalysisTestPasses
   CIRCTCalyx
   CIRCTCalyxToHW
+  CIRCTCalyxToFSM
   CIRCTCalyxTransforms
   CIRCTESI
+  CIRCTExportSystemC
   CIRCTExportVerilog
   CIRCTFIRRTL
   CIRCTFIRRTLToHW
   CIRCTFIRRTLTransforms
   CIRCTFSM
   CIRCTFSMTransforms
+  CIRCTFSMToSV
   CIRCTHandshake
   CIRCTHandshakeToFIRRTL
   CIRCTHandshakeToHW
   CIRCTHandshakeTransforms
   CIRCTLLHD
   CIRCTLLHDToLLVM
+  CIRCTHWToLLVM
+  CIRCTCombToLLVM
   CIRCTLLHDTransforms
   CIRCTMoore
   CIRCTMooreToCore
   CIRCTMSFT
   CIRCTHW
+  CIRCTHWArith
+  CIRCTHWArithToHW
   CIRCTHWToLLHD
+  CIRCTHWToSystemC
   CIRCTHWTransforms
   CIRCTSCFToCalyx
   CIRCTScheduling
   CIRCTSchedulingTestPasses
   CIRCTSeq
   CIRCTSeqTransforms
+  CIRCTSSP
   CIRCTStandardToHandshake
-  CIRCTStandardToStaticLogic
-  CIRCTStaticLogicOps
-  CIRCTStaticLogicToCalyx
+  CIRCTStandardToPipeline
+  CIRCTPipelineOps
+  CIRCTPipelineToCalyx
   CIRCTSV
   CIRCTSVTransforms
+  CIRCTHWArith
+  CIRCTSystemC
   CIRCTTransforms
 
-  
   MLIRIR
-  MLIRLLVMIR
-  MLIRMemRef
+  MLIRLLVMDialect
+  MLIRMemRefDialect
   MLIROptLib
   MLIRParser
-  MLIRFunc
+  MLIRFuncDialect
   MLIRSupport
   MLIRTransforms
-  MLIRSCF
-  )
+  MLIRSCFDialect
+)

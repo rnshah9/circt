@@ -2,10 +2,11 @@
 #  See https://llvm.org/LICENSE.txt for license information.
 #  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+from .common import (AppID, Clock, Input, InputChannel, Output, OutputChannel)
 from .module import (externmodule, generator, module, no_connect)
-from .module import (Input, InputChannel, Output, OutputChannel)
 from .system import (System)
 from .pycde_types import (dim, types)
+from .value import (Value)
 from circt.support import (connect)
 
 import mlir.ir

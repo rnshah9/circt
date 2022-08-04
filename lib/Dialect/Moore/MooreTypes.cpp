@@ -12,6 +12,7 @@
 
 #include "circt/Dialect/Moore/MooreTypes.h"
 #include "circt/Dialect/Moore/MooreDialect.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -476,8 +477,8 @@ Optional<IntType::Kind> IntType::getKindFromDomainAndSize(Domain domain,
 
 IntType IntType::get(MLIRContext *context, Kind kind, Optional<Sign> sign) {
   return Base::get(context, detail::IntTypeStorage::pack(
-                                kind, sign.getValueOr(getDefaultSign(kind)),
-                                sign.hasValue()));
+                                kind, sign.value_or(getDefaultSign(kind)),
+                                sign.has_value()));
 }
 
 IntType::Kind IntType::getKind() const { return getImpl()->kind; }
@@ -928,7 +929,7 @@ UnpackedType UnpackedAssocDim::getIndexType() const {
 
 UnpackedQueueDim UnpackedQueueDim::get(UnpackedType inner,
                                        Optional<unsigned> bound) {
-  auto type = Base::get(inner.getContext(), inner, bound.getValueOr(-1));
+  auto type = Base::get(inner.getContext(), inner, bound.value_or(-1));
   type.getImpl()->finalize<UnpackedQueueDim>(type, bound);
   return type;
 }
@@ -1120,7 +1121,7 @@ PackedStructType PackedStructType::get(StructKind kind,
          "packed struct members must be packed");
   return Base::get(loc.getContext(),
                    detail::StructTypeStorage::pack(
-                       kind, sign.getValueOr(Sign::Unsigned), sign.hasValue()),
+                       kind, sign.value_or(Sign::Unsigned), sign.has_value()),
                    members, name, loc);
 }
 
@@ -1548,10 +1549,7 @@ static ParseResult parseMooreType(DialectAsmParser &parser, Subset subset,
                                   Type &type) {
   llvm::SMLoc loc = parser.getCurrentLocation();
   StringRef mnemonic;
-  if (parser.parseKeyword(&mnemonic))
-    return failure();
-
-  OptionalParseResult result = generatedTypeParser(parser, mnemonic, type);
+  OptionalParseResult result = generatedTypeParser(parser, &mnemonic, type);
   if (result.hasValue())
     return result.getValue();
 

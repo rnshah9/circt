@@ -98,7 +98,7 @@ firrtl.circuit "foo" {
 // expected-error @+1 {{requires one region}}
 "firrtl.module"() ( { }, { })
    {sym_name = "foo", portTypes = [!firrtl.uint], portDirections = 1 : i1,
-    portNames = ["in0"], portAnnotations = [], portSyms = [""]} : () -> ()
+    portNames = ["in0"], portAnnotations = [], portSyms = []} : () -> ()
 }
 
 
@@ -109,7 +109,7 @@ firrtl.circuit "foo" {
 "firrtl.module"() ( {
   ^entry:
 }) {sym_name = "foo", portTypes = [!firrtl.uint], portDirections = 1 : i1,
-    portNames = ["in0"], portAnnotations = [], portSyms = [""]} : () -> ()
+    portNames = ["in0"], portAnnotations = [], portSyms = []} : () -> ()
 }
 
 // -----
@@ -119,7 +119,7 @@ firrtl.circuit "foo" {
 "firrtl.module"() ( {
   ^entry(%a: i1):
 }) {sym_name = "foo", portTypes = [!firrtl.uint], portDirections = 1 : i1,
-    portNames = ["in0"], portAnnotations = [], portSyms = [""]} : () -> ()
+    portNames = ["in0"], portAnnotations = [], portSyms = []} : () -> ()
 }
 
 // -----
@@ -663,7 +663,7 @@ firrtl.circuit "BitCast4" {
 firrtl.circuit "NLAWithNestedReference" {
 firrtl.module @NLAWithNestedReference() { }
 // expected-error @below {{only one nested reference is allowed}}
-firrtl.nla @nla [@A::@B::@C]
+firrtl.hierpath @nla [@A::@B::@C]
 }
 
 // -----
@@ -671,11 +671,11 @@ firrtl.nla @nla [@A::@B::@C]
 
 firrtl.circuit "LowerToBind" {
  // expected-error @+1 {{the instance path cannot be empty/single element}}
-firrtl.nla @NLA1 []
-firrtl.nla @NLA2 [@LowerToBind::@s1]
+firrtl.hierpath @NLA1 []
+firrtl.hierpath @NLA2 [@LowerToBind::@s1]
 firrtl.module @InstanceLowerToBind() {}
 firrtl.module @LowerToBind() {
-  firrtl.instance foo sym @s1 {lowerToBind = true, annotations = [{circt.nonlocal = @NLA2, class = "circt.test", nl = "nl"}]} @InstanceLowerToBind() 
+  firrtl.instance foo sym @s1 {lowerToBind} @InstanceLowerToBind()
 }
 }
 
@@ -684,16 +684,16 @@ firrtl.module @LowerToBind() {
 firrtl.circuit "NLATop" {
 
  // expected-error @+1 {{the instance path can only contain inner sym reference, only the leaf can refer to a module symbol}}
-  firrtl.nla @nla [@NLATop::@test, @Aardvark, @Zebra]
-  firrtl.nla @nla_1 [@NLATop::@test,@Aardvark::@test_1, @Zebra]
+  firrtl.hierpath @nla [@NLATop::@test, @Aardvark, @Zebra]
+  firrtl.hierpath @nla_1 [@NLATop::@test,@Aardvark::@test_1, @Zebra]
   firrtl.module @NLATop() {
-    firrtl.instance test  sym @test {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}, {circt.nonlocal = @nla_1, class = "circt.nonlocal"} ]}@Aardvark()
+    firrtl.instance test  sym @test @Aardvark()
     firrtl.instance test2 @Zebra()
   }
 
   firrtl.module @Aardvark() {
-    firrtl.instance test sym @test {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}]}@Zebra()
-    firrtl.instance test1 sym @test_1 {annotations = [{circt.nonlocal = @nla_1, class = "circt.nonlocal"}]}@Zebra()
+    firrtl.instance test sym @test @Zebra()
+    firrtl.instance test1 sym @test_1 @Zebra()
   }
 
   firrtl.module @Zebra() {
@@ -704,21 +704,21 @@ firrtl.circuit "NLATop" {
 
 firrtl.circuit "NLATop1" {
   // expected-error @+1 {{instance path is incorrect. Expected module: "Aardvark" instead found: "Zebra"}}
-  firrtl.nla @nla [@NLATop1::@test, @Zebra::@test,@Aardvark::@test]
-  firrtl.nla @nla_1 [@NLATop1::@test,@Aardvark::@test_1, @Zebra]
+  firrtl.hierpath @nla [@NLATop1::@test, @Zebra::@test,@Aardvark::@test]
+  firrtl.hierpath @nla_1 [@NLATop1::@test,@Aardvark::@test_1, @Zebra]
   firrtl.module @NLATop1() {
-    firrtl.instance test  sym @test {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}, {circt.nonlocal = @nla_1, class = "circt.nonlocal"} ]}@Aardvark()
+    firrtl.instance test  sym @test @Aardvark()
     firrtl.instance test2 @Zebra()
   }
 
   firrtl.module @Aardvark() {
-    firrtl.instance test sym @test {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}]}@Zebra()
-    firrtl.instance test1 sym @test_1 {annotations = [{circt.nonlocal = @nla_1, class = "circt.nonlocal"}]}@Zebra()
+    firrtl.instance test sym @test @Zebra()
+    firrtl.instance test1 sym @test_1 @Zebra()
   }
 
   firrtl.module @Zebra() {
-    firrtl.instance test sym @test {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}]}@Ext()
-    firrtl.instance test1 sym @test_1 {annotations = [{circt.nonlocal = @nla_1, class = "circt.nonlocal"}]}@Ext()
+    firrtl.instance test sym @test @Ext()
+    firrtl.instance test1 sym @test_1 @Ext()
   }
 
   firrtl.module @Ext() {
@@ -730,20 +730,20 @@ firrtl.circuit "NLATop1" {
 // This should not error out. Note that there is no symbol on the %bundle. This handles a special case, when the nonlocal is applied to a subfield.
 firrtl.circuit "fallBackName" {
 
-  firrtl.nla @nla [@fallBackName::@test, @Aardvark::@test, @Zebra::@bundle]
-  firrtl.nla @nla_1 [@fallBackName::@test,@Aardvark::@test_1, @Zebra]
+  firrtl.hierpath @nla [@fallBackName::@test, @Aardvark::@test, @Zebra::@bundle]
+  firrtl.hierpath @nla_1 [@fallBackName::@test,@Aardvark::@test_1, @Zebra]
   firrtl.module @fallBackName() {
-    firrtl.instance test  sym @test {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}, {circt.nonlocal = @nla_1, class = "circt.nonlocal"} ]}@Aardvark()
+    firrtl.instance test  sym @test @Aardvark()
     firrtl.instance test2 @Zebra()
   }
 
   firrtl.module @Aardvark() {
-    firrtl.instance test sym @test {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}]}@Zebra()
-    firrtl.instance test1 sym @test_1 {annotations = [{circt.nonlocal = @nla_1, class = "circt.nonlocal"}]}@Zebra()
+    firrtl.instance test sym @test @Zebra()
+    firrtl.instance test1 sym @test_1 @Zebra()
   }
 
   firrtl.module @Zebra(){
-    %bundle = firrtl.wire  sym @bundle {annotations = [#firrtl<"subAnno<fieldID = 2, {circt.nonlocal = @nla, class =\"test\" }>">]}: !firrtl.bundle<valid: uint<1>, ready: uint<1>, data: uint<64>>
+    %bundle = firrtl.wire  sym @bundle {annotations = [{circt.fieldID = 2 : i32, circt.nonlocal = @nla, class ="test"}]}: !firrtl.bundle<valid: uint<1>, ready: uint<1>, data: uint<64>>
   }
 }
 
@@ -751,11 +751,11 @@ firrtl.circuit "fallBackName" {
 
 firrtl.circuit "Foo"   {
   // expected-error @+1 {{operation with symbol: #hw.innerNameRef<@Bar::@b> was not found}}
-  firrtl.nla @nla_1 [@Foo::@bar, @Bar::@b]
-  firrtl.module @Bar(in %a: !firrtl.uint<1>, out %b: !firrtl.bundle<baz: uint<1>, qux: uint<1>> [#firrtl.subAnno<fieldID = 2, {circt.nonlocal = @nla_1, three}>], out %c: !firrtl.uint<1>) {
+  firrtl.hierpath @nla_1 [@Foo::@bar, @Bar::@b]
+  firrtl.module @Bar(in %a: !firrtl.uint<1>, out %b: !firrtl.bundle<baz: uint<1>, qux: uint<1>> [{circt.fieldID = 2 : i32, circt.nonlocal = @nla_1, three}], out %c: !firrtl.uint<1>) {
   }
   firrtl.module @Foo() {
-    %bar_a, %bar_b, %bar_c = firrtl.instance bar sym @bar  {annotations = [{circt.nonlocal = @nla_1, class = "circt.nonlocal"}]} @Bar(in a: !firrtl.uint<1> [{one}], out b: !firrtl.bundle<baz: uint<1>, qux: uint<1>> [#firrtl.subAnno<fieldID = 1, {two}>], out c: !firrtl.uint<1> [{four}])
+    %bar_a, %bar_b, %bar_c = firrtl.instance bar sym @bar  @Bar(in a: !firrtl.uint<1> [{one}], out b: !firrtl.bundle<baz: uint<1>, qux: uint<1>> [{circt.fieldID = 1 : i32, two}], out c: !firrtl.uint<1> [{four}])
   }
 }
 
@@ -763,17 +763,17 @@ firrtl.circuit "Foo"   {
 
 firrtl.circuit "Top"   {
  // Legal nla would be:
-//firrtl.nla @nla [@Top::@mid, @Mid::@leaf, @Leaf::@w]
+//firrtl.hierpath @nla [@Top::@mid, @Mid::@leaf, @Leaf::@w]
   // expected-error @+1 {{instance path is incorrect. Expected module: "Middle" instead found: "Leaf"}}
-  firrtl.nla @nla [@Top::@mid, @Leaf::@w]
+  firrtl.hierpath @nla [@Top::@mid, @Leaf::@w]
   firrtl.module @Leaf() {
     %w = firrtl.wire sym @w  {annotations = [{circt.nonlocal = @nla, class = "fake1"}]} : !firrtl.uint<3>
   }
   firrtl.module @Middle() {
-    firrtl.instance leaf sym @leaf  {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}]} @Leaf()
+    firrtl.instance leaf sym @leaf  @Leaf()
   }
   firrtl.module @Top() {
-    firrtl.instance mid sym @mid  {annotations = [{circt.nonlocal = @nla, class = "circt.nonlocal"}]} @Middle()
+    firrtl.instance mid sym @mid  @Middle()
   }
 }
 
@@ -821,4 +821,85 @@ firrtl.circuit "MismatchedRegister" {
 // expected-error @+1 {{'firrtl.circuit' op main module 'private_main' must be public}}
 firrtl.circuit "private_main" {
   firrtl.module private @private_main() {}
+}
+
+// -----
+
+firrtl.circuit "InnerSymAttr" {
+  firrtl.module @InnerSymAttr() {
+    // expected-error @+1 {{cannot assign multiple symbol names to the field id:'2'}}
+    %w3 = firrtl.wire sym [<@w3,2,public>,<@x2,2,private>,<@syh2,0,public>] : !firrtl.bundle<a: uint<1>, b: uint<1>, c: uint<1>, d: uint<1>>
+  }
+}
+
+// -----
+
+firrtl.circuit "InnerSymAttr2" {
+  firrtl.module @InnerSymAttr2() {
+    // expected-error @+1 {{cannot reuse symbol name:'w3'}}
+    %w4 = firrtl.wire sym [<@w3,1,public>,<@w3,2,private>,<@syh2,0,public>] : !firrtl.bundle<a: uint<1>, b: uint<1>, c: uint<1>, d: uint<1>>
+  }
+}
+
+// -----
+firrtl.circuit "Parent" {
+  firrtl.module @Child() {
+    %w = firrtl.wire sym @w : !firrtl.uint<1>
+  }
+  firrtl.module @Parent() {
+    // expected-error @+1 {{cannot assign symbols to non-zero field id, for ops with zero or multiple results}}
+    firrtl.instance child sym [<@w3,1,public>,<@w3,2,private>,<@syh2,0,public>] @Child()
+  }
+}
+
+// -----
+
+firrtl.circuit "Foo" {
+  firrtl.module @Foo() {
+  // expected-error @+1 {{field id:'1' is greater than the maximum field id:'0'}}
+    %m = firrtl.mem sym [<@w3,1,public>,<@w3,2,private>,<@syh2,0,public>] Undefined {depth = 32 : i64, name = "m", portNames = ["rw"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<>
+  }
+}
+
+// -----
+
+firrtl.circuit "Foo"   {
+  firrtl.module @Bar(in %a: !firrtl.uint<1>, out %b: !firrtl.bundle<baz: uint<1>, qux: uint<1>>, out %c: !firrtl.uint<1>) {
+  }
+  firrtl.module @Foo() {
+    // expected-error @+1 {{cannot assign symbols to non-zero field id, for ops with zero or multiple results}}
+    %bar_a, %bar_b, %bar_c = firrtl.instance bar sym [<@w3,1,public>,<@w3,2,private>,<@syh2,0,public>] @Bar(in a: !firrtl.uint<1> [{one}], out b: !firrtl.bundle<baz: uint<1>, qux: uint<1>> [{circt.fieldID = 1 : i32, two}], out c: !firrtl.uint<1> [{four}])
+  }
+}
+
+// -----
+
+firrtl.circuit "DupSyms" {
+  firrtl.module @DupSyms() {
+    // expected-note @+1 {{see existing inner symbol definition here}}
+    %w1 = firrtl.wire sym @x : !firrtl.uint<2>
+    // expected-error @+1 {{redefinition of inner symbol named 'x'}}
+    %w2 = firrtl.wire sym @x : !firrtl.uint<2>
+  }
+}
+
+// -----
+
+firrtl.circuit "DupSymPort" {
+  // expected-note @+1 {{see existing inner symbol definition here}}
+  firrtl.module @DupSymPort(in %a : !firrtl.uint<1> sym @x) {
+    // expected-error @+1 {{redefinition of inner symbol named 'x'}}
+    %w1 = firrtl.wire sym @x : !firrtl.uint<2>
+  }
+}
+
+// -----
+
+firrtl.circuit "DupSymField" {
+  firrtl.module @DupSymField() {
+    // expected-note @+1 {{see existing inner symbol definition here}}
+    %w1 = firrtl.wire sym @x : !firrtl.uint<2>
+    // expected-error @+1 {{redefinition of inner symbol named 'x'}}
+    %w3 = firrtl.wire sym [<@x,1,public>] : !firrtl.vector<uint<1>,1>
+  }
 }

@@ -197,13 +197,13 @@ class ModuleLike:
         hw.ParamDeclAttr(a) for a in ArrayAttr(self.attributes["parameters"])
     ]
 
-  def create(self,
-             name: str,
-             parameters: Dict[str, object] = {},
-             results=None,
-             loc=None,
-             ip=None,
-             **kwargs):
+  def instantiate(self,
+                  name: str,
+                  parameters: Dict[str, object] = {},
+                  results=None,
+                  loc=None,
+                  ip=None,
+                  **kwargs):
     return InstanceBuilder(self,
                            name,
                            kwargs,
@@ -401,6 +401,22 @@ class ArrayGetOp:
     return hw.ArrayGetOp(array_type.element_type, array_value, idx_val)
 
 
+class ArraySliceOp:
+
+  @staticmethod
+  def create(array_value, low_index, ret_type):
+    array_value = support.get_value(array_value)
+    array_type = support.get_self_or_inner(array_value.type)
+    if isinstance(low_index, int):
+      idx_width = (array_type.size - 1).bit_length()
+      idx_width = max(1, idx_width)  # hw.constant cannot produce i0.
+      idx_val = ConstantOp.create(IntegerType.get_signless(idx_width),
+                                  low_index).result
+    else:
+      idx_val = support.get_value(low_index)
+    return hw.ArraySliceOp(ret_type, array_value, idx_val)
+
+
 class ArrayCreateOp:
 
   @staticmethod
@@ -409,14 +425,15 @@ class ArrayCreateOp:
       raise ValueError("Cannot 'create' an array of length zero")
     vals = []
     type = None
-    for arg in elements:
+    for i, arg in enumerate(elements):
       arg_val = support.get_value(arg)
       vals.append(arg_val)
       if type is None:
         type = arg_val.type
       elif type != arg_val.type:
         raise TypeError(
-            "All arguments must be the same type to create an array")
+            f"Argument {i} has a different element type ({arg_val.type}) than the element type of the array ({type})"
+        )
     return hw.ArrayCreateOp(hw.ArrayType.get(type, len(vals)), vals)
 
 
@@ -427,7 +444,7 @@ class ArrayConcatOp:
     vals = []
     types = []
     element_type = None
-    for array in sub_arrays:
+    for i, array in enumerate(sub_arrays):
       array_value = support.get_value(array)
       array_type = support.type_to_pytype(array_value.type)
       if array_value is None or not isinstance(array_type, hw.ArrayType):
@@ -436,7 +453,9 @@ class ArrayConcatOp:
         element_type = array_type.element_type
       elif element_type != array_type.element_type:
         raise TypeError(
-            "All arguments must be the same type to concatenate arrays")
+            f"Argument {i} has a different element type ({element_type}) than the element type of the array ({array_type.element_type})"
+        )
+
       vals.append(array_value)
       types.append(array_type)
 
@@ -460,7 +479,9 @@ class StructCreateOp:
     else:
       result_type_inner = support.get_self_or_inner(result_type)
       if result_type_inner != struct_type:
-        raise TypeError("result_type must match generated struct")
+        raise TypeError(
+            f"result type:\n\t{result_type_inner}\nmust match generated struct type:\n\t{struct_type}"
+        )
 
     return hw.StructCreateOp(result_type,
                              [value for (_, value) in elem_name_values])
@@ -481,8 +502,9 @@ class TypedeclOp:
 
   @staticmethod
   def create(sym_name: str, type: Type, verilog_name: str = None):
-    return hw.TypedeclOp(StringAttr.get(sym_name), TypeAttr.get(type),
-                         verilog_name)
+    return hw.TypedeclOp(StringAttr.get(sym_name),
+                         TypeAttr.get(type),
+                         verilogName=verilog_name)
 
 
 class TypeScopeOp:

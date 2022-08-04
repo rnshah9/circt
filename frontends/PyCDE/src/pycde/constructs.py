@@ -4,12 +4,25 @@
 
 from __future__ import annotations
 
-from .support import _obj_to_value
 from .pycde_types import dim
-from .value import Value
+from .value import BitVectorValue, ListValue, Value
 from circt.support import get_value
 from circt.dialects import msft, hw
 import mlir.ir as ir
+
+import typing
+
+
+def Mux(sel: BitVectorValue, *data_inputs: typing.List[Value]):
+  """Create a single mux from a list of values."""
+  num_inputs = len(data_inputs)
+  if num_inputs == 0:
+    raise ValueError("'Mux' must have 1 or more data input")
+  if num_inputs == 1:
+    return data_inputs[0]
+  if sel.type.width != (num_inputs - 1).bit_length():
+    raise TypeError("'Sel' bit width must be clog2 of number of inputs")
+  return ListValue(data_inputs)[sel]
 
 
 def SystolicArray(row_inputs, col_inputs, pe_builder):
@@ -24,7 +37,7 @@ def SystolicArray(row_inputs, col_inputs, pe_builder):
   with ir.InsertionPoint(pe_block):
     result = pe_builder(Value(pe_block.arguments[0]),
                         Value(pe_block.arguments[1]))
-    value = _obj_to_value(result, result.type)
+    value = Value(result)
     pe_output_type = value.type
     msft.PEOutputOp(value.value)
 
@@ -35,4 +48,4 @@ def SystolicArray(row_inputs, col_inputs, pe_builder):
   dummy_op.regions[0].blocks[0].append_to(array.regions[0])
   dummy_op.operation.erase()
 
-  return array.peOutputs
+  return Value(array.peOutputs)

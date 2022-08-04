@@ -85,6 +85,7 @@ The current set of "style" Lowering Options is:
    information style.  The available styles are:
    * `plain`: `// perf/regress/AndNot.fir:3:10, :7:{10,17}`
    * `wrapInAtSquareBracket`: `// @[perf/regress/AndNot.fir:3:10, :7:{10,17}]`
+   * `none`: (no comment emitted)
  * `disallowPortDeclSharing` (default=`false`).  If true, emit one port per
    declaration.  Instead of `input a,\n b` this will produce
    `input a,\n input b`.  When false, ports are emitted using the same
@@ -197,7 +198,7 @@ are run in this order:
    "prettiness", and should always be used in practice.
 2) The mandatory [`PrepareForEmission` logic] that is built into the
    `exportVerilog` function, and is thus mandatory.
-3) The core [`ExportVerilog`](https://github.com/llvm/circt/blob/main/lib/Translation/ExportVerilog/ExportVerilog.cpp) logic, which handles printing out
+3) The core [`ExportVerilog`](https://github.com/llvm/circt/blob/main/lib/Conversion/ExportVerilog/ExportVerilog.cpp) logic, which handles printing out
    of Verilog source code.
 
 The first two of these are highly parameterized on `LoweringOptions`, and we're

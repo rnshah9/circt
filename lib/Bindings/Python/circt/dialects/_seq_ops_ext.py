@@ -1,6 +1,6 @@
 from circt.support import BackedgeBuilder, NamedValueOpView
 
-from mlir.ir import IntegerType, OpView, StringAttr
+from mlir.ir import ArrayAttr, IntegerType, OpView, StringAttr
 
 
 class CompRegBuilder(NamedValueOpView):

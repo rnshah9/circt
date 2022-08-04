@@ -69,6 +69,48 @@ struct AnnoPathValue {
   }
 };
 
+/// Cache AnnoTargets for a module's named things.
+struct AnnoTargetCache {
+  AnnoTargetCache() = delete;
+  AnnoTargetCache(const AnnoTargetCache &other) = default;
+  AnnoTargetCache(AnnoTargetCache &&other)
+      : targets(std::move(other.targets)){};
+
+  AnnoTargetCache(FModuleLike mod) { gatherTargets(mod); };
+
+  /// Lookup the target for 'name', empty if not found.
+  /// (check for validity using operator bool()).
+  AnnoTarget getTargetForName(StringRef name) const {
+    return targets.lookup(name);
+  }
+
+private:
+  /// Walk the module and add named things to 'targets'.
+  void gatherTargets(FModuleLike mod);
+
+  llvm::DenseMap<StringRef, AnnoTarget> targets;
+};
+
+/// Cache AnnoTargets for a circuit's modules, walked as needed.
+struct CircuitTargetCache {
+  /// Get cache for specified module, creating it as needed.
+  /// Returned reference may become invalidated by future calls.
+  const AnnoTargetCache &getOrCreateCacheFor(FModuleLike module) {
+    auto it = targetCaches.find(module);
+    if (it == targetCaches.end())
+      it = targetCaches.try_emplace(module, module).first;
+    return it->second;
+  }
+
+  /// Lookup the target for 'name' in 'module'.
+  AnnoTarget lookup(FModuleLike module, StringRef name) {
+    return getOrCreateCacheFor(module).getTargetForName(name);
+  }
+
+private:
+  DenseMap<Operation *, AnnoTargetCache> targetCaches;
+};
+
 /// Return an input \p target string in canonical form.  This converts a Legacy
 /// Annotation (e.g., A.B.C) into a modern annotation (e.g., ~A|B>C).  Trailing
 /// subfield/subindex references are preserved.
@@ -80,11 +122,13 @@ Optional<TokenAnnoTarget> tokenizePath(StringRef origTarget);
 /// Convert a parsed target string to a resolved target structure.  This
 /// resolves all names and aggregates from a parsed target.
 Optional<AnnoPathValue> resolveEntities(TokenAnnoTarget path, CircuitOp circuit,
-                                        SymbolTable &symTbl);
+                                        SymbolTable &symTbl,
+                                        CircuitTargetCache &cache);
 
 /// Resolve a string path to a named item inside a circuit.
 Optional<AnnoPathValue> resolvePath(StringRef rawPath, CircuitOp circuit,
-                                    SymbolTable &symTbl);
+                                    SymbolTable &symTbl,
+                                    CircuitTargetCache &cache);
 
 /// Return true if an Annotation's class name is handled by the LowerAnnotations
 /// pass.
@@ -99,6 +143,7 @@ struct ApplyState {
 
   CircuitOp circuit;
   SymbolTable &symTbl;
+  CircuitTargetCache targetCaches;
   AddToWorklistFn addToWorklistFn;
 
   ModuleNamespace &getNamespace(FModuleLike module) {
@@ -118,19 +163,25 @@ private:
   unsigned annotationID = 0;
 };
 
-LogicalResult applyGCTView(AnnoPathValue target, DictionaryAttr anno,
+LogicalResult applyGCTView(const AnnoPathValue &target, DictionaryAttr anno,
                            ApplyState &state);
 
-LogicalResult applyGCTDataTaps(AnnoPathValue target, DictionaryAttr anno,
+LogicalResult applyGCTDataTaps(const AnnoPathValue &target, DictionaryAttr anno,
                                ApplyState &state);
 
-LogicalResult applyGCTMemTaps(AnnoPathValue target, DictionaryAttr anno,
+LogicalResult applyGCTMemTaps(const AnnoPathValue &target, DictionaryAttr anno,
                               ApplyState &state);
 
-/// Implements the same behavior as DictionaryAttr::getAs<A> to return the value
-/// of a specific type associated with a key in a dictionary.  However, this is
-/// specialized to print a useful error message, specific to custom annotation
-/// process, on failure.
+LogicalResult applyGCTSignalMappings(const AnnoPathValue &target,
+                                     DictionaryAttr anno, ApplyState &state);
+
+LogicalResult applyOMIR(const AnnoPathValue &target, DictionaryAttr anno,
+                        ApplyState &state);
+
+/// Implements the same behavior as DictionaryAttr::getAs<A> to return the
+/// value of a specific type associated with a key in a dictionary. However,
+/// this is specialized to print a useful error message, specific to custom
+/// annotation process, on failure.
 template <typename A>
 A tryGetAs(DictionaryAttr &dict, const Attribute &root, StringRef key,
            Location loc, Twine className, Twine path = Twine()) {

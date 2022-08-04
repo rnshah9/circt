@@ -1,10 +1,10 @@
-// RUN: circt-reduce %s --test %S/test.sh --test-arg cat --test-arg "firrtl.module @Basic" --keep-best=0 --include memory-stubber | FileCheck %s
+// RUN: circt-reduce %s --test %S/test.sh --test-arg cat --test-arg "firrtl.module @Basic" --keep-best=0 --include memory-stubber --test-must-fail | FileCheck %s
 
 firrtl.circuit "Basic"   {
   // CHECK-LABEL: @Basic
   firrtl.module @Basic() {
     %memory_r = firrtl.mem Undefined  {depth = 16 : i64, name = "memory", portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: uint<8>>
-    // CHECK: %memory_r = firrtl.wire  : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: uint<8>>
+    // CHECK: %memory_r = firrtl.wire : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: uint<8>>
     // CHECK: [[MEM_ADDR:%.+]] = firrtl.subfield %memory_r(0)
     // CHECK: [[MEM_EN:%.+]] = firrtl.subfield %memory_r(1)
     // CHECK: [[XOR:%.+]] = firrtl.xor [[MEM_ADDR]], [[MEM_EN]]

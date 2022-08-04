@@ -176,6 +176,13 @@ InstanceOp::verifySignatureMatch(const hw::ModulePortInfo &ports) {
   return success();
 }
 
+void InstanceOp::build(OpBuilder &builder, OperationState &state,
+                       ArrayRef<Type> resultTypes, StringAttr sym_name,
+                       FlatSymbolRefAttr moduleName, ArrayRef<Value> inputs) {
+  build(builder, state, resultTypes, sym_name, moduleName, inputs, ArrayAttr(),
+        SymbolRefAttr());
+}
+
 /// Return an encapsulated set of information about input and output ports of
 /// the specified module or instance.  The input ports always come before the
 /// output ports in the list.
@@ -307,6 +314,15 @@ SmallVector<unsigned> MSFTModuleOp::removePorts(llvm::BitVector inputs,
   body->eraseArguments(inputs);
 
   return newToOldResultMap;
+}
+
+void MSFTModuleOp::modifyPorts(
+    llvm::ArrayRef<std::pair<unsigned int, circt::hw::PortInfo>> insertInputs,
+    llvm::ArrayRef<std::pair<unsigned int, circt::hw::PortInfo>> insertOutputs,
+    llvm::ArrayRef<unsigned int> eraseInputs,
+    llvm::ArrayRef<unsigned int> eraseOutputs) {
+  hw::modifyModulePorts(*this, insertInputs, insertOutputs, eraseInputs,
+                        eraseOutputs);
 }
 
 // Copied nearly exactly from hwops.cpp.

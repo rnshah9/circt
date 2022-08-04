@@ -70,12 +70,41 @@ static void printCHIRRTLOp(OpAsmPrinter &p, Operation *op, DictionaryAttr attr,
   if (actualName == expectedName ||
       (expectedName.empty() && isdigit(actualName[0])))
     elides.push_back("name");
+  elides.push_back("nameKind");
 
   // Elide "annotations" if it is empty.
   if (op->getAttrOfType<ArrayAttr>("annotations").empty())
     elides.push_back("annotations");
 
   p.printOptionalAttrDict(op->getAttrs(), elides);
+}
+
+//===----------------------------------------------------------------------===//
+// NameKind Custom Directive
+//===----------------------------------------------------------------------===//
+
+static ParseResult parseNameKind(OpAsmParser &parser,
+                                 firrtl::NameKindEnumAttr &result) {
+  StringRef keyword;
+
+  if (!parser.parseOptionalKeyword(&keyword,
+                                   {"interesting_name", "droppable_name"})) {
+    auto kind = symbolizeNameKindEnum(keyword);
+    result = NameKindEnumAttr::get(parser.getContext(), kind.value());
+    return success();
+  }
+
+  // Default is droppable name.
+  result =
+      NameKindEnumAttr::get(parser.getContext(), NameKindEnum::DroppableName);
+  return success();
+}
+
+static void printNameKind(OpAsmPrinter &p, Operation *op,
+                          firrtl::NameKindEnumAttr attr,
+                          ArrayRef<StringRef> extraElides = {}) {
+  if (attr.getValue() != NameKindEnum::DroppableName)
+    p << stringifyNameKindEnum(attr.getValue());
 }
 
 //===----------------------------------------------------------------------===//
@@ -110,25 +139,25 @@ LogicalResult MemoryPortOp::inferReturnTypes(MLIRContext *context,
 LogicalResult MemoryPortOp::verify() {
   // MemoryPorts require exactly 1 access. Right now there are no other
   // operations that could be using that value due to the types.
-  if (!port().hasOneUse())
+  if (!getPort().hasOneUse())
     return emitOpError("port should be used by a chirrtl.memoryport.access");
   return success();
 }
 
 MemoryPortAccessOp MemoryPortOp::getAccess() {
-  auto uses = port().use_begin();
-  if (uses == port().use_end())
+  auto uses = getPort().use_begin();
+  if (uses == getPort().use_end())
     return {};
   return cast<MemoryPortAccessOp>(uses->getOwner());
 }
 
 void MemoryPortOp::getAsmResultNames(
     function_ref<void(Value, StringRef)> setNameFn) {
-  StringRef base = name();
+  StringRef base = getName();
   if (base.empty())
     base = "memport";
-  setNameFn(data(), (base + "_data").str());
-  setNameFn(port(), (base + "_port").str());
+  setNameFn(getData(), (base + "_data").str());
+  setNameFn(getPort(), (base + "_port").str());
 }
 
 static ParseResult parseMemoryPortOp(OpAsmParser &parser,
@@ -168,15 +197,16 @@ static void printCombMemOp(OpAsmPrinter &p, Operation *op,
 
 void CombMemOp::build(OpBuilder &builder, OperationState &result,
                       FIRRTLType elementType, uint64_t numElements,
-                      StringRef name, ArrayAttr annotations,
-                      StringAttr innerSym) {
+                      StringRef name, NameKindEnum nameKind,
+                      ArrayAttr annotations, StringAttr innerSym) {
   build(builder, result,
         CMemoryType::get(builder.getContext(), elementType, numElements), name,
-        annotations, innerSym);
+        nameKind, annotations,
+        innerSym ? InnerSymAttr::get(innerSym) : InnerSymAttr());
 }
 
 void CombMemOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  setNameFn(getResult(), name());
+  setNameFn(getResult(), getName());
 }
 
 //===----------------------------------------------------------------------===//
@@ -195,15 +225,16 @@ static void printSeqMemOp(OpAsmPrinter &p, Operation *op, DictionaryAttr attr) {
 
 void SeqMemOp::build(OpBuilder &builder, OperationState &result,
                      FIRRTLType elementType, uint64_t numElements, RUWAttr ruw,
-                     StringRef name, ArrayAttr annotations,
-                     StringAttr innerSym) {
+                     StringRef name, NameKindEnum nameKind,
+                     ArrayAttr annotations, StringAttr innerSym) {
   build(builder, result,
         CMemoryType::get(builder.getContext(), elementType, numElements), ruw,
-        name, annotations, innerSym);
+        name, nameKind, annotations,
+        innerSym ? InnerSymAttr::get(innerSym) : InnerSymAttr());
 }
 
 void SeqMemOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-  setNameFn(getResult(), name());
+  setNameFn(getResult(), getName());
 }
 
 //===----------------------------------------------------------------------===//

@@ -17,12 +17,15 @@
 // DIALECT-NEXT: func
 // DIALECT-NEXT: handshake
 // DIALECT-NEXT: hw
+// DIALECT-NEXT: hwarith
 // DIALECT-NEXT: llhd
 // DIALECT-NEXT: llvm
 // DIALECT-NEXT: memref
 // DIALECT-NEXT: moore
 // DIALECT-NEXT: msft
+// DIALECT-NEXT: pipeline
 // DIALECT-NEXT: scf
 // DIALECT-NEXT: seq
-// DIALECT-NEXT: staticlogic
+// DIALECT-NEXT: ssp
 // DIALECT-NEXT: sv
+// DIALECT-NEXT: systemc

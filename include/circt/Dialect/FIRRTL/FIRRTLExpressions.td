@@ -161,7 +161,7 @@ def SubfieldOp : FIRRTLExprOp<"subfield"> {
     OpBuilder<(ins "Value":$input, "StringRef":$fieldName), [{
       auto bundleType = input.getType().cast<BundleType>();
       auto fieldIndex = bundleType.getElementIndex(fieldName);
-      assert(fieldIndex.hasValue() && "subfield operation to unknown field");
+      assert(fieldIndex.has_value() && "subfield operation to unknown field");
       return build($_builder, $_state, input, *fieldIndex);
     }]>
   ];
@@ -172,8 +172,8 @@ def SubfieldOp : FIRRTLExprOp<"subfield"> {
 
     /// Return a `FieldRef` to the accessed field.
     FieldRef getAccessedField() {
-      return FieldRef(input(), input().getType().cast<BundleType>()
-                                      .getFieldID(fieldIndex()));
+      return FieldRef(getInput(), getInput().getType().cast<BundleType>()
+                                            .getFieldID(getFieldIndex()));
     }
   }];
 
@@ -209,8 +209,8 @@ def SubindexOp : FIRRTLExprOp<"subindex", [
   let firrtlExtraClassDeclaration = [{
     /// Return a `FieldRef` to the accessed field.
     FieldRef getAccessedField() {
-      return FieldRef(input(), input().getType().cast<FVectorType>()
-                                      .getFieldID(index()));
+      return FieldRef(getInput(), getInput().getType().cast<FVectorType>()
+                                            .getFieldID(getIndex()));
     }
   }];
 }
@@ -543,6 +543,26 @@ def TailPrimOp : PrimOp<"tail"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Verif and SV specific
+//===----------------------------------------------------------------------===//
+
+def IsXVerifOp : FIRRTLExprOp<"verif_isX"> {
+  let summary = "Test for 'x";
+  let description = [{
+    The verif.isX expression checks that the operand is not a verilog literal 
+    'x.  Firrtl doesn't have a notion of 'x per-se, but x can come in to the 
+    system from external modules and from SV constructs.  Verification 
+    constructs need to explicitly test for 'x.
+    }];
+
+  let arguments = (ins FIRRTLType:$arg);
+  let results = (outs UInt1Type:$result);
+  let assemblyFormat =
+    "$arg attr-dict `:` qualified(type($arg))";
+
+}
+
+//===----------------------------------------------------------------------===//
 // Verbatim
 //===----------------------------------------------------------------------===//
 
@@ -561,20 +581,20 @@ def VerbatimExprOp : FIRRTLOp<"verbatim.expr",
     `firrtl.verbatim.expr` allows operand substitutions with `{{0}}` syntax.
   }];
 
-  let arguments = (ins StrAttr:$text, Variadic<AnyType>:$operands,
+  let arguments = (ins StrAttr:$text, Variadic<AnyType>:$substitutions,
                        DefaultValuedAttr<NameRefArrayAttr,"{}">:$symbols);
   let results = (outs FIRRTLType:$result);
   let assemblyFormat = [{
-    $text (`(` $operands^ `)`)?
-    `:` functional-type($operands, $result) attr-dict
+    $text (`(` $substitutions^ `)`)?
+    `:` functional-type($substitutions, $result) attr-dict
   }];
 
   let builders = [
     OpBuilder<(ins "Type":$resultType, "Twine":$text,
-                   CArg<"ValueRange", "{}">:$operands,
+                   CArg<"ValueRange", "{}">:$substitutions,
                    CArg<"ArrayRef<Attribute>", "{}">:$symbols), [{
       build(odsBuilder, odsState, resultType, odsBuilder.getStringAttr(text),
-            operands, odsBuilder.getArrayAttr(symbols));
+            substitutions, odsBuilder.getArrayAttr(symbols));
     }]>
   ];
 }
@@ -595,20 +615,20 @@ def VerbatimWireOp : FIRRTLOp<"verbatim.wire",
     `firrtl.verbatim.wire` allows operand substitutions with `{{0}}` syntax.
   }];
 
-  let arguments = (ins StrAttr:$text, Variadic<AnyType>:$operands,
+  let arguments = (ins StrAttr:$text, Variadic<AnyType>:$substitutions,
                        DefaultValuedAttr<NameRefArrayAttr,"{}">:$symbols);
   let results = (outs FIRRTLType:$result);
   let assemblyFormat = [{
-    $text (`(` $operands^ `)`)?
-    `:` functional-type($operands, $result) attr-dict
+    $text (`(` $substitutions^ `)`)?
+    `:` functional-type($substitutions, $result) attr-dict
   }];
 
   let builders = [
     OpBuilder<(ins "Type":$resultType, "Twine":$text,
-                   CArg<"ValueRange", "{}">:$operands,
+                   CArg<"ValueRange", "{}">:$substitutions,
                    CArg<"ArrayRef<Attribute>", "{}">:$symbols), [{
       build(odsBuilder, odsState, resultType, odsBuilder.getStringAttr(text),
-            operands, odsBuilder.getArrayAttr(symbols));
+            substitutions, odsBuilder.getArrayAttr(symbols));
     }]>
   ];
 }

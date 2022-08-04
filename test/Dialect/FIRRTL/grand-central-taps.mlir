@@ -333,9 +333,9 @@ firrtl.circuit "NLAGarbageCollection" {
   // CHECK-NOT: @nla_1
   // CHECK-NOT: @nla_2
   // CHECK-NOT: @nla_3
-  firrtl.nla @nla_1 [@NLAGarbageCollection::@dut, @DUT::@submodule, @Submodule::@foo]
-  firrtl.nla @nla_2 [@NLAGarbageCollection::@dut, @DUT::@submodule, @Submodule::@port]
-  firrtl.nla @nla_3 [@NLAGarbageCollection::@dut, @DUT::@submodule, @Submodule::@bar_0]
+  firrtl.hierpath @nla_1 [@NLAGarbageCollection::@dut, @DUT::@submodule, @Submodule::@foo]
+  firrtl.hierpath @nla_2 [@NLAGarbageCollection::@dut, @DUT::@submodule, @Submodule::@port]
+  firrtl.hierpath @nla_3 [@NLAGarbageCollection::@dut, @DUT::@submodule, @Submodule::@bar_0]
   firrtl.module @Submodule(
     in %port: !firrtl.uint<1> sym @port [
       {circt.nonlocal = @nla_2,
@@ -354,7 +354,7 @@ firrtl.circuit "NLAGarbageCollection" {
     %bar_out_MPORT_clk = firrtl.wire  : !firrtl.clock
     %bar_0 = firrtl.reg sym @bar_0 %bar_out_MPORT_clk  {annotations = [{circt.nonlocal = @nla_3, class = "sifive.enterprise.grandcentral.MemTapAnnotation.source", id = 0 : i64, portID = 0 : i64}]} : !firrtl.uint<1>
     // CHECK:  %bar_0 = firrtl.reg sym @[[bar_0:.+]] %bar_out_MPORT_clk  : !firrtl.uint<1>
-    %bar_out_MPORT = firrtl.mem sym Undefined {
+    %bar_out_MPORT = firrtl.mem Undefined {
       depth = 1 : i64,
       name = "bar",
       portNames = ["out_MPORT"],
@@ -419,8 +419,8 @@ firrtl.circuit "NLAGarbageCollection" {
 firrtl.circuit "NLAUsedInWiring"  {
   // CHECK-NOT: @nla_1
   // CHECK-NOT: @nla_2
-  firrtl.nla @nla_1 [@NLAUsedInWiring::@foo, @Foo::@f]
-  firrtl.nla @nla_2 [@NLAUsedInWiring::@foo, @Foo::@g]
+  firrtl.hierpath @nla_1 [@NLAUsedInWiring::@foo, @Foo::@f]
+  firrtl.hierpath @nla_2 [@NLAUsedInWiring::@foo, @Foo::@g]
 
   // CHECK-LABEL: firrtl.module @DataTap
   // CHECK-NEXT: [[TMP:%.+]] = firrtl.verbatim.expr
@@ -467,10 +467,6 @@ firrtl.circuit "NLAUsedInWiring"  {
       id = 0 : i64,
       portID = 1 : i64
     }]} : !firrtl.uint<1>
-    // Use a verbatim expression to prevent constant optimization.
-    %x = firrtl.verbatim.expr "<foo>" : () -> !firrtl.uint<1>
-    firrtl.connect %g, %x : !firrtl.uint<1>, !firrtl.uint<1>
-    firrtl.connect %f, %x : !firrtl.uint<1>, !firrtl.uint<1>
   }
 
   firrtl.module @NLAUsedInWiring() {
@@ -485,9 +481,6 @@ firrtl.circuit "NLAUsedInWiring"  {
       portID = 3 : i64
     }]} : !firrtl.uint<1>
     %dataTap_b, %dataTap_c, %dataTap_d = firrtl.instance dataTap @DataTap(out b: !firrtl.uint<1>, out c: !firrtl.uint<1>, out d: !firrtl.uint<1>)
-    // Use a verbatim expression to prevent constant optimization.
-    %x = firrtl.verbatim.expr "<foo>" : () -> !firrtl.uint<1>
-    firrtl.connect %k, %x : !firrtl.uint<1>, !firrtl.uint<1>
   }
 }
 
@@ -497,8 +490,8 @@ firrtl.circuit "NLAUsedInWiring"  {
 // See https://github.com/llvm/circt/issues/2767.
 
 firrtl.circuit "Top" {
-  firrtl.nla @nla_0 [@DUT::@submodule_1, @Submodule::@bar_0]
-  firrtl.nla @nla [@DUT::@submodule_2, @Submodule::@bar_0]
+  firrtl.hierpath @nla_0 [@DUT::@submodule_1, @Submodule::@bar_0]
+  firrtl.hierpath @nla [@DUT::@submodule_2, @Submodule::@bar_0]
   firrtl.module @Submodule(in %clock: !firrtl.clock, out %out: !firrtl.uint<1>) {
     %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
     %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
@@ -531,12 +524,12 @@ firrtl.circuit "Top" {
   }
 
   // CHECK-LABEL: firrtl.module @MemTap_1_impl_0
-  // CHECK-NEXT{LITERAL}: firrtl.verbatim.expr "{{0}}.{{1}}.{{2}}.{{3}}"
-  // CHECK-SAME: symbols = [@Top, #hw.innerNameRef<@Top::@dut>, #hw.innerNameRef<@DUT::@submodule_1>, #hw.innerNameRef<@Submodule::@[[bar_0]]>]
+  // CHECK-NEXT{LITERAL}: firrtl.verbatim.expr "{{0}}.{{1}}.{{2}}"
+  // CHECK-SAME: symbols = [@DUT, #hw.innerNameRef<@DUT::@submodule_1>, #hw.innerNameRef<@Submodule::@[[bar_0]]>]
   firrtl.extmodule @MemTap_1(out mem_0: !firrtl.uint<1> [{class = "sifive.enterprise.grandcentral.MemTapAnnotation.port", id = 0 : i64, portID = 0 : i64}]) attributes {defname = "MemTap"}
   // CHECK-LABEL: firrtl.module @MemTap_2_impl_0
-  // CHECK-NEXT{LITERAL}: firrtl.verbatim.expr "{{0}}.{{1}}.{{2}}.{{3}}"
-  // CHECK-SAME: symbols = [@Top, #hw.innerNameRef<@Top::@dut>, #hw.innerNameRef<@DUT::@submodule_2>, #hw.innerNameRef<@Submodule::@[[bar_0]]>]
+  // CHECK-NEXT{LITERAL}: firrtl.verbatim.expr "{{0}}.{{1}}.{{2}}"
+  // CHECK-SAME: symbols = [@DUT, #hw.innerNameRef<@DUT::@submodule_2>, #hw.innerNameRef<@Submodule::@[[bar_0]]>]
   firrtl.extmodule @MemTap_2(out mem_0: !firrtl.uint<1> [{class = "sifive.enterprise.grandcentral.MemTapAnnotation.port", id = 1 : i64, portID = 0 : i64}]) attributes {defname = "MemTap"}
 }
 
@@ -559,24 +552,85 @@ firrtl.circuit "Top" {
 
 // -----
 
-// Check that constants are sunk into data taps.
-
-// CHECK-LABEL: "ConstantPropagation"
-firrtl.circuit "ConstantPropagation" {
-
+// Check that zero-width data taps are no-ops.  These should generate no XMRs.
+//
+firrtl.circuit "Top"  {
   firrtl.extmodule private @DataTap(
-    out _0: !firrtl.uint<1> [{class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.port", id = 1 : i64, portID = 2 : i64}]
-  ) attributes {annotations = [{class = "sifive.enterprise.grandcentral.DataTapsAnnotation.blackbox"}], defname = "DataTap_3"}
-  // CHECK:      firrtl.module @DataTap
-  // CHECK-NEXT:   %c1_ui1 = firrtl.constant 1
-  // CHECK-NEXT:   firrtl.connect %_0, %c1_ui1
+    out _0: !firrtl.uint<0> [
+      {
+        class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.port",
+        id = 0 : i64,
+        portID = 1 : i64
+      }
+    ],
+    out _1: !firrtl.uint<0> [
+      {
+        class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.port",
+        id = 0 : i64,
+        portID = 2 : i64
+      }
+    ]) attributes {annotations = [
+      {class = "sifive.enterprise.grandcentral.DataTapsAnnotation.blackbox"}
+    ]}
+  firrtl.module @Top(
+    out %p: !firrtl.uint<0> [
+      {
+        class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.source",
+        id = 0 : i64,
+        portID = 2 : i64
+      }
+    ]) {
+    %w = firrtl.wire {annotations = [
+      {
+        class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.source",
+        id = 0 : i64,
+        portID = 1 : i64
+      }
+    ]} : !firrtl.uint<0>
+    %tap_0, %tap_1 = firrtl.instance tap @DataTap(
+      out _0: !firrtl.uint<0>,
+      out _1: !firrtl.uint<0>
+    )
+  }
+}
 
-  firrtl.module @ConstantPropagation() attributes {annotations = [{class = "sifive.enterprise.firrtl.MarkDUTAnnotation"}]} {
+// CHECK-NOT: firrtl.verbatim.expr
+
+// -----
+
+// Check that constants are sunk into XMRs and symbols are not unnecessarily
+// created.
+//
+// CHECK-LABEL: "ConstantSinking"
+firrtl.circuit "ConstantSinking"  {
+  // CHECK:      firrtl.module @DataTap
+  // CHECK-NEXT:   %[[one:.+]] = firrtl.constant 1
+  // CHECK-NEXT:   firrtl.connect %a, %[[one]]
+  firrtl.extmodule private @DataTap(
+    out a: !firrtl.uint<1> [
+      {
+        class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.port",
+        id = 0 : i64,
+        portID = 1 : i64
+      }
+    ]) attributes {annotations = [
+      {
+        class = "sifive.enterprise.grandcentral.DataTapsAnnotation.blackbox"
+      }
+    ]}
+  // CHECK: firrtl.module @ConstantSinking
+  firrtl.module @ConstantSinking() {
+    %dataTap_a = firrtl.instance dataTap interesting_name  @DataTap(out a: !firrtl.uint<1>)
+    // CHECK:    %w = firrtl.wire
+    // CHECK-NOT   sym
+    %w = firrtl.wire {annotations = [
+      {
+        class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.source",
+        id = 0 : i64,
+        portID = 1 : i64
+      }
+    ]} : !firrtl.uint<1>
     %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
-    %_gctTap_0 = firrtl.wire sym @_gctTap_0_0  {annotations = [{class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.source", id = 1 : i64, portID = 3 : i64}]} : !firrtl.uint<1>
-    firrtl.strictconnect %_gctTap_0, %c1_ui1 : !firrtl.uint<1>
-    %_gctTap = firrtl.wire sym @_gctTap_1  {annotations = [{class = "sifive.enterprise.grandcentral.ReferenceDataTapKey.source", id = 1 : i64, portID = 2 : i64}]} : !firrtl.uint<1>
-    firrtl.strictconnect %_gctTap, %c1_ui1 : !firrtl.uint<1>
-    %_0 = firrtl.instance DataTap_3  @DataTap(out _0: !firrtl.uint<1>)
+    firrtl.strictconnect %w, %c1_ui1 : !firrtl.uint<1>
   }
 }

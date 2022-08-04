@@ -14,6 +14,7 @@
 #include "circt/Dialect/Calyx/CalyxEmitter.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -63,6 +64,19 @@ constexpr std::array<StringRef, 7> booleanAttributes{
     "clk", "done", "go", "reset", "generated", "precious", "toplevel",
 };
 
+static Optional<StringRef> getCalyxAttrIdentifier(NamedAttribute attr) {
+  StringRef identifier = attr.getName().strref();
+  if (identifier.contains(".")) {
+    Dialect *dialect = attr.getNameDialect();
+    if (dialect != nullptr && isa<CalyxDialect>(*dialect)) {
+      return std::get<1>(identifier.split("."));
+    }
+    return None;
+  }
+
+  return identifier;
+}
+
 /// Determines whether the given identifier is a valid Calyx attribute.
 static bool isValidCalyxAttribute(StringRef identifier) {
 
@@ -74,7 +88,7 @@ static bool isValidCalyxAttribute(StringRef identifier) {
 static Optional<StringRef> unsupportedOpInfo(Operation *op) {
   return llvm::TypeSwitch<Operation *, Optional<StringRef>>(op)
       .Case<ExtSILibOp>([](auto) -> Optional<StringRef> {
-        static std::string_view info =
+        static constexpr std::string_view info =
             "calyx.std_extsi is currently not available in the native Rust "
             "compiler (see github.com/cucapra/calyx/issues/1009)";
         return {info};
@@ -88,16 +102,16 @@ struct ImportTracker {
 public:
   /// Returns the list of library names used for in this program.
   /// E.g. if `primitives/core.futil` is used, returns { "core" }.
-  FailureOr<llvm::SmallSet<StringRef, 4>> getLibraryNames(ProgramOp program) {
-    auto walkRes = program.walk([&](ComponentOp component) {
+  FailureOr<llvm::SmallSet<StringRef, 4>> getLibraryNames(ModuleOp module) {
+    auto walkRes = module.walk([&](ComponentOp component) {
       for (auto &op : *component.getBody()) {
-        if (!isa<CellInterface>(op) || isa<InstanceOp>(op))
+        if (!isa<CellInterface>(op) || isa<InstanceOp, PrimitiveOp>(op))
           // It is not a primitive.
           continue;
         auto libraryName = getLibraryFor(&op);
         if (failed(libraryName))
           return WalkResult::interrupt();
-        usedLibraries.insert(libraryName.getValue());
+        usedLibraries.insert(*libraryName);
       }
       return WalkResult::advance();
     });
@@ -114,13 +128,15 @@ private:
               AddLibOp, SubLibOp, GtLibOp, LtLibOp, EqLibOp, NeqLibOp, GeLibOp,
               LeLibOp, LshLibOp, RshLibOp, SliceLibOp, PadLibOp, WireLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
-              static std::string_view sCore = "core";
+              static constexpr std::string_view sCore = "core";
               return {sCore};
             })
         .Case<SgtLibOp, SltLibOp, SeqLibOp, SneqLibOp, SgeLibOp, SleLibOp,
-              SrshLibOp, MultPipeLibOp, DivPipeLibOp>(
+              SrshLibOp, MultPipeLibOp, RemUPipeLibOp, RemSPipeLibOp,
+              DivUPipeLibOp, DivSPipeLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
-              static std::string_view sBinaryOperators = "binary_operators";
+              static constexpr std::string_view sBinaryOperators =
+                  "binary_operators";
               return {sBinaryOperators};
             })
         /*.Case<>([&](auto op) { library = "math"; })*/
@@ -154,8 +170,8 @@ struct Emitter {
     currentIndent -= 2;
   }
 
-  // Program emission
-  void emitProgram(ProgramOp op);
+  // Module emission
+  void emitModule(ModuleOp op);
 
   // Metadata emission for the Cider debugger.
   void emitCiderMetadata(mlir::ModuleOp op) {
@@ -176,7 +192,7 @@ struct Emitter {
   }
 
   /// Import emission.
-  LogicalResult emitImports(ProgramOp op) {
+  LogicalResult emitImports(ModuleOp op) {
     auto emitImport = [&](StringRef library) {
       // Libraries share a common relative path:
       //   primitives/<library-name>.futil
@@ -188,7 +204,7 @@ struct Emitter {
     if (failed(libraryNames))
       return failure();
 
-    for (StringRef library : libraryNames.getValue())
+    for (StringRef library : *libraryNames)
       emitImport(library);
 
     return success();
@@ -198,8 +214,15 @@ struct Emitter {
   void emitComponent(ComponentOp op);
   void emitComponentPorts(ComponentOp op);
 
+  // HWModuleExtern emission
+  void emitPrimitiveExtern(hw::HWModuleExternOp op);
+  void emitPrimitivePorts(hw::HWModuleExternOp op);
+
   // Instance emission
   void emitInstance(InstanceOp op);
+
+  // Primitive emission
+  void emitPrimitive(PrimitiveOp op);
 
   // Wires emission
   void emitWires(WiresOp op);
@@ -244,7 +267,9 @@ struct Emitter {
   //   $f.in0, $f.in1, $f.out : calyx.std_foo "f" : i32, i32, i1
   // emits:
   //   f = std_foo(1);
-  void emitLibraryPrimTypedByFirstOutputPort(Operation *op);
+  void
+  emitLibraryPrimTypedByFirstOutputPort(Operation *op,
+                                        Optional<StringRef> calyxLibName = {});
 
 private:
   /// Used to track which imports are required for this program.
@@ -269,8 +294,14 @@ private:
   /// Since ports are structural in nature and not operations, an
   /// extra boolean value is added to determine whether this is a port of the
   /// given operation.
-  std::string getAttribute(Operation *op, StringRef identifier, Attribute attr,
-                           bool isPort) {
+  std::string getAttribute(Operation *op, NamedAttribute attr, bool isPort) {
+
+    Optional<StringRef> identifierOpt = getCalyxAttrIdentifier(attr);
+    // Verify this is a Calyx attribute
+    if (!identifierOpt.has_value())
+      return "";
+
+    StringRef identifier = identifierOpt.value();
     // Verify this attribute is supported for emission.
     if (!isValidCalyxAttribute(identifier))
       return "";
@@ -284,7 +315,7 @@ private:
 
     bool isBooleanAttribute =
         llvm::find(booleanAttributes, identifier) != booleanAttributes.end();
-    if (attr.isa<UnitAttr>()) {
+    if (attr.getValue().isa<UnitAttr>()) {
       assert(isBooleanAttribute &&
              "Non-boolean attributes must provide an integer value.");
       if (isGroupOrComponentAttr) {
@@ -293,7 +324,7 @@ private:
       } else {
         buffer << addressSymbol() << identifier << space();
       }
-    } else if (auto intAttr = attr.dyn_cast<IntegerAttr>()) {
+    } else if (auto intAttr = attr.getValue().dyn_cast<IntegerAttr>()) {
       APInt value = intAttr.getValue();
       if (isGroupOrComponentAttr) {
         buffer << LAngleBracket() << delimiter() << identifier << delimiter()
@@ -324,8 +355,8 @@ private:
 
     SmallString<16> calyxAttributes;
     for (auto &attr : attributes)
-      calyxAttributes.append(
-          getAttribute(op, attr.getName(), attr.getValue(), isPort));
+      calyxAttributes.append(getAttribute(op, attr, isPort));
+
     return calyxAttributes.c_str();
   }
 
@@ -356,7 +387,7 @@ private:
   /// Helper function for emitting combinational operations.
   template <typename CombinationalOp>
   void emitCombinationalValue(CombinationalOp op, StringRef logicalSymbol) {
-    auto inputs = op.inputs();
+    auto inputs = op.getInputs();
     os << LParen();
     for (size_t i = 0, e = inputs.size(); i != e; ++i) {
       emitValue(inputs[i], /*isIndented=*/false);
@@ -388,7 +419,7 @@ private:
         .Case<hw::ConstantOp>([&](auto op) {
           // A constant is defined as <bit-width>'<base><value>, where the base
           // is `b` (binary), `o` (octal), `h` hexadecimal, or `d` (decimal).
-          APInt value = op.value();
+          APInt value = op.getValue();
 
           (isIndented ? indent() : os)
               << std::to_string(value.getBitWidth()) << apostrophe() << "d";
@@ -407,7 +438,7 @@ private:
           // The LHS is the value to be negated, and the RHS is a constant with
           // all ones (guaranteed by isBinaryNot).
           os << exclamationMark();
-          emitValue(op.inputs()[0], /*isIndented=*/false);
+          emitValue(op.getInputs()[0], /*isIndented=*/false);
         })
         .Default(
             [&](auto op) { emitOpError(op, "not supported for emission"); });
@@ -461,8 +492,8 @@ private:
             indent() << prependAttributes(op, "while ");
             emitValue(op.cond(), /*isIndented=*/false);
 
-            if (auto groupName = op.groupName(); groupName.hasValue())
-              os << " with " << groupName.getValue();
+            if (auto groupName = op.groupName())
+              os << " with " << *groupName;
 
             emitCalyxBody([&]() { emitCalyxControl(op.getBody()); });
           })
@@ -470,8 +501,8 @@ private:
             indent() << prependAttributes(op, "if ");
             emitValue(op.cond(), /*isIndented=*/false);
 
-            if (auto groupName = op.groupName(); groupName.hasValue())
-              os << " with " << groupName.getValue();
+            if (auto groupName = op.groupName())
+              os << " with " << *groupName;
 
             emitCalyxBody([&]() { emitCalyxControl(op.getThenBody()); });
             if (op.elseBodyExists())
@@ -501,10 +532,12 @@ private:
 LogicalResult Emitter::finalize() { return failure(encounteredError); }
 
 /// Emit an entire program.
-void Emitter::emitProgram(ProgramOp op) {
+void Emitter::emitModule(ModuleOp op) {
   for (auto &bodyOp : *op.getBody()) {
     if (auto componentOp = dyn_cast<ComponentOp>(bodyOp))
       emitComponent(componentOp);
+    else if (auto hwModuleExternOp = dyn_cast<hw::HWModuleExternOp>(bodyOp))
+      emitPrimitiveExtern(hwModuleExternOp);
     else
       emitOpError(&bodyOp, "Unexpected op");
   }
@@ -527,6 +560,7 @@ void Emitter::emitComponent(ComponentOp op) {
           .Case<WiresOp>([&](auto op) { wires = op; })
           .Case<ControlOp>([&](auto op) { control = op; })
           .Case<InstanceOp>([&](auto op) { emitInstance(op); })
+          .Case<PrimitiveOp>([&](auto op) { emitPrimitive(op); })
           .Case<RegisterOp>([&](auto op) { emitRegister(op); })
           .Case<MemoryOp>([&](auto op) { emitMemory(op); })
           .Case<hw::ConstantOp>([&](auto op) { /*Do nothing*/ })
@@ -537,8 +571,16 @@ void Emitter::emitComponent(ComponentOp op) {
                 SubLibOp, ShruLibOp, RshLibOp, SrshLibOp, LshLibOp, AndLibOp,
                 NotLibOp, OrLibOp, XorLibOp, WireLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstInputPort(op); })
-          .Case<MultPipeLibOp, DivPipeLibOp>(
+          .Case<MultPipeLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstOutputPort(op); })
+          .Case<RemUPipeLibOp, DivUPipeLibOp>([&](auto op) {
+            emitLibraryPrimTypedByFirstOutputPort(
+                op, /*calyxLibName=*/{"std_div_pipe"});
+          })
+          .Case<RemSPipeLibOp, DivSPipeLibOp>([&](auto op) {
+            emitLibraryPrimTypedByFirstOutputPort(
+                op, /*calyxLibName=*/{"std_sdiv_pipe"});
+          })
           .Default([&](auto op) {
             emitOpError(op, "not supported for emission inside component");
           });
@@ -559,7 +601,7 @@ void Emitter::emitComponentPorts(ComponentOp op) {
       const PortInfo &port = ports[i];
 
       // We only care about the bit width in the emitted .futil file.
-      auto bitWidth = port.type.getIntOrFloatBitWidth();
+      unsigned int bitWidth = port.type.getIntOrFloatBitWidth();
       os << getAttributes(op, port.attributes) << port.name.getValue()
          << colon() << bitWidth;
 
@@ -573,10 +615,86 @@ void Emitter::emitComponentPorts(ComponentOp op) {
   emitPorts(op.getOutputPortInfo());
 }
 
+/// Emit a primitive extern
+void Emitter::emitPrimitiveExtern(hw::HWModuleExternOp op) {
+  Attribute filename = op->getAttrDictionary().get("filename");
+  indent() << "extern " << filename << space() << LBraceEndL();
+  addIndent();
+  indent() << "primitive " << op.getName();
+
+  if (!op.getParameters().empty()) {
+    os << LSquare();
+    llvm::interleaveComma(op.getParameters(), os, [&](Attribute param) {
+      auto paramAttr = param.cast<hw::ParamDeclAttr>();
+      os << paramAttr.getName().str();
+    });
+    os << RSquare();
+  }
+  os << getAttributes(op);
+  // Emit the ports.
+  emitPrimitivePorts(op);
+  os << semicolonEndL();
+  reduceIndent();
+  os << RBraceEndL();
+}
+
+/// Emit the ports of a component.
+void Emitter::emitPrimitivePorts(hw::HWModuleExternOp op) {
+  auto emitPorts = [&](auto ports, bool isInput) {
+    os << LParen();
+    for (size_t i = 0, e = ports.size(); i < e; ++i) {
+      const hw::PortInfo &port = ports[i];
+      DictionaryAttr portAttr =
+          isInput ? op.getArgAttrDict(i) : op.getResultAttrDict(i);
+
+      os << getAttributes(op, portAttr) << port.name.getValue() << colon();
+      // We only care about the bit width in the emitted .futil file.
+      // Emit parameterized or non-parameterized bit width.
+      if (hw::isParametricType(port.type)) {
+        hw::ParamDeclRefAttr bitWidth = port.type.cast<hw::IntType>()
+                                            .getWidth()
+                                            .dyn_cast<hw::ParamDeclRefAttr>();
+        os << bitWidth.getName().str();
+      } else {
+        unsigned int bitWidth = port.type.getIntOrFloatBitWidth();
+        os << bitWidth;
+      }
+
+      if (i + 1 < e)
+        os << comma();
+    }
+    os << RParen();
+  };
+  emitPorts(op.getPorts().inputs, true);
+  os << arrow();
+  emitPorts(op.getPorts().outputs, false);
+}
+
 void Emitter::emitInstance(InstanceOp op) {
   indent() << getAttributes(op) << op.instanceName() << space() << equals()
            << space() << op.componentName() << LParen() << RParen()
            << semicolonEndL();
+}
+
+void Emitter::emitPrimitive(PrimitiveOp op) {
+  indent() << getAttributes(op) << op.instanceName() << space() << equals()
+           << space() << op.primitiveName() << LParen();
+
+  if (op.parameters().has_value()) {
+    llvm::interleaveComma(*op.parameters(), os, [&](Attribute param) {
+      auto paramAttr = param.cast<hw::ParamDeclAttr>();
+      auto value = paramAttr.getValue();
+      if (auto intAttr = value.dyn_cast<IntegerAttr>()) {
+        os << intAttr.getInt();
+      } else if (auto fpAttr = value.dyn_cast<FloatAttr>()) {
+        os << fpAttr.getValue().convertToFloat();
+      } else {
+        llvm_unreachable("Primitive parameter type not supported");
+      }
+    });
+  }
+
+  os << RParen() << semicolonEndL();
 }
 
 void Emitter::emitRegister(RegisterOp reg) {
@@ -638,14 +756,16 @@ void Emitter::emitLibraryPrimTypedByFirstInputPort(Operation *op) {
            << RParen() << semicolonEndL();
 }
 
-void Emitter::emitLibraryPrimTypedByFirstOutputPort(Operation *op) {
+void Emitter::emitLibraryPrimTypedByFirstOutputPort(
+    Operation *op, Optional<StringRef> calyxLibName) {
   auto cell = cast<CellInterface>(op);
   unsigned bitWidth =
       cell.getOutputPorts()[0].getType().getIntOrFloatBitWidth();
   StringRef opName = op->getName().getStringRef();
   indent() << getAttributes(op) << cell.instanceName() << space() << equals()
-           << space() << removeCalyxPrefix(opName) << LParen() << bitWidth
-           << RParen() << semicolonEndL();
+           << space()
+           << (calyxLibName ? *calyxLibName : removeCalyxPrefix(opName))
+           << LParen() << bitWidth << RParen() << semicolonEndL();
 }
 
 void Emitter::emitAssignment(AssignOp op) {
@@ -711,16 +831,9 @@ void Emitter::emitControl(ControlOp control) {
 mlir::LogicalResult circt::calyx::exportCalyx(mlir::ModuleOp module,
                                               llvm::raw_ostream &os) {
   Emitter emitter(os);
-  for (auto &op : *module.getBody()) {
-    auto walkRes = op.walk([&](ProgramOp program) {
-      if (failed(emitter.emitImports(program)))
-        return WalkResult::interrupt();
-      emitter.emitProgram(program);
-      return WalkResult::advance();
-    });
-    if (walkRes.wasInterrupted())
-      return failure();
-  }
+  if (failed(emitter.emitImports(module)))
+    return failure();
+  emitter.emitModule(module);
   emitter.emitCiderMetadata(module);
   return emitter.finalize();
 }

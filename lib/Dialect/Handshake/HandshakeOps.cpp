@@ -525,6 +525,16 @@ LogicalResult FuncOp::verify() {
   if (failed(verifyPortNameAttr("resNames", getNumResults())))
     return failure();
 
+  // Verify that all memrefs have a corresponding extmemory operation
+  for (auto arg : entryBlock.getArguments()) {
+    if (!arg.getType().isa<MemRefType>())
+      continue;
+    if (arg.getUsers().empty() ||
+        !isa<ExternalMemoryOp>(*arg.getUsers().begin()))
+      return emitOpError("expected that block argument #")
+             << arg.getArgNumber() << " is used by an 'extmemory' operation";
+  }
+
   return success();
 }
 
@@ -996,12 +1006,12 @@ void handshake::TerminatorOp::build(OpBuilder &builder, OperationState &result,
 LogicalResult BufferOp::verify() {
   // Verify that exactly 'size' number of initial values have been provided, if
   // an initializer list have been provided.
-  if (initValues().hasValue()) {
+  if (auto initVals = initValues()) {
     if (!isSequential())
       return emitOpError()
              << "only bufferType buffers are allowed to have initial values.";
 
-    auto nInits = initValues().getValue().size();
+    auto nInits = initVals->size();
     if (nInits != size())
       return emitOpError() << "expected " << size() << " init values but got "
                            << nInits << ".";

@@ -37,6 +37,7 @@ parseLocationInfoStyle(StringRef option) {
              option)
       .Case("plain", LoweringOptions::Plain)
       .Case("wrapInAtSquareBracket", LoweringOptions::WrapInAtSquareBracket)
+      .Case("none", LoweringOptions::None)
       .Default(llvm::None);
 }
 
@@ -63,8 +64,8 @@ void LoweringOptions::parse(StringRef text, ErrorHandlerT errorHandler) {
         errorHandler("expected integer source width");
         emittedLineLength = DEFAULT_LINE_LENGTH;
       }
-    } else if (option == "explicitBitcastAddMul") {
-      explicitBitcastAddMul = true;
+    } else if (option == "explicitBitcast") {
+      explicitBitcast = true;
     } else if (option == "emitReplicatedOpsToHeader") {
       emitReplicatedOpsToHeader = true;
     } else if (option.consume_front("maximumNumberOfTermsPerExpression=")) {
@@ -81,12 +82,14 @@ void LoweringOptions::parse(StringRef text, ErrorHandlerT errorHandler) {
       if (auto style = parseLocationInfoStyle(option)) {
         locationInfoStyle = *style;
       } else {
-        errorHandler("expected 'plain' or 'wrapInAtSquareBracket'");
+        errorHandler("expected 'plain', 'wrapInAtSquareBracket', or 'none'");
       }
     } else if (option == "disallowPortDeclSharing") {
       disallowPortDeclSharing = true;
     } else if (option == "printDebugInfo") {
       printDebugInfo = true;
+    } else if (option == "spillWiresAtPrepare") {
+      spillWiresAtPrepare = true;
     } else {
       errorHandler(llvm::Twine("unknown style option \'") + option + "\'");
       // We continue parsing options after a failure.
@@ -107,16 +110,20 @@ std::string LoweringOptions::toString() const {
     options += "disallowLocalVariables,";
   if (enforceVerifLabels)
     options += "verifLabels,";
-  if (explicitBitcastAddMul)
-    options += "explicitBitcastAddMul,";
+  if (explicitBitcast)
+    options += "explicitBitcast,";
   if (emitReplicatedOpsToHeader)
     options += "emitReplicatedOpsToHeader,";
   if (locationInfoStyle == LocationInfoStyle::WrapInAtSquareBracket)
     options += "locationInfoStyle=wrapInAtSquareBracket,";
+  if (locationInfoStyle == LocationInfoStyle::None)
+    options += "locationInfoStyle=none,";
   if (disallowPortDeclSharing)
     options += "disallowPortDeclSharing,";
   if (printDebugInfo)
     options += "printDebugInfo,";
+  if (spillWiresAtPrepare)
+    options += "spillWiresAtPrepare,";
 
   if (emittedLineLength != DEFAULT_LINE_LENGTH)
     options += "emittedLineLength=" + std::to_string(emittedLineLength) + ',';
@@ -179,9 +186,9 @@ struct LoweringCLOptions {
           "noAlwaysComb, exprInEventControl, disallowPackedArrays, "
           "disallowLocalVariables, verifLabels, emittedLineLength=<n>, "
           "maximumNumberOfTermsPerExpression=<n>, "
-          "maximumNumberOfTermsInConcat=<n>, explicitBitcastAddMul, "
+          "maximumNumberOfTermsInConcat=<n>, explicitBitcast, "
           "emitReplicatedOpsToHeader, "
-          "locationInfoStyle={plain,wrapInAtSquareBracket}, "
+          "locationInfoStyle={plain,wrapInAtSquareBracket,none}, "
           "disallowPortDeclSharing, printDebugInfo"),
       llvm::cl::value_desc("option")};
 };
@@ -203,4 +210,20 @@ void circt::applyLoweringCLOptions(ModuleOp module) {
   if (clOptions->loweringOptions.getNumOccurrences()) {
     clOptions->loweringOptions.setAsAttribute(module);
   }
+}
+
+LoweringOptions
+circt::getLoweringCLIOption(mlir::ModuleOp module,
+                            LoweringOptions::ErrorHandlerT errorHandler) {
+  // If the command line options were not registered in the first place, use the
+  // lowering option associated with module op.
+  if (!clOptions.isConstructed() ||
+      !clOptions->loweringOptions.getNumOccurrences()) {
+    if (auto styleAttr = LoweringOptions::getAttributeFrom(module))
+      return LoweringOptions(styleAttr, errorHandler);
+    // If the module doesn't have a lowering option, then use the default value.
+    return LoweringOptions();
+  }
+
+  return clOptions->loweringOptions.getValue();
 }

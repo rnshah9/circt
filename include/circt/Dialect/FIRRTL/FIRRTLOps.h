@@ -30,11 +30,13 @@
 namespace circt {
 namespace firrtl {
 
+class StrictConnectOp;
+
 // is the name useless?
 bool isUselessName(circt::StringRef name);
 
 // works for regs, nodes, and wires
-bool isUselessName(Operation *op);
+bool hasDroppableName(Operation *op);
 
 /// Return true if the specified operation is a firrtl expression.
 bool isExpression(Operation *op);
@@ -93,6 +95,15 @@ inline MemDirAttr &operator|=(MemDirAttr &lhs, MemDirAttr rhs) {
   return lhs;
 }
 
+/// Return the StringAttr for the inner_sym name, if it exists.
+inline StringAttr getInnerSymName(Operation *op) {
+  InnerSymAttr s = op->getAttrOfType<InnerSymAttr>(
+      InnerSymbolTable::getInnerSymbolAttrName());
+  if (s)
+    return s.getSymName();
+  return StringAttr();
+}
+
 /// Check whether a block argument ("port") or the operation defining a value
 /// has a `DontTouch` annotation, or a symbol that should prevent certain types
 /// of canonicalizations.
@@ -101,6 +112,18 @@ bool hasDontTouch(Value value);
 /// Check whether an operation has a `DontTouch` annotation, or a symbol that
 /// should prevent certain types of canonicalizations.
 bool hasDontTouch(Operation *op);
+
+/// Scan all the uses of the specified value, checking to see if there is
+/// exactly one connect that has the value as its destination. This returns the
+/// operation if found and if all the other users are "reads" from the value.
+/// Returns null if there are no connects, or multiple connects to the value, or
+/// if the value is involved in an `AttachOp`.
+///
+/// Note that this will simply return the connect, which is located *anywhere*
+/// after the definition of the value. Users of this function are likely
+/// interested in the source side of the returned connect, the definition of
+/// which does likely not dominate the original value.
+StrictConnectOp getSingleConnectUserOf(Value value);
 
 // Out-of-line implementation of various trait verification methods and
 // functions commonly used among operations.

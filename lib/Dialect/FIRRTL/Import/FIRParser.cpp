@@ -50,129 +50,6 @@ using mlir::LocationAttr;
 namespace json = llvm::json;
 
 //===----------------------------------------------------------------------===//
-// Parser-related utilities
-//===----------------------------------------------------------------------===//
-
-std::pair<bool, Optional<LocationAttr>> circt::firrtl::maybeStringToLocation(
-    StringRef spelling, bool skipParsing, StringAttr &locatorFilenameCache,
-    FileLineColLoc &fileLineColLocCache, MLIRContext *context) {
-  // The spelling of the token looks something like "@[Decoupled.scala 221:8]".
-  if (!spelling.startswith("@[") || !spelling.endswith("]"))
-    return {false, None};
-
-  spelling = spelling.drop_front(2).drop_back(1);
-
-  // Decode the locator in "spelling", returning the filename and filling in
-  // lineNo and colNo on success.  On failure, this returns an empty filename.
-  auto decodeLocator = [&](StringRef input, unsigned &resultLineNo,
-                           unsigned &resultColNo) -> StringRef {
-    // Split at the last space.
-    auto spaceLoc = input.find_last_of(' ');
-    if (spaceLoc == StringRef::npos)
-      return {};
-
-    auto filename = input.take_front(spaceLoc);
-    auto lineAndColumn = input.drop_front(spaceLoc + 1);
-
-    // Decode the line/column.  If the colon is missing, then it will be empty
-    // here.
-    StringRef lineStr, colStr;
-    std::tie(lineStr, colStr) = lineAndColumn.split(':');
-
-    // Decode the line number and the column number if present.
-    if (lineStr.getAsInteger(10, resultLineNo))
-      return {};
-    if (!colStr.empty()) {
-      if (colStr.front() != '{') {
-        if (colStr.getAsInteger(10, resultColNo))
-          return {};
-      } else {
-        // compound locator, just parse the first part for now
-        if (colStr.drop_front().split(',').first.getAsInteger(10, resultColNo))
-          return {};
-      }
-    }
-    return filename;
-  };
-
-  // Decode the locator spelling, reporting an error if it is malformed.
-  unsigned lineNo = 0, columnNo = 0;
-  StringRef filename = decodeLocator(spelling, lineNo, columnNo);
-  if (filename.empty())
-    return {false, None};
-
-  // If info locators are ignored, don't actually apply them.  We still do all
-  // the verification above though.
-  if (skipParsing)
-    return {true, None};
-
-  /// Return an FileLineColLoc for the specified location, but use a bit of
-  /// caching to reduce thrasing the MLIRContext.
-  auto getFileLineColLoc = [&](StringRef filename, unsigned lineNo,
-                               unsigned columnNo) -> FileLineColLoc {
-    // Check our single-entry cache for this filename.
-    StringAttr filenameId = locatorFilenameCache;
-    if (filenameId.str() != filename) {
-      // We missed!  Get the right identifier.
-      locatorFilenameCache = filenameId = StringAttr::get(context, filename);
-
-      // If we miss in the filename cache, we also miss in the FileLineColLoc
-      // cache.
-      return fileLineColLocCache =
-                 FileLineColLoc::get(filenameId, lineNo, columnNo);
-    }
-
-    // If we hit the filename cache, check the FileLineColLoc cache.
-    auto result = fileLineColLocCache;
-    if (result && result.getLine() == lineNo && result.getColumn() == columnNo)
-      return result;
-
-    return fileLineColLocCache =
-               FileLineColLoc::get(filenameId, lineNo, columnNo);
-  };
-
-  // Compound locators will be combined with spaces, like:
-  //  @[Foo.scala 123:4 Bar.scala 309:14]
-  // and at this point will be parsed as a-long-string-with-two-spaces at
-  // 309:14.   We'd like to parse this into two things and represent it as an
-  // MLIR fused locator, but we want to be conservatively safe for filenames
-  // that have a space in it.  As such, we are careful to make sure we can
-  // decode the filename/loc of the result.  If so, we accumulate results,
-  // backward, in this vector.
-  SmallVector<Location> extraLocs;
-  auto spaceLoc = filename.find_last_of(' ');
-  while (spaceLoc != StringRef::npos) {
-    // Try decoding the thing before the space.  Validates that there is another
-    // space and that the file/line can be decoded in that substring.
-    unsigned nextLineNo = 0, nextColumnNo = 0;
-    auto nextFilename =
-        decodeLocator(filename.take_front(spaceLoc), nextLineNo, nextColumnNo);
-
-    // On failure we didn't have a joined locator.
-    if (nextFilename.empty())
-      break;
-
-    // On success, remember what we already parsed (Bar.Scala / 309:14), and
-    // move on to the next chunk.
-    auto loc =
-        getFileLineColLoc(filename.drop_front(spaceLoc + 1), lineNo, columnNo);
-    extraLocs.push_back(loc);
-    filename = nextFilename;
-    lineNo = nextLineNo;
-    columnNo = nextColumnNo;
-    spaceLoc = filename.find_last_of(' ');
-  }
-
-  LocationAttr result = getFileLineColLoc(filename, lineNo, columnNo);
-  if (!extraLocs.empty()) {
-    extraLocs.push_back(result);
-    std::reverse(extraLocs.begin(), extraLocs.end());
-    result = FusedLoc::get(context, extraLocs);
-  }
-  return {true, result};
-}
-
-//===----------------------------------------------------------------------===//
 // SharedParserConstants
 //===----------------------------------------------------------------------===//
 
@@ -371,8 +248,8 @@ struct FIRParser {
   /// aggregate type, "{foo: UInt<1>, bar: UInt<1>}[2]", tokens "[0].foo" will
   /// be converted to a field ID range of [2, 2]; tokens "[1]" will be converted
   /// to [4, 6]. The generated field ID range will then be attached to the
-  /// firrtl::subAnnotationAttr in order to indicate the applicable fields of an
-  /// annotation.
+  /// annotation in a "circt.fieldID" field in order to indicate the applicable
+  /// fields of an annotation.
   Optional<unsigned> getFieldIDFromTokens(ArrayAttr tokens, SMLoc loc,
                                           Type type);
 
@@ -475,8 +352,8 @@ public:
   SMLoc getFIRLoc() const { return firLoc; }
 
   Location getLoc() {
-    if (infoLoc.hasValue())
-      return infoLoc.getValue();
+    if (infoLoc)
+      return *infoLoc;
     auto result = parser->translateLocation(firLoc);
     infoLoc = result;
     return result;
@@ -495,7 +372,7 @@ public:
   /// If we didn't parse an info locator for the specified value, this sets a
   /// default, overriding a fall back to a location in the .fir file.
   void setDefaultLoc(Location loc) {
-    if (!infoLoc.hasValue())
+    if (!infoLoc)
       infoLoc = loc;
   }
 
@@ -538,7 +415,7 @@ ParseResult FIRParser::parseOptionalInfoLocator(LocationAttr &result) {
     return success();
 
   // Otherwise, set the location attribute and return.
-  result = locationPair.second.getValue();
+  result = locationPair.second.value();
   return success();
 }
 
@@ -898,8 +775,8 @@ ParseResult FIRParser::parseOptionalRUW(RUWAttr &result) {
 /// Convert the input "tokens" to a range of field IDs. Considering a FIRRTL
 /// aggregate type, "{foo: UInt<1>, bar: UInt<1>}[2]", tokens "[0].foo" will be
 /// converted to a field ID range of [2, 2]; tokens "[1]" will be converted to
-/// [4, 6]. The generated field ID range will then be attached to the
-/// firrtl::subAnnotationAttr in order to indicate the applicable fields of an
+/// [4, 6]. The generated field ID range will then be attached to the annotation
+/// in a "circt.fieldID" field to indicate the applicable fields of an
 /// annotation.
 Optional<unsigned> FIRParser::getFieldIDFromTokens(ArrayAttr tokens, SMLoc loc,
                                                    Type type) {
@@ -945,8 +822,8 @@ Optional<unsigned> FIRParser::getFieldIDFromTokens(ArrayAttr tokens, SMLoc loc,
         return None;
       }
 
-      id += bundleType.getFieldID(index.getValue());
-      currentType = bundleType.getElementType(index.getValue());
+      id += bundleType.getFieldID(*index);
+      currentType = bundleType.getElementType(*index);
       continue;
     }
 
@@ -1012,12 +889,13 @@ ArrayAttr FIRParser::convertSubAnnotations(ArrayRef<Attribute> annotations,
       modAttr.push_back(attr);
     }
 
-    // Construct the SubAnnotationAttr for the annotation.
-    auto subAnnotation =
-        SubAnnotationAttr::get(constants.context, fieldID.getValue(),
-                               DictionaryAttr::get(constants.context, modAttr));
+    // Add a "circt.fieldID" field with the fieldID.
+    modAttr.append("circt.fieldID",
+                   IntegerAttr::get(IntegerType::get(constants.context, 64,
+                                                     IntegerType::Signless),
+                                    *fieldID));
 
-    annotationVec.push_back(subAnnotation);
+    annotationVec.push_back(DictionaryAttr::get(constants.context, modAttr));
   }
 
   return ArrayAttr::get(constants.context, annotationVec);
@@ -1505,19 +1383,16 @@ static bool needsSymbol(ArrayAttr &annotations) {
   // Subfield annotations.
   for (Attribute attr : annotations) {
     // Ensure it is a valid annotation.
-    if (!attr.isa<SubAnnotationAttr, DictionaryAttr>())
+    if (!attr.isa<DictionaryAttr>())
       continue;
     Annotation anno(attr);
     // Check if it is a DontTouch annotation that applies to all subfields in
     // case of a bundle. getFieldID returns 0 if it is not a SubAnno.
-    if (anno.getFieldID() == 0 &&
-        anno.isClass("firrtl.transforms.DontTouchAnnotation")) {
+    if (anno.getFieldID() == 0 && anno.isClass(dontTouchAnnoClass)) {
       needsSymbol = true;
       // Ignore the annotation.
       continue;
     }
-    if (anno.getMember("circt.nonlocal"))
-      needsSymbol = true;
     filteredAnnos.push_back(attr);
   }
   if (needsSymbol)
@@ -1611,8 +1486,6 @@ private:
   /// Remove the DontTouch annotation and return a valid symbol name if the
   /// annotation exists. Ignore DontTouch that will apply only to a subfield.
   StringAttr getSymbolIfRequired(ArrayAttr &annotations, StringRef id) {
-    SmallVector<Attribute> filteredAnnos;
-
     bool hasDontTouch = needsSymbol(annotations);
     if (hasDontTouch)
       return StringAttr::get(annotations.getContext(),
@@ -1894,7 +1767,7 @@ ParseResult FIRStmtParser::parsePostFixFieldId(Value &result) {
   if (!indexV)
     return emitError(loc, "unknown field '" + fieldName + "' in bundle type ")
            << result.getType();
-  auto indexNo = indexV.getValue();
+  auto indexNo = *indexV;
 
   // Make sure the field name matches up with the input value's type and
   // compute the result type for the expression.
@@ -2302,14 +2175,14 @@ ParseResult FIRStmtParser::parseSimpleStmtBlock(unsigned indent) {
       return success();
 
     auto subIndent = getIndentation();
-    if (!subIndent.hasValue())
+    if (!subIndent.has_value())
       return emitError("expected statement to be on its own line"), failure();
 
-    if (subIndent.getValue() <= indent)
+    if (*subIndent <= indent)
       return success();
 
     // Let the statement parser handle this.
-    if (parseSimpleStmt(subIndent.getValue()))
+    if (parseSimpleStmt(*subIndent))
       return failure();
   }
 }
@@ -2400,7 +2273,7 @@ ParseResult FIRStmtParser::parseAttach() {
 
   // If this was actually the start of a connect or something else handle that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   if (parseToken(FIRToken::l_paren, "expected '(' after attach"))
     return failure();
@@ -2430,7 +2303,7 @@ ParseResult FIRStmtParser::parseMemPort(MemDirAttr direction) {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   StringRef memName;
@@ -2520,7 +2393,7 @@ ParseResult FIRStmtParser::parseSkip() {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   if (parseOptionalInfo())
     return failure();
@@ -2627,7 +2500,7 @@ ParseResult FIRStmtParser::parseWhen(unsigned whenIndent) {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   Value condition;
   if (parseExp(condition, "expected condition in 'when'") ||
@@ -2665,10 +2538,10 @@ ParseResult FIRStmtParser::parseWhen(unsigned whenIndent) {
     auto stmtIndent = getIndentation();
 
     // Parsing a single statment is straightforward.
-    if (!stmtIndent.hasValue())
+    if (!stmtIndent.has_value())
       return subParser.parseSimpleStmt(whenIndent);
 
-    if (stmtIndent.getValue() <= whenIndent)
+    if (*stmtIndent <= whenIndent)
       return emitError("statement must be indented more than 'when'"),
              failure();
 
@@ -2687,7 +2560,7 @@ ParseResult FIRStmtParser::parseWhen(unsigned whenIndent) {
   // If the 'else' is less indented than the when, then it must belong to some
   // containing 'when'.
   auto elseIndent = getIndentation();
-  if (elseIndent.hasValue() && elseIndent.getValue() < whenIndent)
+  if (elseIndent && *elseIndent < whenIndent)
     return success();
 
   consumeToken(FIRToken::kw_else);
@@ -2774,7 +2647,7 @@ ParseResult FIRStmtParser::parseInstance() {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   StringRef moduleName;
@@ -2820,9 +2693,17 @@ ParseResult FIRStmtParser::parseInstance() {
       startTok.getLoc(), resultNamesAndTypes, moduleContext.targetsInModule);
 
   auto sym = getSymbolIfRequired(annotations.first, id);
+  // Also check for port annotations that may require adding a symbol
+  if (!sym)
+    for (auto portAnno : annotations.second.getAsRange<ArrayAttr>()) {
+      sym = getSymbolIfRequired(portAnno, id);
+      if (sym)
+        break;
+    }
+
   result = builder.create<InstanceOp>(
-      referencedModule, id, annotations.first.getValue(),
-      annotations.second.getValue(), false, sym);
+      referencedModule, id, NameKindEnum::InterestingName,
+      annotations.first.getValue(), annotations.second.getValue(), false, sym);
 
   // Since we are implicitly unbundling the instance results, we need to keep
   // track of the mapping from bundle fields to results in the unbundledValues
@@ -2847,7 +2728,7 @@ ParseResult FIRStmtParser::parseCombMem() {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   FIRRTLType type;
@@ -2868,9 +2749,9 @@ ParseResult FIRStmtParser::parseCombMem() {
                                moduleContext.targetsInModule, type);
 
   auto sym = getSymbolIfRequired(annotations, id);
-  auto result = builder.create<CombMemOp>(vectorType.getElementType(),
-                                          vectorType.getNumElements(), id,
-                                          annotations, sym);
+  auto result = builder.create<CombMemOp>(
+      vectorType.getElementType(), vectorType.getNumElements(), id,
+      NameKindEnum::InterestingName, annotations, sym);
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
 
@@ -2882,7 +2763,7 @@ ParseResult FIRStmtParser::parseSeqMem() {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   FIRRTLType type;
@@ -2906,9 +2787,9 @@ ParseResult FIRStmtParser::parseSeqMem() {
                                moduleContext.targetsInModule, type);
   auto sym = getSymbolIfRequired(annotations, id);
 
-  auto result = builder.create<SeqMemOp>(vectorType.getElementType(),
-                                         vectorType.getNumElements(), ruw, id,
-                                         annotations, sym);
+  auto result = builder.create<SeqMemOp>(
+      vectorType.getElementType(), vectorType.getNumElements(), ruw, id,
+      NameKindEnum::InterestingName, annotations, sym);
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
 
@@ -2927,7 +2808,7 @@ ParseResult FIRStmtParser::parseMem(unsigned memIndent) {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   if (parseId(id, "expected mem name") ||
@@ -2943,7 +2824,7 @@ ParseResult FIRStmtParser::parseMem(unsigned memIndent) {
   // Parse all the memfield records, which are indented more than the mem.
   while (1) {
     auto nextIndent = getIndentation();
-    if (!nextIndent.hasValue() || nextIndent.getValue() <= memIndent)
+    if (!nextIndent || *nextIndent <= memIndent)
       break;
 
     auto spelling = getTokenSpelling();
@@ -3000,7 +2881,7 @@ ParseResult FIRStmtParser::parseMem(unsigned memIndent) {
     ports.push_back({builder.getStringAttr(portName),
                      MemOp::getTypeForPort(depth, type, portKind)});
 
-    while (!getIndentation().hasValue()) {
+    while (!getIndentation().has_value()) {
       if (parseId(portName, "expected port name"))
         return failure();
       ports.push_back({builder.getStringAttr(portName),
@@ -3045,10 +2926,11 @@ ParseResult FIRStmtParser::parseMem(unsigned memIndent) {
       if (sym)
         break;
     }
-  result = builder.create<MemOp>(resultTypes, readLatency, writeLatency, depth,
-                                 ruw, builder.getArrayAttr(resultNames), id,
-                                 annotations.first, annotations.second, sym,
-                                 IntegerAttr());
+  result = builder.create<MemOp>(
+      resultTypes, readLatency, writeLatency, depth, ruw,
+      builder.getArrayAttr(resultNames), id, NameKindEnum::InterestingName,
+      annotations.first, annotations.second,
+      sym ? InnerSymAttr::get(sym) : InnerSymAttr(), IntegerAttr());
 
   UnbundledValueEntry unbundledValueEntry;
   unbundledValueEntry.reserve(result.getNumResults());
@@ -3067,7 +2949,7 @@ ParseResult FIRStmtParser::parseNode() {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   Value initializer;
@@ -3102,8 +2984,9 @@ ParseResult FIRStmtParser::parseNode() {
                                moduleContext.targetsInModule, initializerType);
 
   auto sym = getSymbolIfRequired(annotations, id);
-  auto result = builder.create<NodeOp>(initializer.getType(), initializer, id,
-                                       annotations, sym);
+  auto result =
+      builder.create<NodeOp>(initializer.getType(), initializer, id,
+                             NameKindEnum::InterestingName, annotations, sym);
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
 
@@ -3114,7 +2997,7 @@ ParseResult FIRStmtParser::parseWire() {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   FIRRTLType type;
@@ -3130,7 +3013,9 @@ ParseResult FIRStmtParser::parseWire() {
                                moduleContext.targetsInModule, type);
 
   auto sym = getSymbolIfRequired(annotations, id);
-  auto result = builder.create<WireOp>(type, id, annotations, sym);
+  auto result = builder.create<WireOp>(
+      type, id, NameKindEnum::InterestingName, annotations,
+      sym ? InnerSymAttr::get(sym) : InnerSymAttr());
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
 
@@ -3150,7 +3035,7 @@ ParseResult FIRStmtParser::parseRegister(unsigned regIndent) {
   // If this was actually the start of a connect or something else handle
   // that.
   if (auto isExpr = parseExpWithLeadingKeyword(startTok))
-    return isExpr.getValue();
+    return *isExpr;
 
   StringRef id;
   FIRRTLType type;
@@ -3178,7 +3063,7 @@ ParseResult FIRStmtParser::parseRegister(unsigned regIndent) {
     bool hasExtraLParen = consumeIf(FIRToken::l_paren);
 
     auto indent = getIndentation();
-    if (!indent.hasValue() || indent.getValue() <= regIndent)
+    if (!indent || *indent <= regIndent)
       if (!hasExtraLParen)
         return emitError("expected indented reset specifier in reg"), failure();
 
@@ -3224,9 +3109,11 @@ ParseResult FIRStmtParser::parseRegister(unsigned regIndent) {
   auto sym = getSymbolIfRequired(annotations, id);
   if (resetSignal)
     result = builder.create<RegResetOp>(type, clock, resetSignal, resetValue,
-                                        id, annotations, sym);
+                                        id, NameKindEnum::InterestingName,
+                                        annotations, sym);
   else
-    result = builder.create<RegOp>(type, clock, id, annotations, sym);
+    result = builder.create<RegOp>(
+        type, clock, id, NameKindEnum::InterestingName, annotations, sym);
   return moduleContext.addSymbolEntry(id, result, startTok.getLoc());
 }
 
@@ -3248,12 +3135,8 @@ struct FIRCircuitParser : public FIRParser {
                mlir::TimingScope &ts);
 
 private:
-  /// Add annotations from a string to the internal annotation map.  Report
-  /// errors using a provided source manager location and with a provided error
-  /// message
-  ParseResult importAnnotations(CircuitOp circuit, SMLoc loc,
-                                StringRef circuitTarget,
-                                StringRef annotationsStr, size_t &nlaNumber);
+  /// Extract Annotations from a JSON-encoded Annotation array string and add
+  /// them to a vector of attributes.
   ParseResult importAnnotationsRaw(SMLoc loc, StringRef circuitTarget,
                                    StringRef annotationsStr,
                                    SmallVector<Attribute> &attrs);
@@ -3284,10 +3167,6 @@ private:
 
   SmallVector<DeferredModuleToParse, 0> deferredModules;
   ModuleOp mlirModule;
-
-  /// A global identifier that can be used to link multiple annotations
-  /// together.  This should be incremented on use.
-  unsigned annotationID = 0;
 };
 
 } // end anonymous namespace
@@ -3321,55 +3200,6 @@ FIRCircuitParser::importAnnotationsRaw(SMLoc loc, StringRef circuitTarget,
   return success();
 }
 
-ParseResult FIRCircuitParser::importAnnotations(CircuitOp circuit, SMLoc loc,
-                                                StringRef circuitTarget,
-                                                StringRef annotationsStr,
-                                                size_t &nlaNumber) {
-
-  auto annotations = json::parse(annotationsStr);
-  if (auto err = annotations.takeError()) {
-    handleAllErrors(std::move(err), [&](const json::ParseError &a) {
-      auto diag = emitError(loc, "Failed to parse JSON Annotations");
-      diag.attachNote() << a.message();
-    });
-    return failure();
-  }
-
-  json::Path::Root root;
-  llvm::StringMap<ArrayAttr> thisAnnotationMap;
-  if (!fromJSON(annotations.get(), circuitTarget, thisAnnotationMap, root,
-                circuit, nlaNumber)) {
-    auto diag = emitError(loc, "Invalid/unsupported annotation format");
-    std::string jsonErrorMessage =
-        "See inline comments for problem area in JSON:\n";
-    llvm::raw_string_ostream s(jsonErrorMessage);
-    root.printErrorContext(annotations.get(), s);
-    diag.attachNote() << jsonErrorMessage;
-    return failure();
-  }
-
-  if (!scatterCustomAnnotations(thisAnnotationMap, circuit, annotationID,
-                                translateLocation(loc), nlaNumber))
-    return failure();
-
-  // Merge the attributes we just parsed into the global set we're accumulating.
-  llvm::StringMap<ArrayAttr> &resultAnnoMap = getConstants().annotationMap;
-  for (auto &thisEntry : thisAnnotationMap) {
-    auto &existing = resultAnnoMap[thisEntry.getKey()];
-    if (!existing) {
-      existing = thisEntry.getValue();
-      continue;
-    }
-
-    SmallVector<Attribute> annotationVec(existing.begin(), existing.end());
-    annotationVec.append(thisEntry.getValue().begin(),
-                         thisEntry.getValue().end());
-    existing = ArrayAttr::get(getContext(), annotationVec);
-  }
-
-  return success();
-}
-
 ParseResult FIRCircuitParser::importOMIR(CircuitOp circuit, SMLoc loc,
                                          StringRef circuitTarget,
                                          StringRef annotationsStr,
@@ -3396,10 +3226,6 @@ ParseResult FIRCircuitParser::importOMIR(CircuitOp circuit, SMLoc loc,
     diag.attachNote() << jsonErrorMessage;
     return failure();
   }
-
-  if (!scatterCustomAnnotations(thisAnnotationMap, circuit, annotationID,
-                                translateLocation(loc), nlaNumber))
-    return failure();
 
   // Merge the attributes we just parsed into the global set we're accumulating.
   llvm::StringMap<ArrayAttr> &resultAnnoMap = getConstants().annotationMap;
@@ -3677,12 +3503,14 @@ FIRCircuitParser::parseModuleBody(DeferredModuleToParse &deferredModule) {
     PortInfo &port = std::get<0>(tuple);
     llvm::SMLoc loc = std::get<1>(tuple);
     BlockArgument portArg = std::get<2>(tuple);
-    modNameSpace.newName(port.sym.getValue());
+    if (port.sym)
+      modNameSpace.newName(port.sym.getSymName().getValue());
     if (moduleContext.addSymbolEntry(port.getName(), portArg, loc))
       return failure();
   }
 
-  FIRStmtParser stmtParser(*moduleOp.getBody(), moduleContext, modNameSpace);
+  FIRStmtParser stmtParser(*moduleOp.getBodyBlock(), moduleContext,
+                           modNameSpace);
 
   // Parse the moduleBlock.
   auto result = stmtParser.parseSimpleStmtBlock(deferredModule.indent);
@@ -3720,9 +3548,9 @@ ParseResult FIRCircuitParser::parseCircuit(
     mlir::TimingScope &ts) {
 
   auto indent = getIndentation();
-  if (!indent.hasValue())
+  if (!indent.has_value())
     return emitError("'circuit' must be first token on its line"), failure();
-  unsigned circuitIndent = indent.getValue();
+  unsigned circuitIndent = indent.value();
 
   LocWithInfo info(getToken().getLoc(), this);
   StringAttr name;
@@ -3753,16 +3581,23 @@ ParseResult FIRCircuitParser::parseCircuit(
   // first to place any annotations from an annotation file *after* the inline
   // annotations.  While arbitrary, this makes the annotation file have
   // "append" semantics.
+  SmallVector<Attribute> annos;
   if (!inlineAnnotations.empty())
-    if (importAnnotations(circuit, inlineAnnotationsLoc, circuitTarget,
-                          inlineAnnotations, nlaNumber))
+    if (importAnnotationsRaw(inlineAnnotationsLoc, circuitTarget,
+                             inlineAnnotations, annos))
       return failure();
 
   // Deal with the annotation file if one was specified
   for (auto *annotationsBuf : annotationsBufs)
-    if (importAnnotations(circuit, info.getFIRLoc(), circuitTarget,
-                          annotationsBuf->getBuffer(), nlaNumber))
+    if (importAnnotationsRaw(inlineAnnotationsLoc, circuitTarget,
+                             annotationsBuf->getBuffer(), annos))
       return failure();
+
+  if (!annos.empty())
+    getConstants().annotationMap[rawAnnotations] = b.getArrayAttr(annos);
+
+  parseAnnotationTimer.stop();
+  auto parseOMIRTimer = ts.nest("Parse OMIR");
 
   // Process OMIR files as annotations with a class of
   // "freechips.rocketchip.objectmodel.OMNode"
@@ -3770,6 +3605,8 @@ ParseResult FIRCircuitParser::parseCircuit(
     if (importOMIR(circuit, info.getFIRLoc(), circuitTarget,
                    omirBuf->getBuffer(), nlaNumber))
       return failure();
+
+  parseOMIRTimer.stop();
 
   // Get annotations associated with this circuit. These are either:
   //   1. Annotations with no target (which we use "~" to identify)
@@ -3783,8 +3620,6 @@ ParseResult FIRCircuitParser::parseCircuit(
     auto extraAnnos = getConstants().annotationMap.lookup(rawAnnotations);
     circuit->setAttr(rawAnnotations, extraAnnos);
   }
-
-  parseAnnotationTimer.stop();
 
   // A timer to get execution time of module parsing.
   auto parseTimer = ts.nest("Parse modules");
@@ -3810,9 +3645,9 @@ ParseResult FIRCircuitParser::parseCircuit(
     case FIRToken::kw_module:
     case FIRToken::kw_extmodule: {
       auto indent = getIndentation();
-      if (!indent.hasValue())
+      if (!indent.has_value())
         return emitError("'module' must be first token on its line"), failure();
-      unsigned moduleIndent = indent.getValue();
+      unsigned moduleIndent = indent.value();
 
       if (moduleIndent <= circuitIndent)
         return emitError("module should be indented more"), failure();
@@ -3875,8 +3710,8 @@ DoneParsing:
              << "no modules found, circuit must contain one or more modules";
     }
     return mlir::emitError(circuit.getLoc())
-           << "no main module found, circuit '" << circuit.name()
-           << "' must contain a module named '" << circuit.name() << "'";
+           << "no main module found, circuit '" << circuit.getName()
+           << "' must contain a module named '" << circuit.getName() << "'";
   }
 
   // If the circuit has an entry point that is not an external module, set the

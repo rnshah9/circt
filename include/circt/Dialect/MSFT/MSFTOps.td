@@ -6,11 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+include "circt/Dialect/HW/HWOpInterfaces.td"
+
 def InstanceOp : MSFTOp<"instance", [
         Symbol,
         ParentOneOf<["MSFTModuleOp"]>,
         DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
-        DeclareOpInterfaceMethods<SymbolUserOpInterface>
+        DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+        DeclareOpInterfaceMethods<HWInstanceLike>
     ]> {
   let summary = "Instantiate a module";
 
@@ -21,14 +24,15 @@ def InstanceOp : MSFTOp<"instance", [
                        OptionalAttr<SymbolRefAttr>:$targetDesignPartition);
   let results = (outs Variadic<AnyType>);
 
+  let builders = [
+    OpBuilder<(ins "ArrayRef<Type>":$resultTypes, "StringAttr":$sym_name,
+                   "FlatSymbolRefAttr":$moduleName, "ArrayRef<Value>":$inputs)>
+  ];
+
   let extraClassDeclaration = [{
     // Return the name of the specified result or empty string if it cannot be
     // determined.
     StringAttr getResultName(size_t i);
-
-    /// Lookup the module or extmodule for the symbol.  This returns null on
-    /// invalid IR.
-    Operation *getReferencedModule();
 
     /// Instance name is the same as the symbol name. This may change in the
     /// future.
@@ -48,8 +52,8 @@ def InstanceOp : MSFTOp<"instance", [
 
   /// sym keyword for optional symbol simplifies parsing
   let assemblyFormat = [{
-    $sym_name $moduleName `(` $inputs `)` custom<ParameterList>($parameters) attr-dict
-      `:` functional-type($inputs, results)
+    $sym_name $moduleName `(` $inputs `)` custom<ParameterList>($parameters)
+      attr-dict `:` functional-type($inputs, results)
   }];
 }
 
@@ -57,11 +61,15 @@ def OneOrNoBlocksRegion : Region<
   CPred<"::llvm::hasNItemsOrLess($_self, 1)">,
   "region with at most 1 block">;
 
+def AppIDArrayAttr : TypedArrayAttrBase<AppIDAttr, "Array of AppIDs">;
+
 def MSFTModuleOp : MSFTOp<"module",
       [IsolatedFromAbove, FunctionOpInterface, Symbol, RegionKindInterface,
        HasParent<"mlir::ModuleOp">,
        SingleBlockImplicitTerminator<"OutputOp">,
-       OpAsmOpInterface]>{
+       OpAsmOpInterface,
+       DeclareOpInterfaceMethods<HWModuleLike>,
+       DeclareOpInterfaceMethods<HWMutableModuleLike>]>{
   let summary = "MSFT HW Module";
   let description = [{
     A lot like `hw.module`, but with a few differences:
@@ -72,7 +80,8 @@ def MSFTModuleOp : MSFTOp<"module",
   let arguments = (ins
       StrArrayAttr:$argNames, StrArrayAttr:$resultNames,
       DictionaryAttr:$parameters,
-      OptionalAttr<StrAttr>:$fileName);
+      OptionalAttr<StrAttr>:$fileName,
+      OptionalAttr<StrArrayAttr>:$childAppIDBases);
   let results = (outs);
   let regions = (region OneOrNoBlocksRegion:$body);
 
@@ -93,6 +102,12 @@ def MSFTModuleOp : MSFTOp<"module",
 
     // Decode information about the input and output ports on this module.
     ::circt::hw::ModulePortInfo getPorts();
+
+    // Insert and remove ports.
+    void modifyPorts(
+      ArrayRef<std::pair<unsigned, circt::hw::PortInfo>> insertInputs,
+      ArrayRef<std::pair<unsigned, circt::hw::PortInfo>> insertOutputs,
+      ArrayRef<unsigned> eraseInputs, ArrayRef<unsigned> eraseOutputs);
 
     // Adds input and output ports. Returns a list of new block arguments for
     // the new inputs.

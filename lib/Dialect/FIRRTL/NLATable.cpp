@@ -22,31 +22,31 @@ NLATable::NLATable(Operation *operation) {
   auto circuit = cast<CircuitOp>(operation);
   // We are assuming it's faster to iterate over the top level twice than cache
   // a large number of options.
-  for (auto &op : *circuit.getBody()) {
+  for (auto &op : *circuit.getBodyBlock()) {
     if (auto module = dyn_cast<FModuleLike>(op))
       symToOp[module.moduleNameAttr()] = module;
-    if (auto nla = dyn_cast<NonLocalAnchor>(op))
+    if (auto nla = dyn_cast<HierPathOp>(op))
       addNLA(nla);
   }
 }
 
-ArrayRef<NonLocalAnchor> NLATable::lookup(StringAttr name) {
+ArrayRef<HierPathOp> NLATable::lookup(StringAttr name) {
   auto iter = nodeMap.find(name);
   if (iter == nodeMap.end())
     return {};
   return iter->second;
 }
 
-ArrayRef<NonLocalAnchor> NLATable::lookup(Operation *op) {
+ArrayRef<HierPathOp> NLATable::lookup(Operation *op) {
   auto name = op->getAttrOfType<StringAttr>("sym_name");
   if (!name)
     return {};
   return lookup(name);
 }
 
-NonLocalAnchor NLATable::getNLA(StringAttr name) {
+HierPathOp NLATable::getNLA(StringAttr name) {
   auto *n = symToOp.lookup(name);
-  return dyn_cast_or_null<NonLocalAnchor>(n);
+  return dyn_cast_or_null<HierPathOp>(n);
 }
 
 FModuleLike NLATable::getModule(StringAttr name) {
@@ -54,9 +54,9 @@ FModuleLike NLATable::getModule(StringAttr name) {
   return dyn_cast_or_null<FModuleLike>(n);
 }
 
-void NLATable::addNLA(NonLocalAnchor nla) {
-  symToOp[nla.sym_nameAttr()] = nla;
-  for (auto ent : nla.namepath()) {
+void NLATable::addNLA(HierPathOp nla) {
+  symToOp[nla.getSymNameAttr()] = nla;
+  for (auto ent : nla.getNamepath()) {
     if (auto mod = ent.dyn_cast<FlatSymbolRefAttr>())
       nodeMap[mod.getAttr()].push_back(nla);
     else if (auto inr = ent.dyn_cast<hw::InnerRefAttr>())
@@ -64,9 +64,9 @@ void NLATable::addNLA(NonLocalAnchor nla) {
   }
 }
 
-void NLATable::erase(NonLocalAnchor nla, SymbolTable *symbolTable) {
-  symToOp.erase(nla.sym_nameAttr());
-  for (auto ent : nla.namepath())
+void NLATable::erase(HierPathOp nla, SymbolTable *symbolTable) {
+  symToOp.erase(nla.getSymNameAttr());
+  for (auto ent : nla.getNamepath())
     if (auto mod = ent.dyn_cast<FlatSymbolRefAttr>())
       llvm::erase_value(nodeMap[mod.getAttr()], nla);
     else if (auto inr = ent.dyn_cast<hw::InnerRefAttr>())
@@ -75,7 +75,7 @@ void NLATable::erase(NonLocalAnchor nla, SymbolTable *symbolTable) {
     symbolTable->erase(nla);
 }
 
-void NLATable::updateModuleInNLA(NonLocalAnchor nlaOp, StringAttr oldModule,
+void NLATable::updateModuleInNLA(HierPathOp nlaOp, StringAttr oldModule,
                                  StringAttr newModule) {
   nlaOp.updateModule(oldModule, newModule);
   auto &nlas = nodeMap[oldModule];

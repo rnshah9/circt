@@ -15,7 +15,7 @@ include "circt/Types.td"
 
 def CircuitOp : FIRRTLOp<"circuit",
       [IsolatedFromAbove, SymbolTable, SingleBlock, NoTerminator,
-       NoRegionArguments]> {
+       NoRegionArguments, InnerRefNamespace]> {
   let summary = "FIRRTL Circuit";
   let description = [{
     The "firrtl.circuit" operation represents an overall Verilog circuit,
@@ -34,14 +34,13 @@ def CircuitOp : FIRRTLOp<"circuit",
 
   let extraClassDeclaration = [{
     OpBuilder getBodyBuilder() {
-      assert(!body().empty() && "Unexpected empty 'body' region.");
-      Block &bodyBlock = body().front();
+      assert(!getBody().empty() && "Unexpected empty 'body' region.");
+      Block &bodyBlock = getBody().front();
       return OpBuilder::atBlockEnd(&bodyBlock);
     }
 
     /// Return body of this circuit.
-    Region &getBodyRegion();
-    Block *getBody();
+    Block *getBodyBlock();
 
     // Return the main module that is the entry point of the circuit.  This may
     // be either an FModuleOp or an FExtModuleOp.
@@ -77,22 +76,22 @@ def FModuleOp : FIRRTLOp<"module", [IsolatedFromAbove, Symbol, SingleBlock,
   ];
 
   let extraClassDeclaration = [{
-    Block *getBody() { return &body().front(); }
+    Block *getBodyBlock() { return &getBody().front(); }
 
     using iterator = Block::iterator;
-    iterator begin() { return getBody()->begin(); }
-    iterator end() { return getBody()->end(); }
+    iterator begin() { return getBodyBlock()->begin(); }
+    iterator end() { return getBodyBlock()->end(); }
 
     Block::BlockArgListType getArguments() {
-      return getBody()->getArguments();
+      return getBodyBlock()->getArguments();
     }
 
     // Return the block argument for the port with the specified index.
     BlockArgument getArgument(size_t portNumber);
 
     OpBuilder getBodyBuilder() {
-      assert(!body().empty() && "Unexpected empty 'body' region.");
-      Block &bodyBlock = body().front();
+      assert(!getBody().empty() && "Unexpected empty 'body' region.");
+      Block &bodyBlock = getBody().front();
       return OpBuilder::atBlockEnd(&bodyBlock);
     }
 
@@ -111,7 +110,7 @@ def FModuleOp : FIRRTLOp<"module", [IsolatedFromAbove, Symbol, SingleBlock,
 
 def FExtModuleOp : FIRRTLOp<"extmodule",
       [IsolatedFromAbove, Symbol, HasParent<"CircuitOp">, OpAsmOpInterface,
-       DeclareOpInterfaceMethods<FModuleLike>,
+       DeclareOpInterfaceMethods<FModuleLike>, InnerSymbolTable,
        DeclareOpInterfaceMethods<HWModuleLike>]> {
   let summary = "FIRRTL extmodule";
   let description = [{
@@ -146,14 +145,14 @@ def FExtModuleOp : FIRRTLOp<"extmodule",
 
 def FMemModuleOp : FIRRTLOp<"memmodule",
       [IsolatedFromAbove, Symbol, HasParent<"CircuitOp">, OpAsmOpInterface,
-       DeclareOpInterfaceMethods<FModuleLike>,
+       DeclareOpInterfaceMethods<FModuleLike>, InnerSymbolTable,
        DeclareOpInterfaceMethods<HWModuleLike>]> {
   let summary = "FIRRTL Generated Module";
   let description = [{
     The "firrtl.memmodule" operation represents an external reference to a
     memory module. See the "firrtl.mem" op for a deeper explantation of the
     parameters.
-    
+
     A "firrtl.mem" operation is typically lowered to this operation when they
     are not directly lowered to registers by the compiler.
   }];
@@ -177,7 +176,7 @@ def FMemModuleOp : FIRRTLOp<"memmodule",
 
   let extraClassDeclaration = [{
     /// Return true if this memory has a mask.
-    bool isMasked() { return maskBits() > 1; }
+    bool isMasked() { return getMaskBits() > 1; }
 
     /// Inserts the given ports.
     void insertPorts(ArrayRef<std::pair<unsigned, PortInfo>> ports);
@@ -189,15 +188,15 @@ def FMemModuleOp : FIRRTLOp<"memmodule",
   let hasCustomAssemblyFormat = 1;
 }
 
-def NonLocalAnchor : FIRRTLOp<"nla",
-      [IsolatedFromAbove, Symbol, 
-       DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+def HierPathOp : FIRRTLOp<"hierpath",
+      [IsolatedFromAbove, Symbol,
+       DeclareOpInterfaceMethods<InnerRefUserOpInterface>,
        HasParent<"CircuitOp">]> {
-  let summary = "Anchor for non-local annotations";
+  let summary = "Hierarchical path specification";
   let description = [{
-    The "firrtl.nla" operation represents a common point for non-local (path)
-    annotations to anchor to in the global scope.  This lets components of the
-    path point to a common entity.
+    The "firrtl.hierpath" operation represents a path through the hierarchy.
+    This is used to specify namable things for use in other operations, for 
+    example in verbatim substitution. Non-local annotations also use these.
   }];
   let arguments = (ins SymbolNameAttr:$sym_name, NameRefArrayAttr:$namepath);
   let results = (outs);
@@ -220,7 +219,7 @@ def NonLocalAnchor : FIRRTLOp<"nla",
 
     /// Replace the oldMod module with newMod module in the namepath of the NLA.
     /// Since the module is being updated, the symbols inside the module should
-    /// also be renamed. Use the rename Map to update the corresponding 
+    /// also be renamed. Use the rename Map to update the corresponding
     /// inner_sym names in the namepath. Return true if any update is made.
     bool updateModuleAndInnerRef(StringAttr oldMod, StringAttr newMod,
          const llvm::DenseMap<StringAttr, StringAttr> &innerSymRenameMap);

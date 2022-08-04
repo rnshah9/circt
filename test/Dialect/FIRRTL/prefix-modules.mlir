@@ -205,10 +205,10 @@ firrtl.circuit "GCTInterfacePrefix"
 // CHECK: firrtl.circuit "T_NLATop"
 firrtl.circuit "NLATop" {
 
-  firrtl.nla @nla [@NLATop::@test, @Aardvark::@test, @Zebra]
-  firrtl.nla @nla_1 [@NLATop::@test,@Aardvark::@test_1, @Zebra]
-  // CHECK: firrtl.nla @nla [@T_NLATop::@test, @T_Aardvark::@test, @T_A_Z_Zebra]
-  // CHECK: firrtl.nla @nla_1 [@T_NLATop::@test, @T_Aardvark::@test_1, @T_A_Z_Zebra]
+  firrtl.hierpath @nla [@NLATop::@test, @Aardvark::@test, @Zebra]
+  firrtl.hierpath @nla_1 [@NLATop::@test,@Aardvark::@test_1, @Zebra]
+  // CHECK: firrtl.hierpath @nla [@T_NLATop::@test, @T_Aardvark::@test, @T_A_Z_Zebra]
+  // CHECK: firrtl.hierpath @nla_1 [@T_NLATop::@test, @T_Aardvark::@test_1, @T_A_Z_Zebra]
   // CHECK: firrtl.module @T_NLATop
   firrtl.module @NLATop()
     attributes {annotations = [{
@@ -271,10 +271,11 @@ firrtl.circuit "GCTDataMemTapsPrefix" {
   // CHECK-SAME:   defname = "BAR_MemTap"
   firrtl.extmodule @MemTap(
     out mem: !firrtl.vector<uint<1>, 1>
-      [#firrtl.subAnno<fieldID = 1, {
+      [{
+        circt.fieldID = 1 : i32,
         class = "sifive.enterprise.grandcentral.MemTapAnnotation.port",
         id = 0 : i64,
-        word = 0 : i64}>])
+        word = 0 : i64}])
     attributes {defname = "MemTap"}
   // Module DUT has a "FOO_" prefix.
   firrtl.module @DUT()
@@ -305,14 +306,14 @@ firrtl.circuit "GCTDataMemTapsPrefix" {
 // Test the the NonLocalAnchor is properly updated.
 // CHECK-LABEL: firrtl.circuit "FixNLA" {
   firrtl.circuit "FixNLA"   {
-    firrtl.nla @nla_1 [@FixNLA::@bar, @Bar::@baz, @Baz]
-    // CHECK:   firrtl.nla @nla_1 [@FixNLA::@bar, @Bar::@baz, @Baz]
-    firrtl.nla @nla_2 [@FixNLA::@foo, @Foo::@bar, @Bar::@baz, @Baz::@s1]
-    // CHECK:   firrtl.nla @nla_2 [@FixNLA::@foo, @X_Foo::@bar, @X_Bar::@baz, @X_Baz::@s1]
-    firrtl.nla @nla_3 [@FixNLA::@bar, @Bar::@baz, @Baz]
-    // CHECK:   firrtl.nla @nla_3 [@FixNLA::@bar, @Bar::@baz, @Baz]
-    firrtl.nla @nla_4 [@Foo::@bar, @Bar::@baz, @Baz]
-    // CHECK:       firrtl.nla @nla_4 [@X_Foo::@bar, @X_Bar::@baz, @X_Baz]
+    firrtl.hierpath @nla_1 [@FixNLA::@bar, @Bar::@baz, @Baz]
+    // CHECK:   firrtl.hierpath @nla_1 [@FixNLA::@bar, @Bar::@baz, @Baz]
+    firrtl.hierpath @nla_2 [@FixNLA::@foo, @Foo::@bar, @Bar::@baz, @Baz::@s1]
+    // CHECK:   firrtl.hierpath @nla_2 [@FixNLA::@foo, @X_Foo::@bar, @X_Bar::@baz, @X_Baz::@s1]
+    firrtl.hierpath @nla_3 [@FixNLA::@bar, @Bar::@baz, @Baz]
+    // CHECK:   firrtl.hierpath @nla_3 [@FixNLA::@bar, @Bar::@baz, @Baz]
+    firrtl.hierpath @nla_4 [@Foo::@bar, @Bar::@baz, @Baz]
+    // CHECK:       firrtl.hierpath @nla_4 [@X_Foo::@bar, @X_Bar::@baz, @X_Baz]
     // CHECK-LABEL: firrtl.module @FixNLA()
     firrtl.module @FixNLA() {
       firrtl.instance foo sym @foo  @Foo()
@@ -343,15 +344,15 @@ firrtl.circuit "GCTDataMemTapsPrefix" {
     // CHECK:       firrtl.module @Baz()
     // CHECK-SAME:  annotations = [{circt.nonlocal = @nla_1, class = "nla_1"}, {circt.nonlocal = @nla_3, class = "nla_3"}]
     // CHECK:       %mem_MPORT_en = firrtl.wire sym @s1  : !firrtl.uint<1>
-    
+
   }
 
 // Test that NonLocalAnchors are properly updated with memmodules.
 firrtl.circuit "Test"   {
-  // CHECK: firrtl.nla @nla_1 [@Test::@foo1, @A_Foo1::@bar, @A_Bar]
-  firrtl.nla @nla_1 [@Test::@foo1, @Foo1::@bar, @Bar]
-  // CHECK: firrtl.nla @nla_2 [@Test::@foo2, @B_Foo2::@bar, @B_Bar]
-  firrtl.nla @nla_2 [@Test::@foo2, @Foo2::@bar, @Bar]
+  // CHECK: firrtl.hierpath @nla_1 [@Test::@foo1, @A_Foo1::@bar, @A_Bar]
+  firrtl.hierpath @nla_1 [@Test::@foo1, @Foo1::@bar, @Bar]
+  // CHECK: firrtl.hierpath @nla_2 [@Test::@foo2, @B_Foo2::@bar, @B_Bar]
+  firrtl.hierpath @nla_2 [@Test::@foo2, @Foo2::@bar, @Bar]
 
   firrtl.module @Test() {
     firrtl.instance foo1 sym @foo1 @Foo1()

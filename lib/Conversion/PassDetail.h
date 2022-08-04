@@ -43,8 +43,13 @@ class FuncOp;
 
 namespace circt {
 
+namespace fsm {
+class FSMDialect;
+} // namespace fsm
+
 namespace calyx {
 class CalyxDialect;
+class ComponentOp;
 } // namespace calyx
 
 namespace firrtl {
@@ -78,9 +83,13 @@ class HWDialect;
 class HWModuleOp;
 } // namespace hw
 
-namespace staticlogic {
-class StaticLogicDialect;
-} // namespace staticlogic
+namespace hwarith {
+class HWArithDialect;
+} // namespace hwarith
+
+namespace pipeline {
+class PipelineDialect;
+} // namespace pipeline
 
 namespace seq {
 class SeqDialect;
@@ -89,6 +98,14 @@ class SeqDialect;
 namespace sv {
 class SVDialect;
 } // namespace sv
+
+namespace fsm {
+class FSMDialect;
+} // namespace fsm
+
+namespace systemc {
+class SystemCDialect;
+} // namespace systemc
 
 // Generate the classes which represent the passes
 #define GEN_PASS_CLASSES

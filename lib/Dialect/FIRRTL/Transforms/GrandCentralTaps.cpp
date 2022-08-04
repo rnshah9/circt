@@ -107,7 +107,10 @@ struct PortWiring {
   /// If set, the port should output a constant literal.
   Literal literal;
   /// The non-local anchor further specifying where to connect.
-  NonLocalAnchor nla;
+  HierPathOp nla;
+  /// True if the tapped target is known to be zero-width.  This indicates that
+  /// the port should not be wired.  The port will be removed by LowerToHW.
+  bool zeroWidth = false;
 
   PortWiring() : target(nullptr) {}
 };
@@ -291,19 +294,12 @@ static FailureOr<Literal> parseIntegerLiteral(MLIRContext *context,
 // A Literal is a FIRRTL IR literal serialized to a string.  For now, just
 // store the string.
 // TODO: Parse the literal string into a UInt or SInt literal.
-LogicalResult circt::firrtl::applyGCTDataTaps(AnnoPathValue target,
+LogicalResult circt::firrtl::applyGCTDataTaps(const AnnoPathValue &target,
                                               DictionaryAttr anno,
                                               ApplyState &state) {
 
   auto *context = state.circuit.getContext();
   auto loc = state.circuit.getLoc();
-
-  auto dontTouch = [&](StringRef targetStr) {
-    NamedAttrList anno;
-    anno.append("class", StringAttr::get(context, dontTouchAnnoClass));
-    anno.append("target", StringAttr::get(context, targetStr));
-    state.addToWorklistFn(DictionaryAttr::get(context, anno));
-  };
 
   auto id = state.newID();
   NamedAttrList attrs;
@@ -351,52 +347,13 @@ LogicalResult circt::firrtl::applyGCTDataTaps(AnnoPathValue target,
           tryGetAs<StringAttr>(bDict, anno, "source", loc, dataTapsClass, path);
       if (!sourceAttr)
         return failure();
-      auto sourceTargetPath = canonicalizeTarget(sourceAttr.getValue());
-      auto sourceTarget = tokenizePath(sourceTargetPath);
-      if (!sourceTarget)
+      auto sourceTarget = canonicalizeTarget(sourceAttr.getValue());
+      if (!tokenizePath(sourceTarget))
         return failure();
 
-      // If this refers to a module port, create a "tap" wire to observe the
-      // value of the port, which can unblock optimizations by not pointing at
-      // the port directly.
-      AnnoPathValue path =
-          resolvePath(sourceTargetPath, state.circuit, state.symTbl).getValue();
-      auto portSourceTarget = path.ref.dyn_cast_or_null<PortAnnoTarget>();
-      if (portSourceTarget && isa<FModuleOp>(portSourceTarget.getOp())) {
-        auto module = cast<FModuleOp>(portSourceTarget.getOp());
-        Value value = module.getArgument(portSourceTarget.getPortNo());
-        auto builder = ImplicitLocOpBuilder::atBlockBegin(value.getLoc(),
-                                                          module.getBody());
-        auto type = portSourceTarget.getType()
-                        .getFinalTypeByFieldID(path.fieldIdx)
-                        .getPassiveType();
-        auto tap = builder.create<WireOp>(
-            type, state.getNamespace(module).newName("_gctTap"));
-        value = getValueByFieldID(builder, value, path.fieldIdx);
-        emitConnect(builder, tap, value);
-        sourceTarget->name = tap.name();
-        sourceTarget->component.clear(); // resolved in getValueByFieldID
-      } else if (!portSourceTarget) {
-        ImplicitLocOpBuilder builder(path.ref.getOp()->getLoc(),
-                                     path.ref.getOp());
-        builder.setInsertionPointAfter(path.ref.getOp());
-        Value value = path.ref.getOp()->getResult(0);
-        auto type = path.ref.getType()
-                        .getFinalTypeByFieldID(path.fieldIdx)
-                        .getPassiveType();
-        auto tap = builder.create<WireOp>(
-            type, state.getNamespace(path.ref.getModule()).newName("_gctTap"));
-        value = getValueByFieldID(builder, value, path.fieldIdx);
-        emitConnect(builder, tap, value);
-        sourceTarget->name = tap.name();
-        sourceTarget->component.clear(); // resolved in getValueByFieldID
-      }
-
-      sourceTargetPath = sourceTarget->str();
-      source.append("target", StringAttr::get(context, sourceTargetPath));
+      source.append("target", StringAttr::get(context, sourceTarget));
 
       state.addToWorklistFn(DictionaryAttr::get(context, source));
-      dontTouch(sourceTargetPath);
 
       // Annotate the data tap module port.
       port.append("class", StringAttr::get(context, referenceKeyPortClass));
@@ -473,7 +430,7 @@ LogicalResult circt::firrtl::applyGCTDataTaps(AnnoPathValue target,
   return success();
 }
 
-LogicalResult circt::firrtl::applyGCTMemTaps(AnnoPathValue target,
+LogicalResult circt::firrtl::applyGCTMemTaps(const AnnoPathValue &target,
                                              DictionaryAttr anno,
                                              ApplyState &state) {
 
@@ -519,7 +476,7 @@ LogicalResult circt::firrtl::applyGCTMemTaps(AnnoPathValue target,
     port.append("target", StringAttr::get(context, canonTarget));
     state.addToWorklistFn(DictionaryAttr::get(context, port));
 
-    auto blackboxTarget = tokenizePath(canonTarget).getValue();
+    auto blackboxTarget = tokenizePath(canonTarget).value();
     blackboxTarget.name = {};
     blackboxTarget.component.clear();
     auto blackboxTargetStr = blackboxTarget.str();
@@ -550,7 +507,15 @@ class GrandCentralTapsPass : public GrandCentralTapsBase<GrandCentralTapsPass> {
     auto key = getKey(anno);
     annos.insert({key, anno});
     assert(!tappedPorts.count(key) && "ambiguous tap annotation");
-    tappedPorts.insert({key, port});
+    auto portWidth = cast<FModuleLike>(port.first)
+                         .getPortType(port.second)
+                         .getBitWidthOrSentinel();
+    // If the port width is non-zero, process it normally.  Otherwise, record it
+    // as being zero-width.
+    if (portWidth)
+      tappedPorts.insert({key, port});
+    else
+      zeroWidthTaps.insert(key);
     if (auto sym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
       deadNLAs.insert(sym.getAttr());
   }
@@ -558,13 +523,18 @@ class GrandCentralTapsPass : public GrandCentralTapsBase<GrandCentralTapsPass> {
     auto key = getKey(anno);
     annos.insert({key, anno});
     assert(!tappedOps.count(key) && "ambiguous tap annotation");
-    tappedOps.insert({key, op});
+    // If the port width is targeting a module (e.g., a blackbox) or if it has a
+    // non-zero width, process it normally.  Otherwise, record it as being
+    // zero-width.
+    if (isa<FModuleLike>(op) ||
+        op->getResult(0).getType().cast<FIRRTLType>().getBitWidthOrSentinel())
+      tappedOps.insert({key, op});
+    else
+      zeroWidthTaps.insert(key);
     if (auto sym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
       deadNLAs.insert(sym.getAttr());
   }
 
-  /// Returns an operation's `inner_sym`, adding one if necessary.
-  StringAttr getOrAddInnerSym(Operation *op);
   /// Returns a port's `inner_sym`, adding one if necessary.
   StringAttr getOrAddInnerSym(FModuleLike module, size_t portIdx);
   /// Obtain an inner reference to an operation, possibly adding an `inner_sym`
@@ -585,6 +555,7 @@ class GrandCentralTapsPass : public GrandCentralTapsBase<GrandCentralTapsPass> {
 
   DenseMap<Key, Annotation> annos;
   DenseMap<Key, Operation *> tappedOps;
+  DenseSet<Key> zeroWidthTaps;
   DenseMap<Key, Port> tappedPorts;
   SmallVector<PortWiring, 8> portWiring;
 
@@ -608,6 +579,8 @@ void GrandCentralTapsPass::runOnOperation() {
   LLVM_DEBUG(llvm::dbgs() << "Running the GCT Data Taps pass\n");
   SymbolTable symtbl(circuitOp);
   circuitSymbols = &symtbl;
+  InnerSymbolTableCollection innerSymTblCol(circuitOp);
+  InnerRefNamespace innerRefNS{symtbl, innerSymTblCol};
 
   // Here's a rough idea of what the Scala code is doing:
   // - Gather the `source` of all `keys` of all `DataTapsAnnotation`s throughout
@@ -654,7 +627,7 @@ void GrandCentralTapsPass::runOnOperation() {
   // expanded.
   SmallVector<AnnotatedExtModule, 4> modules;
   for (auto extModule : llvm::make_early_inc_range(
-           circuitOp.getBody()->getOps<FExtModuleOp>())) {
+           circuitOp.getBodyBlock()->getOps<FExtModuleOp>())) {
 
     // If the external module indicates that it is a data or mem tap, but does
     // not actually contain any taps (it has no ports), then delete the module
@@ -668,6 +641,7 @@ void GrandCentralTapsPass::runOnOperation() {
       for (auto *use : instancePaths.instanceGraph[extModule]->uses())
         use->getInstance().erase();
       extModule.erase();
+      continue;
     }
 
     // Go through the module ports and collect the annotated ones.
@@ -758,7 +732,7 @@ void GrandCentralTapsPass::runOnOperation() {
         for (auto path : wiring.prefices) {
           llvm::dbgs() << "  - " << path;
           if (wiring.nla)
-            llvm::dbgs() << "." << wiring.nla.namepathAttr();
+            llvm::dbgs() << "." << wiring.nla.getNamepathAttr();
           if (!wiring.suffix.empty())
             llvm::dbgs() << " $ " << wiring.suffix;
           llvm::dbgs() << "\n";
@@ -805,11 +779,17 @@ void GrandCentralTapsPass::runOnOperation() {
                       hw::OutputFileAttr::getFromDirectoryAndFilename(
                           &getContext(), maybeExtractDirectory.getValue(),
                           impl.getName() + ".sv"));
-      builder.setInsertionPointToEnd(impl.getBody());
+      impl->setAttr("comment",
+                    builder.getStringAttr("VCS coverage exclude_file"));
+      builder.setInsertionPointToEnd(impl.getBodyBlock());
 
       // Connect the output ports to the appropriate tapped object.
       for (auto port : portWiring) {
         LLVM_DEBUG(llvm::dbgs() << "- Wiring up port " << port.portNum << "\n");
+
+        // Ignore the port if it is marked for deletion.
+        if (port.zeroWidth)
+          continue;
 
         // Handle literals. We send the literal string off to the FIRParser to
         // translate into whatever ops are necessary. This yields a handle on
@@ -826,25 +806,30 @@ void GrandCentralTapsPass::runOnOperation() {
         // The code tries to come up with a relative path from the data tap
         // instance (path being the absolute path to that instance) to the
         // tapped thing (prefix being the path to the tapped port, wire, or
-        // memory) by calling stripCommonPrefix(prefix, path). Bug 2767 was
-        // caused because, the path in the NLA was not considered for this
-        // common prefix stripping (prefix is the path to the root of the NLA).
-        // This leads to overly pessimistic paths like
-        // Top.dut.submodule_1.bar.Memory[0], which should rather be
-        // DUT.submodule_1.bar.Memory[0]. To properly fix this, the path in the
-        // NLA should be inlined in the prefix such that it becomes part of the
-        // prefix stripping operation.
+        // memory) by calling stripCommonPrefix(prefix, path).  If the tapped
+        // thing includes an NLA, then the NLA path is appended to the rest of
+        // the path before the common prefix stripping is done.
 
         // Determine the shortest hierarchical prefix from this black box
         // instance to the tapped object.
-        Optional<InstancePath> shortestPrefix;
+        Optional<SmallVector<InstanceOp>> shortestPrefix;
         for (auto prefix : port.prefices) {
-          auto relative = stripCommonPrefix(prefix, path);
-          if (!shortestPrefix.hasValue() ||
-              relative.size() < shortestPrefix->size())
-            shortestPrefix = relative;
+
+          // Append the NLA path to the instance graph-determined path.
+          SmallVector<InstanceOp> prefixWithNLA(prefix.begin(), prefix.end());
+          if (port.nla) {
+            for (auto segment : port.nla.getNamepath().getValue().drop_back())
+              if (auto ref = segment.dyn_cast<InnerRefAttr>()) {
+                prefixWithNLA.push_back(
+                    cast<InstanceOp>(innerRefNS.lookupOp(ref)));
+              }
+          }
+
+          auto relative = stripCommonPrefix(prefixWithNLA, path);
+          if (!shortestPrefix || relative.size() < shortestPrefix->size())
+            shortestPrefix.emplace(relative.begin(), relative.end());
         }
-        if (!shortestPrefix.hasValue()) {
+        if (!shortestPrefix) {
           LLVM_DEBUG(llvm::dbgs() << "  - Has no prefix, skipping\n");
           continue;
         }
@@ -852,9 +837,14 @@ void GrandCentralTapsPass::runOnOperation() {
                    << "  - Shortest prefix " << *shortestPrefix << "\n");
 
         // Determine the module at which the hierarchical name should start.
-        Operation *opInRootModule =
-            shortestPrefix->empty() ? path.front() : shortestPrefix->front();
-        auto rootModule = opInRootModule->getParentOfType<FModuleLike>();
+        FModuleLike rootModule;
+        if (shortestPrefix->empty()) {
+          if (port.target.hasPort())
+            rootModule = cast<FModuleLike>(port.target.getOp());
+          else
+            rootModule = port.target.getOp()->getParentOfType<FModuleLike>();
+        } else
+          rootModule = shortestPrefix->front()->getParentOfType<FModuleLike>();
 
         SmallVector<Attribute> symbols;
         SmallString<128> hname;
@@ -869,29 +859,18 @@ void GrandCentralTapsPass::runOnOperation() {
         // Concatenate the prefix into a proper full hierarchical name.
         addSymbol(
             FlatSymbolRefAttr::get(SymbolTable::getSymbolName(rootModule)));
-        if (port.nla && shortestPrefix->empty() &&
-            port.nla.root() != rootModule.moduleNameAttr()) {
-          // This handles the case when nla is not considered for common prefix
-          // stripping.
-          auto rootMod = port.nla.root();
-          for (auto p : path) {
-            if (rootMod == p->getParentOfType<FModuleOp>().getNameAttr())
-              break;
-            addSymbol(getInnerRefTo(p));
-          }
-        }
-        for (auto inst : shortestPrefix.getValue())
+        for (auto inst : *shortestPrefix)
           addSymbol(getInnerRefTo(inst));
-        if (port.nla) {
-          for (auto sym : port.nla.namepath())
-            addSymbol(sym);
-        } else if (port.target.getOp()) {
+
+        if (port.target.getOp()) {
+          Attribute leaf;
           if (port.target.hasPort())
-            addSymbol(
-                getInnerRefTo(port.target.getOp(), port.target.getPort()));
+            leaf = getInnerRefTo(port.target.getOp(), port.target.getPort());
           else
-            addSymbol(getInnerRefTo(port.target.getOp()));
+            leaf = getInnerRefTo(port.target.getOp());
+          addSymbol(leaf);
         }
+
         if (!port.suffix.empty()) {
           hname += '.';
           hname += port.suffix;
@@ -929,32 +908,12 @@ void GrandCentralTapsPass::runOnOperation() {
 
   // Garbage collect NLAs which were removed.
   for (auto &op :
-       llvm::make_early_inc_range(circuitOp.getBody()->getOperations())) {
+       llvm::make_early_inc_range(circuitOp.getBodyBlock()->getOperations())) {
     // Remove NLA anchors whose leaf annotations were removed.
-    if (auto nla = dyn_cast<NonLocalAnchor>(op)) {
+    if (auto nla = dyn_cast<HierPathOp>(op)) {
       if (deadNLAs.contains(nla.getNameAttr()))
         nla.erase();
       continue;
-    }
-
-    // Remove NLA paths on instances associated with removed NLA
-    // leaves.
-    auto module = dyn_cast<FModuleOp>(op);
-    if (!module)
-      continue;
-    for (auto instance : module.getBody()->getOps<InstanceOp>()) {
-      AnnotationSet annotations(instance);
-      if (annotations.empty())
-        continue;
-      bool modified = false;
-      annotations.removeAnnotations([&](Annotation anno) {
-        if (auto sym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
-          if (deadNLAs.contains(sym.getAttr()))
-            return modified = true;
-        return false;
-      });
-      if (modified)
-        annotations.applyToOperation(instance);
     }
   }
 }
@@ -1031,9 +990,9 @@ void GrandCentralTapsPass::processAnnotation(AnnotatedPort &portAnno,
   // path. During wiring of the ports, we generate hierarchical names of the
   // form `<prefix>.<nla-path>.<suffix>`. If we don't have an NLA, we leave it
   // to the key-class-specific code below to come up with the possible prefices.
-  NonLocalAnchor nla;
+  HierPathOp nla;
   if (auto nlaSym = targetAnno.getMember<FlatSymbolRefAttr>("circt.nonlocal")) {
-    nla = dyn_cast<NonLocalAnchor>(circuitSymbols->lookup(nlaSym.getAttr()));
+    nla = dyn_cast<HierPathOp>(circuitSymbols->lookup(nlaSym.getAttr()));
     assert(nla);
     // Find all paths to the root of the NLA.
     Operation *root = circuitSymbols->lookup(nla.root());
@@ -1067,19 +1026,23 @@ void GrandCentralTapsPass::processAnnotation(AnnotatedPort &portAnno,
       if (!nla)
         wiring.prefices =
             instancePaths.getAbsolutePaths(op->getParentOfType<FModuleOp>());
-
-      // Set the literal member if this wire or node is driven by a constant.
-      auto driver = getDriverFromConnect(op->getResult(0));
-      if (driver)
-        if (auto constant =
-                dyn_cast_or_null<ConstantOp>(driver.getDefiningOp())) {
-          wiring.literal = {
-              IntegerAttr::get(constant.getContext(), constant.value()),
-              constant.getType()};
-          op->removeAttr("inner_sym");
-        }
-
       wiring.target = PortWiring::Target(op);
+
+      // If the tapped operation is trivially driven by a constant, set
+      // information about the literal so that this can later be used instead of
+      // an XMR.
+      if (auto driver = getDriverFromConnect(op->getResult(0)))
+        if (auto constant =
+                dyn_cast_or_null<ConstantOp>(driver.getDefiningOp()))
+          wiring.literal = {constant.getValueAttr(), constant.getType()};
+
+      portWiring.push_back(std::move(wiring));
+      return;
+    }
+
+    // If the port is zero-width, then mark it as
+    if (zeroWidthTaps.contains(key)) {
+      wiring.zeroWidth = true;
       portWiring.push_back(std::move(wiring));
       return;
     }
@@ -1215,38 +1178,19 @@ void GrandCentralTapsPass::processAnnotation(AnnotatedPort &portAnno,
   llvm_unreachable("portAnnos is never populated with unsupported annos");
 }
 
-StringAttr GrandCentralTapsPass::getOrAddInnerSym(Operation *op) {
-  auto attr = op->getAttrOfType<StringAttr>("inner_sym");
-  if (attr)
-    return attr;
-  auto module = op->getParentOfType<FModuleOp>();
-  auto name = getModuleNamespace(module).newName("gct_sym");
-  attr = StringAttr::get(op->getContext(), name);
-  op->setAttr("inner_sym", attr);
-  return attr;
-}
-
-StringAttr GrandCentralTapsPass::getOrAddInnerSym(FModuleLike module,
-                                                  size_t portIdx) {
-  auto attr = module.getPortSymbolAttr(portIdx);
-  if (attr && !attr.getValue().empty())
-    return attr;
-  auto name = getModuleNamespace(module).newName("gct_sym");
-  attr = StringAttr::get(module.getContext(), name);
-  module.setPortSymbolAttr(portIdx, attr);
-  return attr;
-}
-
 InnerRefAttr GrandCentralTapsPass::getInnerRefTo(Operation *op) {
-  return InnerRefAttr::get(
-      SymbolTable::getSymbolName(op->getParentOfType<FModuleOp>()),
-      getOrAddInnerSym(op));
+  return ::getInnerRefTo(op, "gct_sym",
+                         [&](FModuleOp mod) -> ModuleNamespace & {
+                           return getModuleNamespace(mod);
+                         });
 }
 
 InnerRefAttr GrandCentralTapsPass::getInnerRefTo(FModuleLike module,
                                                  size_t portIdx) {
-  return InnerRefAttr::get(SymbolTable::getSymbolName(module),
-                           getOrAddInnerSym(module, portIdx));
+  return ::getInnerRefTo(module, portIdx, "gct_sym",
+                         [&](FModuleLike mod) -> ModuleNamespace & {
+                           return getModuleNamespace(mod);
+                         });
 }
 
 std::unique_ptr<mlir::Pass> circt::firrtl::createGrandCentralTapsPass() {
