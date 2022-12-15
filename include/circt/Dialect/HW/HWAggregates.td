@@ -12,10 +12,35 @@
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
+// Constants
+//===----------------------------------------------------------------------===//
+
+def AggregateConstantOp : HWOp<"aggregate_constant", [Pure, ConstantLike]> {
+  let summary = "Produce a constant aggregate value";
+  let description = [{
+    This operation produces a constant value of an aggregate type. Clock and
+    reset values are supported. For nested aggregates, embedded arrays are
+    used.
+
+    Examples:
+    ```mlir
+      %result = hw.aggregate.constant [1 : i1, 2 : i2, 3 : i2] : !hw.struct<a: i8, b: i8, c: i8>
+      %result = hw.aggregate.constant [1 : i1, [2 : i2, 3 : i2]] : !hw.struct<a: i8, b: vector<i8, 2>>
+    ```
+  }];
+
+  let arguments = (ins ArrayAttr:$fields);
+  let results = (outs HWAggregateType:$result);
+  let assemblyFormat = "$fields attr-dict `:` type($result)";
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // Packed Array Processing Operations
 //===----------------------------------------------------------------------===//
 
-def ArrayCreateOp : HWOp<"array_create", [NoSideEffect, SameTypeOperands]> {
+def ArrayCreateOp : HWOp<"array_create", [Pure, SameTypeOperands]> {
   let summary = "Create an array from values";
   let description = [{
     Creates an array from a variable set of values. One or more values must be
@@ -33,15 +58,25 @@ def ArrayCreateOp : HWOp<"array_create", [NoSideEffect, SameTypeOperands]> {
   let results = (outs ArrayType:$result);
 
   let hasVerifier = 1;
+  let hasFolder = 1;
+  let hasCanonicalizeMethod = 1;
 
   let hasCustomAssemblyFormat = 1;
   let builders = [
     // ValueRange needs to contain at least one element.
     OpBuilder<(ins "ValueRange":$input)>
   ];
+
+  let extraClassDeclaration = [{
+    /// If the all elements of the array are identical, returns that element
+    /// value. Otherwise returns a null value.
+    Value getUniformElement();
+    /// Returns true if all array elements are identical.
+    bool isUniform() { return !!getUniformElement(); }
+  }];
 }
 
-def ArrayConcatOp : HWOp<"array_concat", [NoSideEffect]> {
+def ArrayConcatOp : HWOp<"array_concat", [Pure]> {
   let summary = "Concatenate some arrays";
   let description = [{
     Creates an array by concatenating a variable set of arrays. One or more
@@ -67,9 +102,11 @@ def ArrayConcatOp : HWOp<"array_concat", [NoSideEffect]> {
     // ValueRange needs to contain at least one element.
     OpBuilder<(ins "ValueRange":$inputs)>
   ];
+  let hasFolder = 1;
+  let hasCanonicalizeMethod = 1;
 }
 
-def ArraySliceOp : HWOp<"array_slice", [NoSideEffect]> {
+def ArraySliceOp : HWOp<"array_slice", [Pure]> {
   let summary = "Get a range of values from an array";
   let description = [{
     Extracts a sub-range from an array. The range is from `lowIndex` to
@@ -99,6 +136,8 @@ def ArraySliceOp : HWOp<"array_slice", [NoSideEffect]> {
   let results = (outs ArrayType:$dst);
 
   let hasVerifier = 1;
+  let hasFolder = 1;
+  let hasCanonicalizeMethod = 1;
 
   let assemblyFormat = [{
     $input`[`$lowIndex`]` attr-dict `:`
@@ -107,13 +146,8 @@ def ArraySliceOp : HWOp<"array_slice", [NoSideEffect]> {
 }
 
 class IndexBitWidthConstraint<string index, string input>
-  : TypesMatchWith<"Index width should be exactly clog2 (size of array)",
-                   input, index,
-                   [{
-    IntegerType::get($_self.getContext(),
-                     type_cast<ArrayType>($_self).getSize() == 1 ? 1 :
-                     llvm::Log2_64_Ceil(type_cast<ArrayType>($_self).getSize()))
-                   }]>;
+  : PredOpTrait<"Index width should be exactly clog2 (size of array), or either 0 or 1 if the array is a singleton.",
+                   CPred<"isValidIndexBitWidth($" # index # ", $" # input # ")">>;
 
 class ArrayElementTypeConstraint<string result, string input>
   : TypesMatchWith<"Result must be arrays element type",
@@ -122,14 +156,14 @@ class ArrayElementTypeConstraint<string result, string input>
 
 // hw.array_get does not work with unpacked arrays.
 def ArrayGetOp : HWOp<"array_get",
-    [NoSideEffect, IndexBitWidthConstraint<"index", "input">,
+    [Pure, IndexBitWidthConstraint<"index", "input">,
      ArrayElementTypeConstraint<"result", "input">]> {
   let summary = "Get the value in an array at the specified index";
   let arguments = (ins ArrayType:$input, HWIntegerType:$index);
   let results = (outs HWNonInOutType:$result);
 
   let assemblyFormat = [{
-    $input`[`$index`]` attr-dict `:` qualified(type($input))
+    $input`[`$index`]` attr-dict `:` qualified(type($input)) `,` qualified(type($index))
   }];
 
   let builders = [
@@ -137,21 +171,27 @@ def ArrayGetOp : HWOp<"array_get",
   ];
 
   let hasFolder = 1;
+  let hasCanonicalizeMethod = 1;
 }
 
 //===----------------------------------------------------------------------===//
 // Structure Processing Operations
 //===----------------------------------------------------------------------===//
 
-def StructCreateOp : HWOp<"struct_create", [NoSideEffect]> {
+def StructCreateOp : HWOp<"struct_create", [Pure]> {
   let summary = "Create a struct from constituent parts.";
   let arguments = (ins Variadic<HWNonInOutType>:$input);
   let results = (outs StructType:$result);
   let hasCustomAssemblyFormat = 1;
+  let hasFolder = 1;
+  let hasVerifier = 1;
 }
 
 // Extract the value of a field of a structure.
-def StructExtractOp : HWOp<"struct_extract", [NoSideEffect]> {
+def StructExtractOp : HWOp<"struct_extract",
+    [Pure,
+    DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>
+  ]> {
   let summary = "Extract a named field from a struct.";
   let description = [{
     ```
@@ -173,7 +213,7 @@ def StructExtractOp : HWOp<"struct_extract", [NoSideEffect]> {
 }
 
 // Create a structure by replacing a field with a value in an existing one.
-def StructInjectOp : HWOp<"struct_inject", [NoSideEffect,
+def StructInjectOp : HWOp<"struct_inject", [Pure,
                            AllTypesMatch<["input", "result"]>]> {
   let summary = "Inject a value into a named field of a struct.";
   let description = [{
@@ -187,11 +227,13 @@ def StructInjectOp : HWOp<"struct_inject", [NoSideEffect,
                    HWNonInOutType:$newValue);
   let results = (outs StructType:$result);
   let hasCustomAssemblyFormat = 1;
-
+  let hasFolder = 1;
   let hasCanonicalizeMethod = 1;
 }
 
-def StructExplodeOp : HWOp<"struct_explode", [NoSideEffect]> {
+def StructExplodeOp : HWOp<"struct_explode", [Pure,
+    DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>
+  ]> {
   let summary = "Expand a struct into its constituent parts.";
   let description = [{
     ```
@@ -201,13 +243,15 @@ def StructExplodeOp : HWOp<"struct_explode", [NoSideEffect]> {
   let arguments = (ins StructType:$input);
   let results = (outs Variadic<HWNonInOutType>:$result);
   let hasCustomAssemblyFormat = 1;
+  let hasFolder = 1;
+  let hasCanonicalizeMethod = 1;
  }
 
 //===----------------------------------------------------------------------===//
 // Union operations
 //===----------------------------------------------------------------------===//
 
-def UnionCreateOp : HWOp<"union_create", [NoSideEffect]> {
+def UnionCreateOp : HWOp<"union_create", [Pure]> {
   let summary = "Create a union with the specified value.";
   let description = [{
     Create a union with the value 'input', which can then be accessed via the
@@ -224,7 +268,7 @@ def UnionCreateOp : HWOp<"union_create", [NoSideEffect]> {
   let hasCustomAssemblyFormat = 1;
 }
 
-def UnionExtractOp : HWOp<"union_extract", [NoSideEffect]> {
+def UnionExtractOp : HWOp<"union_extract", [Pure]> {
   let summary = "Get a union member.";
   let description = [{
     Get the value of a union, interpreting it as the type of the specified

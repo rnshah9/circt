@@ -117,6 +117,9 @@ def IfDefProceduralOp
     OpBuilder<(ins "StringRef":$cond,
                       CArg<"std::function<void()>", "{}">:$thenCtor,
                       CArg<"std::function<void()>", "{}">:$elseCtor)>,
+    OpBuilder<(ins "StringAttr":$cond,
+                      CArg<"std::function<void()>", "{}">:$thenCtor,
+                      CArg<"std::function<void()>", "{}">:$elseCtor)>,
     OpBuilder<(ins "MacroIdentAttr":$cond,
                       CArg<"std::function<void()>", "{}">:$thenCtor,
                       CArg<"std::function<void()>", "{}">:$elseCtor)>
@@ -190,8 +193,8 @@ def EventControlAttr : I32EnumAttr<"EventControl", "edge control trigger",
 
 
 def AlwaysOp : SVOp<"always", [SingleBlock, NoTerminator, NoRegionArguments,
-                               RecursiveSideEffects, ProceduralRegion,
-                               NonProceduralOp]> {
+                               RecursiveMemoryEffects, RecursivelySpeculatable,
+                               ProceduralRegion, NonProceduralOp]> {
   let summary = "'always @' block";
   let description = "See SV Spec 9.2, and 9.4.2.2.";
 
@@ -225,7 +228,9 @@ def AlwaysOp : SVOp<"always", [SingleBlock, NoTerminator, NoRegionArguments,
 }
 
 def AlwaysCombOp : SVOp<"alwayscomb", [SingleBlock, NoTerminator,
-                                       NoRegionArguments, RecursiveSideEffects,
+                                       NoRegionArguments,
+                                       RecursiveMemoryEffects,
+                                       RecursivelySpeculatable,
                                        ProceduralRegion, NonProceduralOp]> {
   let summary = "'alwayscomb block";
   let description = "See SV Spec 9.2, and 9.2.2.2.";
@@ -255,8 +260,8 @@ def ResetTypeAttr : I32EnumAttr<"ResetType", "reset type",
 
 
 def AlwaysFFOp : SVOp<"alwaysff", [SingleBlock, NoTerminator, NoRegionArguments,
-                                   RecursiveSideEffects, ProceduralRegion,
-                                   NonProceduralOp]> {
+                                   RecursiveMemoryEffects, RecursivelySpeculatable,
+                                   ProceduralRegion, NonProceduralOp]> {
   let summary = "'alwaysff @' block with optional reset";
   let description = [{
     alwaysff blocks represent always_ff verilog nodes, which enforce inference
@@ -300,8 +305,9 @@ def AlwaysFFOp : SVOp<"alwaysff", [SingleBlock, NoTerminator, NoRegionArguments,
 
 
 def InitialOp : SVOp<"initial", [SingleBlock, NoTerminator, NoRegionArguments,
-                                 RecursiveSideEffects, ProceduralRegion,
-                                 NonProceduralOp]> {
+                                 RecursiveMemoryEffects,
+                                 RecursivelySpeculatable,
+                                 ProceduralRegion, NonProceduralOp]> {
   let summary = "'initial' block";
   let description = "See SV Spec 9.2.1.";
 
@@ -360,7 +366,7 @@ def CaseOp : SVOp<"case", [SingleBlock, NoTerminator, NoRegionArguments,
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
   let hasCanonicalizeMethod = 1;
-  
+
   let builders = [
     /// This ctor allows you to build a CaseZ with some number of cases, getting
     /// a callback for each case.
@@ -407,6 +413,7 @@ def BPAssignOp : SVOp<"bpassign", [InOutTypeConstraint<"src", "dest">,
     occur in initial, always, task, and function blocks.  The statement is
     executed before any following statements are. See SV Spec 10.4.1.
   }];
+  let hasCanonicalizeMethod = true;
   let arguments = (ins InOutType:$dest, InOutElementType:$src);
   let results = (outs);
   let assemblyFormat = "$dest `,` $src  attr-dict `:` qualified(type($src))";
@@ -421,6 +428,7 @@ def PAssignOp : SVOp<"passign", [InOutTypeConstraint<"src", "dest">,
     These occur in initial, always, task, and function blocks.  The statement
     can be scheduled without blocking procedural flow.  See SV Spec 10.4.2.
   }];
+  let hasCanonicalizeMethod = true;
   let arguments = (ins InOutType:$dest, InOutElementType:$src);
   let results = (outs);
   let assemblyFormat = "$dest `,` $src  attr-dict `:` qualified(type($src))";
@@ -528,7 +536,7 @@ def VerbatimOp : SVOp<"verbatim"> {
 // Bind Statements
 //===----------------------------------------------------------------------===//
 
-def BindOp : SVOp<"bind", 
+def BindOp : SVOp<"bind",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "indirect instantiation statement";
   let description = [{
@@ -554,7 +562,7 @@ def BindOp : SVOp<"bind",
   }];
 }
 
-def BindInterfaceOp : SVOp<"bind.interface", 
+def BindInterfaceOp : SVOp<"bind.interface",
     [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
   let summary = "indirectly instantiate an interface";
   let description = [{
@@ -583,7 +591,7 @@ def BindInterfaceOp : SVOp<"bind.interface",
 /// - `1`: Prints simulation time and location (default)
 /// - `2`: Prints simulation time, location, and statistics about the memory and
 ///   CPU time used in simulation
-def VerbosityIntAttr : DefaultValuedAttr<Confined<I8Attr,
+def VerbosityIntAttr : DefaultValuedAttr<ConfinedAttr<I8Attr,
   [IntMinValue<0>, IntMaxValue<2>]>, "1">;
 
 /// Commonalities between `StopOp` and `FinishOp`.
@@ -703,7 +711,7 @@ def InfoOp : NonfatalMessageOp<"info"> {
   }] # messageDescription;
 }
 
-def DepositOp : SVOp<"nonstandard.deposit", 
+def DepositOp : SVOp<"nonstandard.deposit",
     [ProceduralOp, VendorExtension, InOutTypeConstraint<"src", "dest">]> {
   let summary = "`$deposit` system task";
   let description = [{
@@ -713,4 +721,29 @@ def DepositOp : SVOp<"nonstandard.deposit",
   let arguments = (ins InOutType:$dest, InOutElementType:$src);
   let results = (outs);
   let assemblyFormat = "$dest `,` $src  attr-dict `:` qualified(type($src))";
+}
+
+
+//===----------------------------------------------------------------------===//
+// Memory loading system tasks
+//===----------------------------------------------------------------------===//
+
+def MemBaseBin: I32EnumAttrCase<"MemBaseBin", 0>;
+def MemBaseHex: I32EnumAttrCase<"MemBaseHex", 1>;
+def MemBaseTypeAttr :
+    I32EnumAttr<"MemBaseTypeAttr", "the numeric base of a memory file",
+                [MemBaseBin, MemBaseHex]>;
+
+def ReadMemOp : SVOp<"readmem", [ProceduralOp]> {
+  let summary = "load a memory from a file in either binary or hex format";
+  let description = [{
+    Load a memory from a file using either `$readmemh` or `$readmemb` based on
+    an attribute.
+
+    See Section 21.4 of IEEE 1800-2017 for more information.
+  }];
+  let arguments =
+    (ins SymbolNameAttr:$inner_sym, StrAttr:$filename, MemBaseTypeAttr:$base);
+  let results = (outs);
+  let assemblyFormat = "$inner_sym `,` $filename `,` $base attr-dict";
 }

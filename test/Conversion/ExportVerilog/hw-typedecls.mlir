@@ -1,5 +1,7 @@
 // RUN: circt-opt %s -export-verilog -verify-diagnostics | FileCheck %s --strict-whitespace
 
+// CHECK: `ifndef _TYPESCOPE___hw_typedecls
+// CHECK: `define _TYPESCOPE___hw_typedecls
 hw.type_scope @__hw_typedecls {
   // CHECK: typedef logic foo;
   hw.typedecl @foo : i1
@@ -17,14 +19,18 @@ hw.type_scope @__hw_typedecls {
   hw.typedecl @qux, "customName" : i32
   // CHECK: typedef struct packed {foo a; _other_scope_foo b; } nestedRef;
   hw.typedecl @nestedRef : !hw.struct<a: !hw.typealias<@__hw_typedecls::@foo,i1>, b: !hw.typealias<@_other_scope::@foo,i2>>
-  // CHECK: typedef enum {A, B, C} myEnum;
+  // CHECK: typedef enum {myEnum_A, myEnum_B, myEnum_C} myEnum;
   hw.typedecl @myEnum : !hw.enum<A, B, C>
 }
+// CHECK: `endif // _TYPESCOPE___hw_typedecls
 
+// CHECK: `ifndef _TYPESCOPE__other_scope
+// CHECK: `define _TYPESCOPE__other_scope
 hw.type_scope @_other_scope {
   // CHECK: typedef logic [1:0] _other_scope_foo;
   hw.typedecl @foo, "_other_scope_foo" : i2
 }
+// CHECK: `endif // _TYPESCOPE__other_scope
 
 // CHECK: `ifndef __PYCDE_TYPES__
 // CHECK:   typedef struct packed {logic a; } exTypedef;
@@ -80,7 +86,6 @@ hw.module @testAggregateCreate(%i: i1) -> (out1: i1, out2: i1) {
 hw.module @testAggregateInout(%i: i1) -> (out1: i8, out2: i1) {
   // CHECK:      wire arr array;
   // CHECK-NEXT: wire bar str;
-  // CHECK-EMPTY:
   // CHECK-NEXT: assign out1 = array[4'h0];
   // CHECk-NEXT: assign out2 = str.a;
   %array = sv.wire : !hw.inout<!hw.typealias<@__hw_typedecls::@arr, !hw.array<16xi8>>>
@@ -95,7 +100,7 @@ hw.module @testAggregateInout(%i: i1) -> (out1: i8, out2: i1) {
 
 // CHECK-LABEL: module testEnumOps
 hw.module @testEnumOps() -> (out1: !hw.typealias<@__hw_typedecls::@myEnum,!hw.enum<A, B, C>>) {
-  // CHECK: assign out1 = A;
+  // CHECK: assign out1 = myEnum_A;
   %0 = hw.enum.constant A : !hw.typealias<@__hw_typedecls::@myEnum,!hw.enum<A, B, C>>
   hw.output %0 : !hw.typealias<@__hw_typedecls::@myEnum,!hw.enum<A, B, C>>
 }

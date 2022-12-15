@@ -37,6 +37,8 @@ declare_mlir_python_extension(CIRCTBindingsPythonExtension.Core
     CIRCTCAPISV
     CIRCTCAPIExportVerilog
     CIRCTCAPIFSM
+    CIRCTCAPIHandshake
+    MLIRCAPITransforms
   PRIVATE_LINK_LIBS
     ${_depends}
 )
@@ -49,7 +51,6 @@ declare_mlir_python_sources(CIRCTBindingsPythonSources
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
   SOURCES
     circt/__init__.py
-    circt/esi.py
     circt/support.py
     circt/dialects/_ods_common.py)
 
@@ -77,7 +78,9 @@ declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
   ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
   TD_FILE circt/dialects/ESIOps.td
-  SOURCES circt/dialects/esi.py
+  SOURCES
+    circt/dialects/esi.py
+    circt/dialects/_esi_ops_ext.py
   DIALECT_NAME esi)
 
 declare_mlir_dialect_python_bindings(

@@ -74,22 +74,22 @@ private:
 } // anonymous namespace
 
 LogicalResult ExportCosimSchema::visitEndpoint(CosimEndpointOp ep) {
-  capnp::TypeSchema sendTypeSchema(ep.send().getType());
+  capnp::TypeSchema sendTypeSchema(ep.getSend().getType());
   if (!sendTypeSchema.isSupported())
-    return ep.emitOpError("Type ") << ep.send().getType() << " not supported.";
+    return ep.emitOpError("Type ")
+           << ep.getSend().getType() << " not supported.";
   types.push_back(sendTypeSchema);
 
-  capnp::TypeSchema recvTypeSchema(ep.recv().getType());
+  capnp::TypeSchema recvTypeSchema(ep.getRecv().getType());
   if (!recvTypeSchema.isSupported())
     return ep.emitOpError("Type '")
-           << ep.recv().getType() << "' not supported.";
+           << ep.getRecv().getType() << "' not supported.";
   types.push_back(recvTypeSchema);
 
   os << "# Endpoint ";
   StringAttr epName = ep->getAttrOfType<StringAttr>("name");
   if (epName)
-    os << epName << " is endpoint ";
-  os << "#" << ep.endpointID() << " at " << ep.getLoc() << ":\n";
+    os << epName << " endpoint at " << ep.getLoc() << ":\n";
   os << "#   Send type: ";
   sendTypeSchema.writeMetadata(os);
   os << "\n";
@@ -171,7 +171,8 @@ LogicalResult circt::esi::exportCosimSchema(ModuleOp module,
 
 LogicalResult circt::esi::exportCosimSchema(ModuleOp module,
                                             llvm::raw_ostream &os) {
-  return failure();
+  return mlir::emitError(UnknownLoc::get(module.getContext()),
+                         "Not compiled with CAPNP support");
 }
 
 #endif
@@ -183,8 +184,8 @@ LogicalResult circt::esi::exportCosimSchema(ModuleOp module,
 void circt::esi::registerESITranslations() {
 #ifdef CAPNP
   mlir::TranslateFromMLIRRegistration cosimToCapnp(
-      "export-esi-capnp", exportCosimSchema,
-      [](mlir::DialectRegistry &registry) {
+      "export-esi-capnp", "ESI Cosim Cap'nProto schema generation",
+      exportCosimSchema, [](mlir::DialectRegistry &registry) {
         registry.insert<ESIDialect, circt::hw::HWDialect, circt::sv::SVDialect,
                         mlir::func::FuncDialect, mlir::BuiltinDialect>();
       });

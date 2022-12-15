@@ -1,9 +1,9 @@
 set(LLVM_LINK_COMPONENTS
   Support
-  )
+)
 
 add_llvm_tool(circt-opt
- circt-opt.cpp
+  circt-opt.cpp
 )
 llvm_update_compile_flags(circt-opt)
 target_link_libraries(circt-opt
@@ -15,7 +15,7 @@ target_link_libraries(circt-opt
   CIRCTCalyxToFSM
   CIRCTCalyxTransforms
   CIRCTESI
-  CIRCTExportSystemC
+  CIRCTExportChiselInterface
   CIRCTExportVerilog
   CIRCTFIRRTL
   CIRCTFIRRTLToHW
@@ -35,9 +35,11 @@ target_link_libraries(circt-opt
   CIRCTMoore
   CIRCTMooreToCore
   CIRCTMSFT
+  CIRCTMSFTTransforms
   CIRCTHW
   CIRCTHWArith
   CIRCTHWArithToHW
+  CIRCTInteropDialect
   CIRCTHWToLLHD
   CIRCTHWToSystemC
   CIRCTHWTransforms
@@ -47,14 +49,17 @@ target_link_libraries(circt-opt
   CIRCTSeq
   CIRCTSeqTransforms
   CIRCTSSP
+  CIRCTSSPTransforms
   CIRCTStandardToHandshake
-  CIRCTStandardToPipeline
   CIRCTPipelineOps
+  CIRCTPipelineToHW
+  CIRCTPipelineTransforms
   CIRCTPipelineToCalyx
   CIRCTSV
   CIRCTSVTransforms
   CIRCTHWArith
   CIRCTSystemC
+  CIRCTSystemCTransforms
   CIRCTTransforms
 
   MLIRIR
@@ -66,4 +71,5 @@ target_link_libraries(circt-opt
   MLIRSupport
   MLIRTransforms
   MLIRSCFDialect
+  MLIREmitCDialect
 )

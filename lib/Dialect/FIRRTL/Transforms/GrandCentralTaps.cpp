@@ -24,6 +24,7 @@
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWSymCache.h"
+#include "circt/Dialect/HW/InstanceGraphBase.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/STLExtras.h"
@@ -37,7 +38,9 @@
 
 using namespace circt;
 using namespace firrtl;
+using hw::HWInstanceLike;
 using hw::InnerRefAttr;
+using hw::InstancePath;
 using mlir::FailureOr;
 
 //===----------------------------------------------------------------------===//
@@ -102,12 +105,14 @@ struct PortWiring {
   ArrayRef<InstancePath> prefices;
   /// The operation or module port being wire to this data tap module port.
   Target target;
+  /// The fieldID which specifies the element we want to connect in the port.
+  unsigned targetFieldID;
   /// An additional string suffix to append to the hierarchical name.
   SmallString<16> suffix;
   /// If set, the port should output a constant literal.
   Literal literal;
   /// The non-local anchor further specifying where to connect.
-  HierPathOp nla;
+  hw::HierPathOp nla;
   /// True if the tapped target is known to be zero-width.  This indicates that
   /// the port should not be wired.  The port will be removed by LowerToHW.
   bool zeroWidth = false;
@@ -271,6 +276,264 @@ static FailureOr<Literal> parseIntegerLiteral(MLIRContext *context,
   return lit;
 }
 
+Value lowerInternalPathAnno(AnnoPathValue &srcTarget,
+                            const AnnoPathValue &moduleTarget,
+                            const AnnoPathValue &target,
+                            StringAttr internalPathAttr, FIRRTLType targetType,
+                            ApplyState &state) {
+  Value sendVal;
+  FModuleLike mod = cast<FModuleLike>(moduleTarget.ref.getOp());
+  InstanceOp modInstance;
+  if (!moduleTarget.instances.empty()) {
+    modInstance = moduleTarget.instances.back();
+  } else {
+    auto *node = state.instancePathCache.instanceGraph.lookup(
+        cast<hw::HWModuleLike>((Operation *)mod));
+    if (!node->hasOneUse()) {
+      mod->emitOpError(
+          "cannot be used for DataTaps, it is instantiated multiple times");
+      return nullptr;
+    }
+    modInstance = cast<InstanceOp>((*node->uses().begin())->getInstance());
+  }
+  ImplicitLocOpBuilder builder(modInstance.getLoc(), modInstance);
+  builder.setInsertionPointAfter(modInstance);
+  auto portRefType = RefType::get(targetType.cast<FIRRTLBaseType>());
+  StringRef refName("ref");
+  // Add RefType ports corresponding to this "internalPath" to the external
+  // module. This also updates all the instances of the external module.
+  // This removes and replaces the instance, and returns the updated
+  // instance.
+  modInstance = addPortsToModule(
+      mod, modInstance, portRefType, Direction::Out, refName,
+      state.instancePathCache,
+      [&](FModuleLike mod) -> ModuleNamespace & {
+        return state.getNamespace(mod);
+      },
+      &state.targetCaches);
+  // Since the instance op generates the RefType output, no need of another
+  // RefSendOp.  Store into an op to ensure we have stable reference,
+  // so future tapping won't invalidate this Value.
+  sendVal = modInstance.getResults().back();
+  sendVal =
+      builder
+          .create<mlir::UnrealizedConversionCastOp>(sendVal.getType(), sendVal)
+          ->getResult(0);
+
+  // Now set the instance as the source for the final datatap xmr.
+  srcTarget = AnnoPathValue(modInstance);
+  if (auto extMod = dyn_cast<FExtModuleOp>((Operation *)mod)) {
+    // The extern module can have other internal paths attached to it,
+    // append this to them.
+    SmallVector<Attribute> paths(extMod.getInternalPathsAttr().getValue());
+    paths.push_back(internalPathAttr);
+    extMod.setInternalPathsAttr(builder.getArrayAttr(paths));
+  } else if (auto intMod = dyn_cast<FModuleOp>((Operation *)mod)) {
+    auto builder = ImplicitLocOpBuilder::atBlockEnd(
+        intMod.getLoc(), &intMod.getBody().getBlocks().back());
+    auto pathStr = builder.create<VerbatimExprOp>(
+        portRefType.getType(), internalPathAttr.getValue(), ValueRange{});
+    auto sendPath = builder.create<RefSendOp>(pathStr);
+    builder.create<StrictConnectOp>(intMod.getArguments().back(),
+                                    sendPath.getResult());
+  }
+
+  if (!moduleTarget.instances.empty())
+    srcTarget.instances = moduleTarget.instances;
+  else {
+    auto path = state.instancePathCache
+                    .getAbsolutePaths(modInstance->getParentOfType<FModuleOp>())
+                    .back();
+    srcTarget.instances.append(path.begin(), path.end());
+  }
+  return sendVal;
+}
+
+LogicalResult static applyNoBlackBoxStyleDataTaps(const AnnoPathValue &target,
+                                                  DictionaryAttr anno,
+                                                  ApplyState &state) {
+  auto *context = state.circuit.getContext();
+  auto loc = state.circuit.getLoc();
+
+  // Process all the taps.
+  auto keyAttr = tryGetAs<ArrayAttr>(anno, anno, "keys", loc, dataTapsClass);
+  if (!keyAttr)
+    return failure();
+  for (size_t i = 0, e = keyAttr.size(); i != e; ++i) {
+    auto b = keyAttr[i];
+    auto path = ("keys[" + Twine(i) + "]").str();
+    auto bDict = b.cast<DictionaryAttr>();
+    auto classAttr =
+        tryGetAs<StringAttr>(bDict, anno, "class", loc, dataTapsClass, path);
+    if (!classAttr)
+      return failure();
+    // Can only handle ReferenceDataTapKey and DataTapModuleSignalKey
+    if (classAttr.getValue() != referenceKeyClass &&
+        classAttr.getValue() != internalKeyClass)
+      return mlir::emitError(loc, "Annotation '" + Twine(dataTapsClass) +
+                                      "' with path '" +
+                                      (Twine(path) + ".class") +
+                                      "' contained an unknown/unimplemented "
+                                      "DataTapKey class '" +
+                                      classAttr.getValue() + "'.")
+                 .attachNote()
+             << "The full Annotation is reproduced here: " << anno << "\n";
+
+    auto sinkNameAttr =
+        tryGetAs<StringAttr>(bDict, anno, "sink", loc, dataTapsClass, path);
+    std::string wirePathStr;
+    if (sinkNameAttr)
+      wirePathStr = canonicalizeTarget(sinkNameAttr.getValue());
+    if (!wirePathStr.empty())
+      if (!tokenizePath(wirePathStr))
+        wirePathStr.clear();
+    Optional<AnnoPathValue> wireTarget = std::nullopt;
+    if (!wirePathStr.empty())
+      wireTarget = resolvePath(wirePathStr, state.circuit, state.symTbl,
+                               state.targetCaches);
+    if (!wireTarget)
+      return mlir::emitError(loc, "Annotation '" + Twine(dataTapsClass) +
+                                      "' with wire path '" + wirePathStr +
+                                      "' couldnot be resolved.");
+    if (!wireTarget->ref.getImpl().isOp())
+      return mlir::emitError(loc, "Annotation '" + Twine(dataTapsClass) +
+                                      "' with path '" +
+                                      (Twine(path) + ".class") +
+                                      "' cannot specify a port for sink.");
+    // Extract the name of the wire, used for datatap.
+    auto tapName = StringAttr::get(
+        context, wirePathStr.substr(wirePathStr.find_last_of('>') + 1));
+    Optional<AnnoPathValue> srcTarget = std::nullopt;
+    Value sendVal;
+    if (classAttr.getValue() == internalKeyClass) {
+      // For DataTapModuleSignalKey, the source is encoded as a string, that
+      // should exist inside the specified module. This source string is used as
+      // a suffix to the instance name for the module inside a VerbatimExprOp.
+      // This verbatim represents an intermediate xmr, which is then used by a
+      // ref.send to be read remotely.
+      auto internalPathAttr = tryGetAs<StringAttr>(bDict, anno, "internalPath",
+                                                   loc, dataTapsClass, path);
+      auto moduleAttr =
+          tryGetAs<StringAttr>(bDict, anno, "module", loc, dataTapsClass, path);
+      if (!internalPathAttr || !moduleAttr)
+        return failure();
+      auto moduleTargetStr = canonicalizeTarget(moduleAttr.getValue());
+      if (!tokenizePath(moduleTargetStr))
+        return failure();
+      Optional<AnnoPathValue> moduleTarget = resolvePath(
+          moduleTargetStr, state.circuit, state.symTbl, state.targetCaches);
+      if (!moduleTarget)
+        return failure();
+      AnnoPathValue internalPathSrc;
+      sendVal = lowerInternalPathAnno(
+          internalPathSrc, *moduleTarget, target, internalPathAttr,
+          wireTarget->ref.getOp()->getResult(0).getType().cast<FIRRTLType>(),
+          state);
+      if (!sendVal)
+        return failure();
+      srcTarget = internalPathSrc;
+    } else {
+      // Now handle ReferenceDataTapKey. Get the source from annotation.
+      auto sourceAttr =
+          tryGetAs<StringAttr>(bDict, anno, "source", loc, dataTapsClass, path);
+      if (!sourceAttr)
+        return failure();
+      auto sourcePathStr = canonicalizeTarget(sourceAttr.getValue());
+      if (!tokenizePath(sourcePathStr))
+        return failure();
+      LLVM_DEBUG(llvm::dbgs() << "\n Drill xmr path from :" << sourcePathStr
+                              << " to " << wirePathStr);
+      srcTarget = resolvePath(sourcePathStr, state.circuit, state.symTbl,
+                              state.targetCaches);
+    }
+    if (!srcTarget)
+      return mlir::emitError(loc, "Annotation '" + Twine(dataTapsClass) +
+                                      "' source path couldnot be resolved.");
+
+    auto wireModule =
+        cast<FModuleOp>(wireTarget->ref.getModule().getOperation());
+
+    if (auto extMod = dyn_cast<FExtModuleOp>(srcTarget->ref.getOp())) {
+      // If the source is a port on extern module, then move the source to the
+      // instance port for the ext module.
+      auto portNo = srcTarget->ref.getImpl().getPortNo();
+      auto lastInst = srcTarget->instances.pop_back_val();
+      auto builder = ImplicitLocOpBuilder::atBlockEnd(lastInst.getLoc(),
+                                                      lastInst->getBlock());
+      builder.setInsertionPointAfter(lastInst);
+      // Instance port cannot be used as an annotation target, so use a NodeOp.
+      auto node = builder.create<NodeOp>(lastInst.getType(portNo),
+                                         lastInst.getResult(portNo));
+      AnnotationSet::addDontTouch(node);
+      srcTarget->ref = AnnoTarget(circt::firrtl::detail::AnnoTargetImpl(node));
+    }
+
+    // The RefSend value can be either generated by the instance of an external
+    // module or a RefSendOp.
+    if (!sendVal) {
+      auto srcModule =
+          dyn_cast<FModuleOp>(srcTarget->ref.getModule().getOperation());
+
+      ImplicitLocOpBuilder sendBuilder(srcModule.getLoc(), srcModule);
+      // Set the insertion point for the RefSend, it should be dominated by the
+      // srcTarget value. If srcTarget is a port, then insert the RefSend
+      // at the beggining of the module, else define the RefSend at the end of
+      // the block that contains the srcTarget Op.
+      if (srcTarget->ref.getImpl().isOp()) {
+        sendVal = srcTarget->ref.getImpl().getOp()->getResult(0);
+        sendBuilder.setInsertionPointAfter(srcTarget->ref.getOp());
+      } else if (srcTarget->ref.getImpl().isPort()) {
+        sendVal = srcModule.getArgument(srcTarget->ref.getImpl().getPortNo());
+        sendBuilder.setInsertionPointToStart(srcModule.getBodyBlock());
+      }
+      // If the target value is a field of an aggregate create the
+      // subfield/subaccess into it.
+      sendVal = getValueByFieldID(sendBuilder, sendVal, srcTarget->fieldIdx);
+      // Note: No DontTouch added to sendVal, it can be constantprop'ed or
+      // CSE'ed.
+    }
+
+    auto *targetOp = wireTarget->ref.getOp();
+    auto sinkBuilder = ImplicitLocOpBuilder::atBlockEnd(wireModule.getLoc(),
+                                                        targetOp->getBlock());
+    auto wireType = cast<FIRRTLBaseType>(targetOp->getResult(0).getType());
+    // Get type of sent value, if already a RefType, the base type.
+    auto valType = getBaseType(cast<FIRRTLType>(sendVal.getType()));
+    Value sink = getValueByFieldID(sinkBuilder, targetOp->getResult(0),
+                                   wireTarget->fieldIdx);
+
+    // Match previous behavior, don't use "good" names for dataflow wires.
+    // (Store as a StringAttr so the wiringProblem StringRef is backed.)
+    auto nameHint =
+        StringAttr::get(context, Twine("_gen_") + tapName.getValue());
+
+    // For resets, sometimes inject a cast between sink and target 'sink'.
+    // Introduced a dummy wire and cast that, dummy wire will be 'sink'.
+    if (valType.isResetType() &&
+        valType.getWidthlessType() != wireType.getWidthlessType()) {
+      // Helper: create a wire, cast it with callback, connect cast to sink.
+      auto addWireWithCast = [&](auto createCast) {
+        auto wire = sinkBuilder.create<WireOp>(
+            valType,
+            state.getNamespace(wireModule).newName(nameHint.getValue()));
+        sinkBuilder.create<ConnectOp>(sink, createCast(wire));
+        sink = wire;
+      };
+      if (isa<IntType>(wireType))
+        addWireWithCast([&](auto v) {
+          return sinkBuilder.create<AsUIntPrimOp>(wireType, v);
+        });
+      else if (isa<AsyncResetType>(wireType))
+        addWireWithCast(
+            [&](auto v) { return sinkBuilder.create<AsAsyncResetPrimOp>(v); });
+    }
+
+    state.wiringProblems.push_back({sendVal, sink, nameHint});
+  }
+
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Code related to handling Grand Central Data/Mem Taps annotations
 //===----------------------------------------------------------------------===//
@@ -304,6 +567,9 @@ LogicalResult circt::firrtl::applyGCTDataTaps(const AnnoPathValue &target,
   auto id = state.newID();
   NamedAttrList attrs;
   attrs.append("class", StringAttr::get(context, dataTapsBlackboxClass));
+  // The new DataTaps donot have blackbox field. Lower them directly to RefType.
+  if (!anno.contains("blackBox"))
+    return applyNoBlackBoxStyleDataTaps(target, anno, state);
   auto blackBoxAttr =
       tryGetAs<StringAttr>(anno, anno, "blackBox", loc, dataTapsClass);
   if (!blackBoxAttr)
@@ -418,15 +684,95 @@ LogicalResult circt::firrtl::applyGCTDataTaps(const AnnoPathValue &target,
     }
 
     mlir::emitError(
-        loc, "Annotation '" + Twine(dataTapsClass) + "' with path '" + path +
-                 ".class" +
-                 +"' contained an unknown/unimplemented DataTapKey class '" +
+        loc, "Annotation '" + Twine(dataTapsClass) + "' with path '" +
+                 (Twine(path) + ".class") +
+                 "' contained an unknown/unimplemented DataTapKey class '" +
                  classAttr.getValue() + "'.")
             .attachNote()
-        << "The full Annotation is reprodcued here: " << anno << "\n";
+        << "The full Annotation is reproduced here: " << anno << "\n";
     return failure();
   }
 
+  return success();
+}
+
+LogicalResult applyGCTMemTapsWithWires(const AnnoPathValue &target,
+                                       DictionaryAttr anno,
+                                       std::string &sourceTargetStr,
+                                       ApplyState &state) {
+  auto loc = state.circuit.getLoc();
+  Value memDbgPort;
+  Optional<AnnoPathValue> srcTarget = resolvePath(
+      sourceTargetStr, state.circuit, state.symTbl, state.targetCaches);
+  if (!srcTarget)
+    return mlir::emitError(loc, "cannot resolve source target path '")
+           << sourceTargetStr << "'";
+  auto tapsAttr = tryGetAs<ArrayAttr>(anno, anno, "sink", loc, memTapClass);
+  if (!tapsAttr || tapsAttr.empty())
+    return mlir::emitError(loc, "sink must have at least one entry");
+  if (auto combMem = dyn_cast<chirrtl::CombMemOp>(srcTarget->ref.getOp())) {
+    if (!combMem.getType().getElementType().isGround())
+      return combMem.emitOpError(
+          "cannot generate MemTap to a memory with aggregate data type");
+    ImplicitLocOpBuilder builder(combMem->getLoc(), combMem);
+    builder.setInsertionPointAfter(combMem);
+    // Construct the type for the debug port.
+    auto debugType =
+        RefType::get(FVectorType::get(combMem.getType().getElementType(),
+                                      combMem.getType().getNumElements()));
+
+    auto debugPort = builder.create<chirrtl::MemoryDebugPortOp>(
+        debugType, combMem,
+        state.getNamespace(srcTarget->ref.getModule()).newName("memTap"));
+
+    memDbgPort = debugPort.getResult();
+    if (srcTarget->instances.empty()) {
+      auto path = state.instancePathCache.getAbsolutePaths(
+          combMem->getParentOfType<FModuleOp>());
+      if (path.size() > 1)
+        return combMem.emitOpError(
+            "cannot be resolved as source for MemTap, multiple paths from top "
+            "exist and unique instance cannot be resolved");
+      srcTarget->instances.append(path.back().begin(), path.back().end());
+    }
+    if (tapsAttr.size() != combMem.getType().getNumElements())
+      return mlir::emitError(
+          loc, "sink cannot specify more taps than the depth of the memory");
+  } else
+    return srcTarget->ref.getOp()->emitOpError(
+        "unsupported operation, only CombMem can be used as the source of "
+        "MemTap");
+
+  auto tap = tapsAttr[0].dyn_cast_or_null<StringAttr>();
+  if (!tap) {
+    return mlir::emitError(
+               loc, "Annotation '" + Twine(memTapClass) +
+                        "' with path '.taps[0" +
+                        "]' contained an unexpected type (expected a string).")
+               .attachNote()
+           << "The full Annotation is reprodcued here: " << anno << "\n";
+  }
+  auto wireTargetStr = canonicalizeTarget(tap.getValue());
+  if (!tokenizePath(wireTargetStr))
+    return failure();
+  Optional<AnnoPathValue> wireTarget = resolvePath(
+      wireTargetStr, state.circuit, state.symTbl, state.targetCaches);
+  if (!wireTarget)
+    return mlir::emitError(loc, "Annotation '" + Twine(memTapClass) +
+                                    "' with path '.taps[0]' contains target '" +
+                                    wireTargetStr +
+                                    "' that cannot be resolved.")
+               .attachNote()
+           << "The full Annotation is reproduced here: " << anno << "\n";
+
+  auto sendVal = memDbgPort;
+  if (wireTarget->ref.getOp()->getResult(0).getType() !=
+      cast<RefType>(sendVal.getType()).getType())
+    return wireTarget->ref.getOp()->emitError(
+        "cannot generate the MemTap, wiretap Type does not match the memory "
+        "type");
+  auto sink = wireTarget->ref.getOp()->getResult(0);
+  state.wiringProblems.push_back({sendVal, sink, "memTap"});
   return success();
 }
 
@@ -449,11 +795,11 @@ LogicalResult circt::firrtl::applyGCTMemTaps(const AnnoPathValue &target,
   attrs.append("class", StringAttr::get(context, memTapSourceClass));
   attrs.append("id", id);
   attrs.append("target", StringAttr::get(context, sourceTarget));
-  state.addToWorklistFn(DictionaryAttr::get(context, attrs));
 
+  if (!anno.contains("taps"))
+    return applyGCTMemTapsWithWires(target, anno, sourceTarget, state);
   auto tapsAttr = tryGetAs<ArrayAttr>(anno, anno, "taps", loc, memTapClass);
-  if (!tapsAttr)
-    return failure();
+  state.addToWorklistFn(DictionaryAttr::get(context, attrs));
   StringSet<> memTapBlackboxes;
   for (size_t i = 0, e = tapsAttr.size(); i != e; ++i) {
     auto tap = tapsAttr[i].dyn_cast_or_null<StringAttr>();
@@ -507,17 +853,22 @@ class GrandCentralTapsPass : public GrandCentralTapsBase<GrandCentralTapsPass> {
     auto key = getKey(anno);
     annos.insert({key, anno});
     assert(!tappedPorts.count(key) && "ambiguous tap annotation");
-    auto portWidth = cast<FModuleLike>(port.first)
-                         .getPortType(port.second)
-                         .getBitWidthOrSentinel();
+    auto portType = cast<FModuleLike>(port.first).getPortType(port.second);
+    auto firrtlPortType = portType.dyn_cast<FIRRTLType>();
+    if (!firrtlPortType) {
+      port.first->emitError("data tap cannot target port with non-FIRRTL type ")
+          << portType;
+      return signalPassFailure();
+    }
+
+    auto portWidth =
+        firrtlPortType.cast<FIRRTLBaseType>().getBitWidthOrSentinel();
     // If the port width is non-zero, process it normally.  Otherwise, record it
     // as being zero-width.
     if (portWidth)
       tappedPorts.insert({key, port});
     else
       zeroWidthTaps.insert(key);
-    if (auto sym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
-      deadNLAs.insert(sym.getAttr());
   }
   void gatherTap(Annotation anno, Operation *op) {
     auto key = getKey(anno);
@@ -526,13 +877,13 @@ class GrandCentralTapsPass : public GrandCentralTapsBase<GrandCentralTapsPass> {
     // If the port width is targeting a module (e.g., a blackbox) or if it has a
     // non-zero width, process it normally.  Otherwise, record it as being
     // zero-width.
-    if (isa<FModuleLike>(op) ||
-        op->getResult(0).getType().cast<FIRRTLType>().getBitWidthOrSentinel())
+    if (isa<FModuleLike>(op) || op->getResult(0)
+                                    .getType()
+                                    .cast<FIRRTLBaseType>()
+                                    .getBitWidthOrSentinel())
       tappedOps.insert({key, op});
     else
       zeroWidthTaps.insert(key);
-    if (auto sym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal"))
-      deadNLAs.insert(sym.getAttr());
   }
 
   /// Returns a port's `inner_sym`, adding one if necessary.
@@ -566,10 +917,6 @@ class GrandCentralTapsPass : public GrandCentralTapsBase<GrandCentralTapsPass> {
   /// Cached module namespaces.
   DenseMap<Operation *, ModuleNamespace> moduleNamespaces;
 
-  /// NLAs which were removed while this pass ran.  These will be garbage
-  /// collected before the pass exits.
-  DenseSet<StringAttr> deadNLAs;
-
   /// The circuit symbol table, used to look up NLAs.
   SymbolTable *circuitSymbols;
 };
@@ -579,8 +926,8 @@ void GrandCentralTapsPass::runOnOperation() {
   LLVM_DEBUG(llvm::dbgs() << "Running the GCT Data Taps pass\n");
   SymbolTable symtbl(circuitOp);
   circuitSymbols = &symtbl;
-  InnerSymbolTableCollection innerSymTblCol(circuitOp);
-  InnerRefNamespace innerRefNS{symtbl, innerSymTblCol};
+  hw::InnerSymbolTableCollection innerSymTblCol(circuitOp);
+  hw::InnerRefNamespace innerRefNS{symtbl, innerSymTblCol};
 
   // Here's a rough idea of what the Scala code is doing:
   // - Gather the `source` of all `keys` of all `DataTapsAnnotation`s throughout
@@ -771,6 +1118,9 @@ void GrandCentralTapsPass::runOnOperation() {
                  << blackBox.extModule.getName() << " for " << path << ")\n");
       auto impl =
           builder.create<FModuleOp>(name, ports, blackBox.filteredModuleAnnos);
+      SymbolTable::setSymbolVisibility(
+          impl, SymbolTable::getSymbolVisibility(blackBox.extModule));
+
       // If extraction information was provided via an
       // `ExtractGrandCentralAnnotation`, put the created data or memory taps
       // inside this directory.
@@ -812,16 +1162,17 @@ void GrandCentralTapsPass::runOnOperation() {
 
         // Determine the shortest hierarchical prefix from this black box
         // instance to the tapped object.
-        Optional<SmallVector<InstanceOp>> shortestPrefix;
+        Optional<SmallVector<HWInstanceLike>> shortestPrefix;
         for (auto prefix : port.prefices) {
 
           // Append the NLA path to the instance graph-determined path.
-          SmallVector<InstanceOp> prefixWithNLA(prefix.begin(), prefix.end());
+          SmallVector<HWInstanceLike> prefixWithNLA(prefix.begin(),
+                                                    prefix.end());
           if (port.nla) {
             for (auto segment : port.nla.getNamepath().getValue().drop_back())
               if (auto ref = segment.dyn_cast<InnerRefAttr>()) {
                 prefixWithNLA.push_back(
-                    cast<InstanceOp>(innerRefNS.lookupOp(ref)));
+                    cast<HWInstanceLike>(innerRefNS.lookupOp(ref)));
               }
           }
 
@@ -861,14 +1212,49 @@ void GrandCentralTapsPass::runOnOperation() {
             FlatSymbolRefAttr::get(SymbolTable::getSymbolName(rootModule)));
         for (auto inst : *shortestPrefix)
           addSymbol(getInnerRefTo(inst));
-
+        FIRRTLBaseType tpe;
         if (port.target.getOp()) {
           Attribute leaf;
-          if (port.target.hasPort())
+          if (port.target.hasPort()) {
             leaf = getInnerRefTo(port.target.getOp(), port.target.getPort());
-          else
+            tpe = cast<FModuleLike>(port.target.getOp())
+                      .getPortType(port.target.getPort())
+                      .cast<FIRRTLBaseType>();
+          } else {
             leaf = getInnerRefTo(port.target.getOp());
+            tpe = port.target.getOp()
+                      ->getResult(0)
+                      .getType()
+                      .cast<FIRRTLBaseType>();
+          }
           addSymbol(leaf);
+        }
+        auto fieldID = port.targetFieldID;
+        while (fieldID) {
+          TypeSwitch<FIRRTLType>(tpe)
+              .template Case<FVectorType>([&](FVectorType vector) {
+                unsigned index = vector.getIndexForFieldID(fieldID);
+                tpe = vector.getElementType();
+                fieldID -= vector.getFieldID(index);
+                hname += ("[" + Twine(index) + "]").str();
+              })
+              .template Case<BundleType>([&](BundleType bundle) {
+                unsigned index = bundle.getIndexForFieldID(fieldID);
+                tpe = bundle.getElementType(index);
+                fieldID -= bundle.getFieldID(index);
+                // FIXME: Invalid verilog names (e.g. "begin", "reg", .. ) will
+                // be renamed at ExportVerilog so the path constructed here
+                // might become invalid. We can use an inner name ref to encode
+                // a reference to a subfield.
+
+                hname += "." + bundle.getElement(index).name.getValue().str();
+              })
+              .Default([&](auto) {
+                blackBox.extModule.emitError()
+                    << "ReferenceDataTapKey on port has invalid field ID";
+                signalPassFailure();
+                fieldID = 0;
+              });
         }
 
         if (!port.suffix.empty()) {
@@ -905,17 +1291,6 @@ void GrandCentralTapsPass::runOnOperation() {
     // Drop the original black box module.
     blackBox.extModule.erase();
   }
-
-  // Garbage collect NLAs which were removed.
-  for (auto &op :
-       llvm::make_early_inc_range(circuitOp.getBodyBlock()->getOperations())) {
-    // Remove NLA anchors whose leaf annotations were removed.
-    if (auto nla = dyn_cast<HierPathOp>(op)) {
-      if (deadNLAs.contains(nla.getNameAttr()))
-        nla.erase();
-      continue;
-    }
-  }
 }
 
 /// Gather the annotations on ports and operations into the `tappedPorts` and
@@ -932,8 +1307,12 @@ void GrandCentralTapsPass::gatherAnnotations(Operation *op) {
     };
     AnnotationSet::removePortAnnotations(op, gather);
 
-    // Handle internal data taps on extmodule ops.
-    if (isa<FExtModuleOp>(op)) {
+    // Handle internal data taps.
+    // Note that these work for both extmodules AND regular modules.
+    // Note also that we do NOT currently check that the String target of an
+    // internalKeySourceClass actually corresponds to anything in regular
+    // modules.
+    if (isa<FModuleOp, FExtModuleOp>(op)) {
       auto gather = [&](Annotation anno) {
         if (anno.isClass(internalKeySourceClass)) {
           gatherTap(anno, op);
@@ -990,14 +1369,21 @@ void GrandCentralTapsPass::processAnnotation(AnnotatedPort &portAnno,
   // path. During wiring of the ports, we generate hierarchical names of the
   // form `<prefix>.<nla-path>.<suffix>`. If we don't have an NLA, we leave it
   // to the key-class-specific code below to come up with the possible prefices.
-  HierPathOp nla;
+  hw::HierPathOp nla;
   if (auto nlaSym = targetAnno.getMember<FlatSymbolRefAttr>("circt.nonlocal")) {
-    nla = dyn_cast<HierPathOp>(circuitSymbols->lookup(nlaSym.getAttr()));
+    nla = dyn_cast<hw::HierPathOp>(circuitSymbols->lookup(nlaSym.getAttr()));
     assert(nla);
     // Find all paths to the root of the NLA.
     Operation *root = circuitSymbols->lookup(nla.root());
     wiring.nla = nla;
     wiring.prefices = instancePaths.getAbsolutePaths(root);
+  }
+
+  wiring.targetFieldID = targetAnno.getFieldID();
+  if (portAnno.anno.getFieldID()) {
+    blackBox.extModule.emitError(
+        "external module ports must have ground types");
+    signalPassFailure();
   }
 
   // Handle data taps on signals and ports.

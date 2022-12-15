@@ -102,7 +102,7 @@ void WireDFTPass::runOnOperation() {
   auto circuit = getOperation();
 
   // This is the module marked as the device under test.
-  Operation *dut = nullptr;
+  FModuleOp dut = nullptr;
 
   // This is the signal marked as the DFT enable, a 1-bit signal to be wired to
   // the EICG modules.
@@ -218,6 +218,36 @@ void WireDFTPass::runOnOperation() {
   if (!clockGates.size())
     return;
 
+  // Handle enable signal (only) outside DUT.
+  if (!instanceGraph.isAncestor(enableModule, lca->getModule())) {
+    // Current LCA covers the clock gates we care about.
+    // Compute new LCA from enable to that node.
+    lca = lowestCommonAncestor(
+        instanceGraph.getTopLevelNode(), [&](InstanceRecord *node) {
+          return node->getTarget() == lca ||
+                 node->getParent()->getModule() == enableModule;
+        });
+    // Handle unreachable case.
+    if (!lca) {
+      auto diag =
+          circuit.emitError("unable to connect enable signal and DUT, may not "
+                            "be reachable from top-level module");
+      diag.attachNote(enableSignal.getLoc()) << "enable signal here";
+      diag.attachNote(dut.getLoc()) << "DUT here";
+      diag.attachNote(instanceGraph.getTopLevelModule().getLoc())
+          << "top-level module here";
+
+      return signalPassFailure();
+    }
+  }
+
+  // Check all gates we're wiring are only within the DUT.
+  if (!allUnder(clockGates.getArrayRef(), instanceGraph.lookup(dut))) {
+    dut->emitError()
+        << "clock gates within DUT must not be instantiated outside the DUT";
+    return signalPassFailure();
+  }
+
   // Stash some useful things.
   auto *context = &getContext();
   auto uint1Type = enableSignal.getType().cast<FIRRTLType>();
@@ -240,8 +270,8 @@ void WireDFTPass::runOnOperation() {
     return clone;
   };
 
-  // At this point we have found the the enable signal, all important clock
-  // gates, and the ancestor of these. From here we need wire the enable signal
+  // At this point we have found the enable signal, all important clock gates,
+  // and the ancestor of these. From here we need wire the enable signal
   // upward to the LCA, and then wire the enable signal down to all clock
   // gates.
 

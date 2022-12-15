@@ -24,8 +24,11 @@
 #include "circt/Dialect/Handshake/HandshakePasses.h"
 #include "circt/Dialect/LLHD/Transforms/Passes.h"
 #include "circt/Dialect/MSFT/MSFTPasses.h"
+#include "circt/Dialect/Pipeline/PipelinePasses.h"
+#include "circt/Dialect/SSP/SSPPasses.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
+#include "circt/Dialect/SystemC/SystemCPasses.h"
 #include "circt/Transforms/Passes.h"
 
 namespace circt {
@@ -43,11 +46,14 @@ inline void registerAllPasses() {
   firrtl::registerPasses();
   fsm::registerPasses();
   llhd::initLLHDTransformationPasses();
-  msft::registerMSFTPasses();
+  msft::registerPasses();
   seq::registerPasses();
   sv::registerPasses();
   handshake::registerPasses();
   hw::registerPasses();
+  pipeline::registerPasses();
+  ssp::registerPasses();
+  systemc::registerPasses();
 }
 
 } // namespace circt

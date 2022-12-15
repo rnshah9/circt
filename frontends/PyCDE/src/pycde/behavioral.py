@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from .value import BitVectorValue, Value
+from .value import BitVectorValue, PyCDEValue, Value
 from pycde.dialects import comb
 
 import ctypes
@@ -115,9 +115,10 @@ class _IfBlock:
     new_lcls: Dict[str, Value] = {}
     for (varname, value) in s.f_locals.items():
       # Only operate on Values.
-      if not isinstance(value, Value):
+      if not isinstance(value, PyCDEValue):
         continue
-      # If the value was in the original scope and it hasn't changed, don't touch it.
+      # If the value was in the original scope and it hasn't changed, don't
+      # touch it.
       if varname in self._scope and self._scope[varname] is value:
         continue
 
@@ -153,7 +154,8 @@ class _IfBlock:
     ctypes.pythonapi.PyFrame_LocalsToFast(ctypes.py_object(s), ctypes.c_int(1))
 
 
-Else = _IfBlock(False)
+def Else():
+  return _IfBlock(False)
 
 
 def EndIf():

@@ -17,10 +17,15 @@ def SameOperandsIntTypeKind : NativeOpTrait<"SameOperandsIntTypeKind"> {
   let cppNamespace = "::circt::firrtl";
 }
 
+class IndexConstraint<string value, string resultValue>
+  : TypesMatchWith<"type should be element of vector type",
+                   value, resultValue,
+                   "firrtl::getVectorElementType($_self)">;
+
 // A common base class for operations that implement type inference and parsed
 // argument validation.
 class FIRRTLExprOp<string mnemonic, list<Trait> traits = []> :
-    FIRRTLOp<mnemonic, traits # [HasCustomSSAName, InferTypeOpInterface, NoSideEffect]> {
+    FIRRTLOp<mnemonic, traits # [HasCustomSSAName, InferTypeOpInterface, Pure]> {
 
   // The narrow operation-specific type inference method. Operations can
   // override this with an inline declaration for the class header, or just
@@ -78,7 +83,7 @@ class FIRRTLExprOp<string mnemonic, list<Trait> traits = []> :
 }
 
 def ConstantOp : FIRRTLOp<"constant",
-      [NoSideEffect, ConstantLike, FirstAttrDerivedResultType,
+      [Pure, ConstantLike, FirstAttrDerivedResultType,
        HasCustomSSAName]> {
   let summary = "Produce a constant value";
   let description = [{
@@ -102,7 +107,7 @@ def ConstantOp : FIRRTLOp<"constant",
 }
 
 def SpecialConstantOp : FIRRTLOp<"specialconstant",
-      [NoSideEffect, ConstantLike, HasCustomSSAName]> {
+      [Pure, ConstantLike, HasCustomSSAName]> {
   let summary = "Produce a constant Reset or Clock value";
   let description = [{
     The constant operation produces a constant value of Reset, AsyncReset, or
@@ -120,8 +125,68 @@ def SpecialConstantOp : FIRRTLOp<"specialconstant",
   let hasFolder = 1;
 }
 
+def AggregateConstantOp : FIRRTLOp<"aggregateconstant", [Pure, ConstantLike]> {
+  let summary = "Produce a constant of a passive aggregate value";
+  let description = [{
+    The constant operation produces a constant value of an aggregate type.  The
+    type must be passive.  Clock and reset values are supported.
+    For nested aggregates, embedded arrays are used.
+    ```
+      %result = firrtl.aggregateconstant [1, 2, 3] : !firrtl.bundle<a: uint<8>, b: uint<5>, c: uint<4>>
+      %result = firrtl.aggregateconstant [1, 2, 3] : !firrtl.vector<uint<8>, 3>
+      %result = firrtl.aggregateconstant [[1, 2], [3, 5]] : !firrtl.vector<!firrtl.bundle<a: uint<8>, b: uint<5>>, 2>
+    ```
+  }];
+
+  let arguments = (ins ArrayAttr:$fields);
+  let results = (outs AggregateType:$result);
+
+  let assemblyFormat = "$fields attr-dict `:` type($result)";
+  let hasFolder = 1;
+  let hasVerifier = 1;
+}
+
+def BundleCreateOp : FIRRTLOp<"bundlecreate"> {
+  let summary = "Produce a bundle value";
+  let description = [{
+    Create an bundle from component values.  This is equivalent in terms of
+    flow to creating a node.
+    ```
+      %result = firrtl.bundlecreate %1, %2, %3 : !firrtl.bundle<a: uint<8>, b: uint<5>, c: uint<4>>
+    ```
+  }];
+
+  let arguments = (ins Variadic<FIRRTLBaseType>:$fields);
+  let results = (outs BundleType:$result);
+
+  let assemblyFormat = "$fields attr-dict `:` functional-type($fields, $result)";
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
+def VectorCreateOp : FIRRTLOp<"vectorcreate"> {
+  let summary = "Produce a vector value";
+  let description = [{
+    Create a vector from component values.  This is equivalent in terms of
+    flow to creating a node. The first operand indicates 0-th element of
+    the result.
+    ```
+      %result = firrtl.vectorcreate %1, %2, %3 : !firrtl.vector<uint<8>, 3>
+
+    ```
+  }];
+
+  let arguments = (ins Variadic<FIRRTLBaseType>:$fields);
+  let results = (outs FVectorType:$result);
+
+  let assemblyFormat = "$fields attr-dict `:` functional-type($fields, $result)";
+  let hasVerifier = 1;
+  let hasFolder = 1;
+}
+
+
 def InvalidValueOp : FIRRTLOp<"invalidvalue",
-      [NoSideEffect, ConstantLike, HasCustomSSAName]> {
+      [MemoryEffects<[MemAlloc]>, HasCustomSSAName]> {
   let summary = "InvalidValue primitive";
   let description = [{
     The InvalidValue operation returns an invalid value of a specified type:
@@ -130,13 +195,13 @@ def InvalidValueOp : FIRRTLOp<"invalidvalue",
     ```
 
     This corresponds to the FIRRTL invalidate operation without the implicit
-    connect semantics.
+    connect semantics.  Each invalid op produces a unique invalid value.  
+    InvalidOp is not constant-like
   }];
 
   let arguments = (ins);
-  let results = (outs FIRRTLType:$result);
+  let results = (outs FIRRTLBaseType:$result);
 
-  let hasFolder = 1;
   let assemblyFormat = "attr-dict `:` qualified(type($result))";
 }
 
@@ -146,16 +211,16 @@ def SubfieldOp : FIRRTLExprOp<"subfield"> {
     The subfield expression refers to a subelement of an expression with a
     bundle type.
     ```
-      %result = firrtl.subfield %input "fieldIndex" : t1, t2
+      %result = firrtl.subfield %input[field-name] : !input-type
     ```
     }];
 
   let arguments = (ins BundleType:$input, I32Attr:$fieldIndex);
-  let results = (outs FIRRTLType:$result);
-
-  // TODO: Could drop the result type, inferring it from the source.
-  let assemblyFormat =
-    "$input `(` $fieldIndex `)` attr-dict `:` functional-type($input, $result)";
+  let results = (outs FIRRTLBaseType:$result);
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
+  let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
 
   let builders = [
     OpBuilder<(ins "Value":$input, "StringRef":$fieldName), [{
@@ -175,15 +240,14 @@ def SubfieldOp : FIRRTLExprOp<"subfield"> {
       return FieldRef(getInput(), getInput().getType().cast<BundleType>()
                                             .getFieldID(getFieldIndex()));
     }
+
+    /// Return the name of the accessed field.
+    StringRef getFieldName() {
+      return getInput().getType().cast<BundleType>()
+        .getElementName(getFieldIndex());
+    }
   }];
-
-  let hasVerifier = 1;
 }
-
-class IndexConstraint<string value, string resultValue>
-  : TypesMatchWith<"type should be element of vector type",
-                   value, resultValue,
-                   "firrtl::getVectorElementType($_self)">;
 
 def SubindexOp : FIRRTLExprOp<"subindex", [
     IndexConstraint<"input", "result">
@@ -199,10 +263,11 @@ def SubindexOp : FIRRTLExprOp<"subindex", [
     ```
     }];
 
-  let arguments = (ins FIRRTLType:$input, I32Attr:$index);
-  let results = (outs FIRRTLType:$result);
+  let arguments = (ins FIRRTLBaseType:$input, I32Attr:$index);
+  let results = (outs FIRRTLBaseType:$result);
+  let hasFolder = 1;
+  let hasCanonicalizer = 1;
 
-  // TODO: Could drop the result type, inferring it from the source.
   let assemblyFormat =
      "$input `[` $index `]` attr-dict `:` qualified(type($input))";
 
@@ -228,13 +293,13 @@ def SubaccessOp : FIRRTLExprOp<"subaccess", [
     ```
     }];
 
-  let arguments = (ins FIRRTLType:$input, UIntType:$index);
-  let results = (outs FIRRTLType:$result);
+  let arguments = (ins FIRRTLBaseType:$input, UIntType:$index);
+  let results = (outs FIRRTLBaseType:$result);
 
   let assemblyFormat =
      "$input `[` $index `]` attr-dict `:` qualified(type($input)) `,` qualified(type($index))";
 
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 
 def MultibitMuxOp : FIRRTLExprOp<"multibit_mux"> {
@@ -250,8 +315,8 @@ def MultibitMuxOp : FIRRTLExprOp<"multibit_mux"> {
     For the example above, if `%index` is 0, then the value is `%v_0`.
     }];
 
-  let arguments = (ins FIRRTLType:$index, Variadic<FIRRTLType>:$inputs);
-  let results = (outs FIRRTLType:$result);
+  let arguments = (ins UIntType:$index, Variadic<FIRRTLBaseType>:$inputs);
+  let results = (outs FIRRTLBaseType:$result);
   let hasCustomAssemblyFormat = 1;
   let hasFolder = true;
   let hasCanonicalizeMethod = true;
@@ -311,7 +376,7 @@ class IntBinaryPrimOp<string mnemonic, Type resultType,
                 traits # [SameOperandsIntTypeKind]>;
 
 let inferType = "impl::inferAddSubResult" in {
-  let hasCanonicalizeMethod = true in {
+  let hasCanonicalizer = true in {
     def AddPrimOp : IntBinaryPrimOp<"add", IntType, [Commutative]>;
     def SubPrimOp : IntBinaryPrimOp<"sub", IntType>;
   }
@@ -333,9 +398,11 @@ def DivPrimOp : IntBinaryPrimOp<"div", IntType> {
 }
 def RemPrimOp : IntBinaryPrimOp<"rem", IntType>;
 let inferType = "impl::inferBitwiseResult" in {
-  def AndPrimOp : IntBinaryPrimOp<"and", UIntType, [Commutative]>;
-  def OrPrimOp  : IntBinaryPrimOp<"or",  UIntType, [Commutative]>;
-  def XorPrimOp : IntBinaryPrimOp<"xor", UIntType, [Commutative]>;
+  let hasCanonicalizer = true in {
+    def AndPrimOp : IntBinaryPrimOp<"and", UIntType, [Commutative]>;
+    def OrPrimOp  : IntBinaryPrimOp<"or",  UIntType, [Commutative]>;
+    def XorPrimOp : IntBinaryPrimOp<"xor", UIntType, [Commutative]>;
+  }
 }
 
 // Comparison Operations
@@ -353,14 +420,14 @@ let inferType = "impl::inferComparisonResult" in {
 }
 
 def CatPrimOp : IntBinaryPrimOp<"cat", UIntType> {
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 def DShlPrimOp  : BinaryPrimOp<"dshl", IntType, UIntType, IntType>  {
   let description = [{
     A dynamic shift left operation. The width of `$result` is expanded to
     `width($lhs) + 1 << width($rhs) - 1`.
   }];
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 def DShlwPrimOp : BinaryPrimOp<"dshlw", IntType, UIntType, IntType> {
   let description = [{
@@ -369,7 +436,7 @@ def DShlwPrimOp : BinaryPrimOp<"dshlw", IntType, UIntType, IntType> {
   }];
 }
 def DShrPrimOp  : BinaryPrimOp<"dshr", IntType, UIntType, IntType> {
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -406,8 +473,10 @@ class UnaryPrimOp<string mnemonic, Type srcType, Type resultType,
   let parseValidator = "impl::validateUnaryOpArguments";
 }
 
-def AsSIntPrimOp : UnaryPrimOp<"asSInt", FIRRTLType, SIntType>;
-def AsUIntPrimOp : UnaryPrimOp<"asUInt", FIRRTLType, UIntType>;
+def SizeOfIntrinsicOp : UnaryPrimOp<"int.sizeof", FIRRTLBaseType, UInt32Type>;
+
+def AsSIntPrimOp : UnaryPrimOp<"asSInt", FIRRTLBaseType, SIntType>;
+def AsUIntPrimOp : UnaryPrimOp<"asUInt", FIRRTLBaseType, UIntType>;
 def AsAsyncResetPrimOp
   : UnaryPrimOp<"asAsyncReset", OneBitCastableType, AsyncResetType>;
 def AsClockPrimOp : UnaryPrimOp<"asClock", OneBitCastableType, ClockType>;
@@ -457,7 +526,7 @@ def BitsPrimOp : PrimOp<"bits"> {
     The result is `hi - lo + 1` bits wide.
   }];
 
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 
 def HeadPrimOp : PrimOp<"head"> {
@@ -546,20 +615,36 @@ def TailPrimOp : PrimOp<"tail"> {
 // Verif and SV specific
 //===----------------------------------------------------------------------===//
 
-def IsXVerifOp : FIRRTLExprOp<"verif_isX"> {
+def IsXIntrinsicOp : FIRRTLExprOp<"int.isX"> {
   let summary = "Test for 'x";
   let description = [{
-    The verif.isX expression checks that the operand is not a verilog literal 
-    'x.  Firrtl doesn't have a notion of 'x per-se, but x can come in to the 
-    system from external modules and from SV constructs.  Verification 
+    The int.isX expression checks that the operand is not a verilog literal
+    'x.  Firrtl doesn't have a notion of 'x per-se, but x can come in to the
+    system from external modules and from SV constructs.  Verification
     constructs need to explicitly test for 'x.
     }];
 
-  let arguments = (ins FIRRTLType:$arg);
+  let arguments = (ins FIRRTLBaseType:$arg);
   let results = (outs UInt1Type:$result);
-  let assemblyFormat =
-    "$arg attr-dict `:` qualified(type($arg))";
+  let hasFolder = 1;
+  let assemblyFormat = "$arg attr-dict `:` type($arg)";
+}
 
+def PlusArgsTestIntrinsicOp : FIRRTLExprOp<"int.plusargs.test"> {
+  let summary = "Verilog $test$plusargs call";
+
+  let arguments = (ins StrAttr:$formatString);
+  let results = (outs UInt1Type:$found);
+  let assemblyFormat = "$formatString attr-dict";
+}
+
+def PlusArgsValueIntrinsicOp 
+: FIRRTLOp<"int.plusargs.value", [HasCustomSSAName, Pure]> {
+  let summary = "Verilog $value$plusargs call";
+
+  let arguments = (ins StrAttr:$formatString);
+  let results = (outs UInt1Type:$found, AnyType:$result);
+  let assemblyFormat = "$formatString attr-dict `:` type($result)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -567,7 +652,7 @@ def IsXVerifOp : FIRRTLExprOp<"verif_isX"> {
 //===----------------------------------------------------------------------===//
 
 def VerbatimExprOp : FIRRTLOp<"verbatim.expr",
-                              [NoSideEffect, HasCustomSSAName]> {
+                              [Pure, HasCustomSSAName]> {
   let summary = "Expression that expands to a value given SystemVerilog text";
   let description = [{
     This operation produces a typed value expressed by a string of
@@ -583,7 +668,7 @@ def VerbatimExprOp : FIRRTLOp<"verbatim.expr",
 
   let arguments = (ins StrAttr:$text, Variadic<AnyType>:$substitutions,
                        DefaultValuedAttr<NameRefArrayAttr,"{}">:$symbols);
-  let results = (outs FIRRTLType:$result);
+  let results = (outs FIRRTLBaseType:$result);
   let assemblyFormat = [{
     $text (`(` $substitutions^ `)`)?
     `:` functional-type($substitutions, $result) attr-dict
@@ -600,7 +685,7 @@ def VerbatimExprOp : FIRRTLOp<"verbatim.expr",
 }
 
 def VerbatimWireOp : FIRRTLOp<"verbatim.wire",
-                              [NoSideEffect, HasCustomSSAName]> {
+                              [Pure, HasCustomSSAName]> {
   let summary = "Expression with wire semantics that expands to a value given "
                 "SystemVerilog text";
   let description = [{
@@ -617,7 +702,7 @@ def VerbatimWireOp : FIRRTLOp<"verbatim.wire",
 
   let arguments = (ins StrAttr:$text, Variadic<AnyType>:$substitutions,
                        DefaultValuedAttr<NameRefArrayAttr,"{}">:$symbols);
-  let results = (outs FIRRTLType:$result);
+  let results = (outs FIRRTLBaseType:$result);
   let assemblyFormat = [{
     $text (`(` $substitutions^ `)`)?
     `:` functional-type($substitutions, $result) attr-dict
@@ -639,7 +724,7 @@ def VerbatimWireOp : FIRRTLOp<"verbatim.wire",
 
 // This operation converts from a struct to a bundle
 // type, or visa-versa.  FIRRTL source/destination types must be passive.
-def HWStructCastOp : FIRRTLOp<"hwStructCast", [NoSideEffect]> {
+def HWStructCastOp : FIRRTLOp<"hwStructCast", [Pure]> {
   let arguments = (ins AnyType:$input);
   let results = (outs AnyType:$result);
 
@@ -649,16 +734,103 @@ def HWStructCastOp : FIRRTLOp<"hwStructCast", [NoSideEffect]> {
   let hasVerifier = 1;
 }
 
-def BitCastOp: FIRRTLOp<"bitcast", [NoSideEffect]> {
+def BitCastOp: FIRRTLOp<"bitcast", [Pure]> {
   let summary = [{
     Reinterpret one value to another value of the same size and
     potentially different type. This op is lowered to hw::BitCastOp.
   }];
 
-  let arguments = (ins FIRRTLType:$input);
-  let results = (outs FIRRTLType:$result);
+  let arguments = (ins FIRRTLBaseType:$input);
+  let results = (outs FIRRTLBaseType:$result);
   let hasVerifier = 1;
   let hasFolder = 1;
 
   let assemblyFormat = "$input attr-dict `:` functional-type($input, $result)";
+}
+
+//===----------------------------------------------------------------------===//
+// RefOperations: Operations on the RefType.
+//
+// The RefType is used to capture dataflow paths.
+// The operations on RefType support capturing the dataflow to/from SSA values.
+// The following ops are supported on the RefType:
+//
+//  - RefSendOp
+//    - Takes as input a `BaseType` and returns a `RefType`
+//    - Used to send a read-only Reference handle of a local value.
+//    - Represents the source of a dataflow by getting it's reference.
+//  - RefResolveOp
+//    - Takes as input a `RefType` and returns a `BaseType`
+//    - Represents the sink of a dataflow from the reference handle
+//    - The `RefType` is constrained to express a "single source to
+//    one-or-more sink" dataflow
+//    - Hence, multiple `RefResolveOp`s can be remotely connected to a single
+//    `RefSendOp`.
+//    - If the Reference ops are lowered to cross-module-reference, then it
+//    represents the location of the XMR.
+//===----------------------------------------------------------------------===//
+
+//===----------------------------------------------------------------------===//
+// Constraints on RefOps
+//===----------------------------------------------------------------------===//
+
+class RefTypeConstraint<string ref, string base>
+  : TypesMatchWith<"reference base type should match",
+                   ref, base,
+                   "$_self.cast<RefType>().getType()">;
+
+class RefResultTypeConstraint<string base, string ref>
+  : TypesMatchWith<"reference base type should match",
+                   base, ref,
+                   "RefType::get($_self.cast<FIRRTLBaseType>())">;
+
+//===----------------------------------------------------------------------===//
+// RefOps
+//===----------------------------------------------------------------------===//
+
+def RefResolveOp: FIRRTLExprOp<"ref.resolve",
+                              [RefTypeConstraint<"ref","result">]> {
+  let summary = "FIRRTL Resolve a Reference";
+  let description = [{
+    Resolve a remote reference for reading a remote value.
+    It takes a RefType input and returns the corresponding BaseType value.
+    If an XMR is emitted for this reference, it will be at the location
+    of this operation.
+  }];
+  let arguments = (ins RefType:$ref);
+  let results = (outs FIRRTLBaseType:$result);
+
+  let assemblyFormat = "$ref attr-dict `:` qualified(type($ref))";
+}
+
+def RefSendOp: FIRRTLExprOp<"ref.send", [RefResultTypeConstraint<"base", "result">]> {
+  let summary = "FIRRTL Send through Reference";
+  let description = [{
+    Endpoint of a remote reference. Send a value through a reference
+    to be read from the firrtl.ref.resolve op.
+    It takes a BaseType input and returns the corresponding RefType value.
+  }];
+  let arguments = (ins FIRRTLBaseType:$base);
+  let results = (outs RefType:$result);
+
+  let assemblyFormat = "$base attr-dict `:` qualified(type($base))";
+}
+
+def RefSubOp : FIRRTLExprOp<"ref.sub"> {
+  let summary = "Extract an element of an aggregate RefType value";
+  let description = [{
+    The refsub expression statically refers, by index, to a sub-element
+    of an expression with a RefType. The index must be a non-negative
+    integer and cannot be equal to or exceed the underlying vector size
+    or number of elements in bundle.
+    ```
+      %result = firrtl.ref.sub %input[index] : t1
+    ```
+    }];
+
+  let arguments = (ins RefType:$input, I32Attr:$index);
+  let results = (outs RefType:$result);
+
+  let assemblyFormat =
+     "$input `[` $index `]` attr-dict `:` qualified(type($input))";
 }

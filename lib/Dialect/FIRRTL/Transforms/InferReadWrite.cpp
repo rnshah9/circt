@@ -46,21 +46,36 @@ struct InferReadWritePass : public InferReadWriteBase<InferReadWritePass> {
     for (MemOp memOp : llvm::make_early_inc_range(
              getOperation().getBodyBlock()->getOps<MemOp>())) {
       inferUnmasked(memOp, opsToErase);
-      size_t nReads, nWrites, nRWs;
-      memOp.getNumPorts(nReads, nWrites, nRWs);
+      size_t nReads, nWrites, nRWs, nDbgs;
+      memOp.getNumPorts(nReads, nWrites, nRWs, nDbgs);
       // Run the analysis only for Seq memories (latency=1) and a single read
       // and write ports.
       if (!(nReads == 1 && nWrites == 1 && nRWs == 0) ||
           !(memOp.getReadLatency() == 1 && memOp.getWriteLatency() == 1))
         continue;
+      SmallVector<Attribute, 4> resultNames;
+      SmallVector<Type, 4> resultTypes;
+      SmallVector<Attribute> portAtts;
+      SmallVector<Attribute, 4> portAnnotations;
       Value rClock, wClock;
       // The memory has exactly two ports.
-      SmallVector<Value> portTerms[2];
+      SmallVector<Value> readTerms, writeTerms;
       for (const auto &portIt : llvm::enumerate(memOp.getResults())) {
+        Attribute portAnno;
+        portAnno = memOp.getPortAnnotation(portIt.index());
+        if (memOp.getPortKind(portIt.index()) == MemOp::PortKind::Debug) {
+          resultNames.push_back(memOp.getPortName(portIt.index()));
+          resultTypes.push_back(memOp.getResult(portIt.index()).getType());
+          portAnnotations.push_back(portAnno);
+          continue;
+        }
+        // Append the annotations from the two ports.
+        if (!portAnno.cast<ArrayAttr>().empty())
+          portAtts.push_back(memOp.getPortAnnotation(portIt.index()));
         // Get the port value.
         Value portVal = portIt.value();
         // Get the port kind.
-        bool readPort =
+        bool isReadPort =
             memOp.getPortKind(portIt.index()) == MemOp::PortKind::Read;
         // Iterate over all users of the port.
         for (Operation *u : portVal.getUsers())
@@ -72,9 +87,10 @@ struct InferReadWritePass : public InferReadWriteBase<InferReadWritePass> {
             // If this is the enable field, record the product terms(the And
             // expression tree).
             if (fName.equals("en"))
-              getProductTerms(sf, portTerms[portIt.index()]);
+              getProductTerms(sf, isReadPort ? readTerms : writeTerms);
+
             else if (fName.equals("clk")) {
-              if (readPort)
+              if (isReadPort)
                 rClock = getConnectSrc(sf);
               else
                 wClock = getConnectSrc(sf);
@@ -90,22 +106,21 @@ struct InferReadWritePass : public InferReadWriteBase<InferReadWritePass> {
           llvm::dbgs() << "\n read clock:" << rClock
                        << " --- write clock:" << wClock;
           llvm::dbgs() << "\n Read terms==>"; for (auto t
-                                                   : portTerms[0]) llvm::dbgs()
+                                                   : readTerms) llvm::dbgs()
                                               << "\n term::" << t;
 
           llvm::dbgs() << "\n Write terms==>"; for (auto t
-                                                    : portTerms[1]) llvm::dbgs()
+                                                    : writeTerms) llvm::dbgs()
                                                << "\n term::" << t;
 
       );
-      // If the read and write clocks are the same, check if any of the product
-      // terms are a complement of each other.
-      if (!checkComplement(portTerms))
+      // If the read and write clocks are the same, and if any of the write
+      // enable product terms are a complement of the read enable, then return
+      // the write enable term.
+      auto complementTerm = checkComplement(readTerms, writeTerms);
+      if (!complementTerm)
         continue;
 
-      SmallVector<Attribute, 4> resultNames;
-      SmallVector<Type, 4> resultTypes;
-      SmallVector<Attribute, 4> portAnnotations;
       // Create the merged rw port for the new memory.
       resultNames.push_back(
           StringAttr::get(memOp.getContext(), modNamespace.newName("rw")));
@@ -113,12 +128,6 @@ struct InferReadWritePass : public InferReadWriteBase<InferReadWritePass> {
       resultTypes.push_back(MemOp::getTypeForPort(
           memOp.getDepth(), memOp.getDataType(), MemOp::PortKind::ReadWrite,
           memOp.getMaskBits()));
-      SmallVector<Attribute> portAtts;
-      // Append the annotations from the two ports.
-      if (!memOp.getPortAnnotations()[0].cast<ArrayAttr>().empty())
-        portAtts.push_back(memOp.getPortAnnotations()[0]);
-      if (!memOp.getPortAnnotations()[1].cast<ArrayAttr>().empty())
-        portAtts.push_back(memOp.getPortAnnotations()[1]);
       ImplicitLocOpBuilder builder(memOp.getLoc(), memOp);
       portAnnotations.push_back(builder.getArrayAttr(portAtts));
       // Create the new rw memory.
@@ -130,7 +139,7 @@ struct InferReadWritePass : public InferReadWriteBase<InferReadWritePass> {
           builder.getArrayAttr(portAnnotations), memOp.getInnerSymAttr(),
           memOp.getGroupIDAttr());
       ++numRWPortMemoriesInferred;
-      auto rwPort = rwMem->getResult(0);
+      auto rwPort = rwMem->getResult(nDbgs);
       // Create the subfield access to all fields of the port.
       // The addr should be connected to read/write address depending on the
       // read/write mode.
@@ -158,14 +167,21 @@ struct InferReadWritePass : public InferReadWriteBase<InferReadWritePass> {
       // Enable = Or(WriteEnable, ReadEnable).
       builder.create<StrictConnectOp>(
           enb, builder.create<OrPrimOp>(rEnWire, wEnWire));
-      // WriteMode = WriteEnable.
-      builder.create<StrictConnectOp>(wmode, wEnWire);
+      builder.setInsertionPointToEnd(wmode->getBlock());
+      builder.create<StrictConnectOp>(wmode, complementTerm);
       // Now iterate over the original memory read and write ports.
+      size_t dbgsIndex = 0;
       for (const auto &portIt : llvm::enumerate(memOp.getResults())) {
         // Get the port value.
         Value portVal = portIt.value();
+        if (memOp.getPortKind(portIt.index()) == MemOp::PortKind::Debug) {
+          memOp.getResult(portIt.index())
+              .replaceAllUsesWith(rwMem.getResult(dbgsIndex));
+          dbgsIndex++;
+          continue;
+        }
         // Get the port kind.
-        bool readPort =
+        bool isReadPort =
             memOp.getPortKind(portIt.index()) == MemOp::PortKind::Read;
         // Iterate over all users of the port, which are the subfield ops, and
         // replace them.
@@ -175,7 +191,7 @@ struct InferReadWritePass : public InferReadWriteBase<InferReadWritePass> {
                 sf.getInput().getType().cast<BundleType>().getElementName(
                     sf.getFieldIndex());
             Value repl;
-            if (readPort)
+            if (isReadPort)
               repl = llvm::StringSwitch<Value>(fName)
                          .Case("en", rEnWire)
                          .Case("clk", clk)
@@ -272,27 +288,28 @@ private:
     }
   }
 
-  /// Check if any of the terms in the prodTerms[0] is a complement of any of
-  /// the terms in prodTerms[1]. prodTerms[0], prodTerms[1] is a vector of
-  /// Value, each of which correspond to the two product terms of read/write
-  /// enable.
-  bool checkComplement(SmallVector<Value> prodTerms[2]) {
-    bool isComplement = false;
+  /// If any of the terms in the read enable, prodTerms[0] is a complement of
+  /// any of the terms in the write enable prodTerms[1], return the
+  /// corresponding write enable term. prodTerms[0], prodTerms[1] is a vector of
+  /// Value, each of which correspond to the two product terms of read and write
+  /// enable respectively.
+  Value checkComplement(const SmallVector<Value> &readTerms,
+                        const SmallVector<Value> &writeTerms) {
     // Foreach Value in first term, check if it is the complement of any of the
     // Value in second term.
-    for (auto t1 : prodTerms[0])
-      for (auto t2 : prodTerms[1]) {
-        // Return true if t1 is a Not of t2.
+    for (auto t1 : readTerms)
+      for (auto t2 : writeTerms) {
+        // Return t2, t1 is a Not of t2.
         if (!t1.isa<BlockArgument>() && isa<NotPrimOp>(t1.getDefiningOp()))
           if (cast<NotPrimOp>(t1.getDefiningOp()).getInput() == t2)
-            return true;
-        // Else Return true if t2 is a Not of t1.
+            return t2;
+        // Else Return t2, if t2 is a Not of t1.
         if (!t2.isa<BlockArgument>() && isa<NotPrimOp>(t2.getDefiningOp()))
           if (cast<NotPrimOp>(t2.getDefiningOp()).getInput() == t1)
-            return true;
+            return t2;
       }
 
-    return isComplement;
+    return {};
   }
 
   void inferUnmasked(MemOp &memOp, SmallVector<Operation *> &opsToErase) {
@@ -302,7 +319,8 @@ private:
     // connected to a multi-bit constant 1.
     for (const auto &portIt : llvm::enumerate(memOp.getResults())) {
       // Read ports donot have the mask field.
-      if (memOp.getPortKind(portIt.index()) == MemOp::PortKind::Read)
+      if (memOp.getPortKind(portIt.index()) == MemOp::PortKind::Read ||
+          memOp.getPortKind(portIt.index()) == MemOp::PortKind::Debug)
         continue;
       Value portVal = portIt.value();
       // Iterate over all users of the write/rw port.
@@ -317,7 +335,7 @@ private:
             // Already 1 bit, nothing to do.
             if (sf.getResult()
                     .getType()
-                    .cast<FIRRTLType>()
+                    .cast<FIRRTLBaseType>()
                     .getBitWidthOrSentinel() == 1)
               continue;
             // Check what is the mask field directly connected to.
@@ -354,7 +372,8 @@ private:
         // New result.
         auto newPortVal = newMem->getResult(portIt.index());
         // If read port, then blindly replace.
-        if (memOp.getPortKind(portIt.index()) == MemOp::PortKind::Read) {
+        if (memOp.getPortKind(portIt.index()) == MemOp::PortKind::Read ||
+            memOp.getPortKind(portIt.index()) == MemOp::PortKind::Debug) {
           oldPort.replaceAllUsesWith(newPortVal);
           continue;
         }

@@ -16,7 +16,9 @@
 
 #include "circt/Dialect/Handshake/HandshakeOps.h"
 #include "circt/Dialect/Handshake/HandshakePasses.h"
+#include "circt/Support/BackedgeBuilder.h"
 #include "mlir/Transforms/DialectConversion.h"
+
 #include <memory>
 
 namespace mlir {
@@ -48,8 +50,15 @@ LogicalResult partiallyLowerRegion(const RegionLoweringFunc &loweringFunc,
 // operation of the encapsulated region.
 class HandshakeLowering {
 public:
+  struct MergeOpInfo {
+    Operation *op;
+    Value val;
+    SmallVector<Backedge> dataEdges;
+    Optional<Backedge> indexEdge{};
+  };
+
   using BlockValues = DenseMap<Block *, std::vector<Value>>;
-  using BlockOps = DenseMap<Block *, std::vector<Operation *>>;
+  using BlockOps = DenseMap<Block *, std::vector<MergeOpInfo>>;
   using blockArgPairs = DenseMap<Value, Operation *>;
   using MemRefToMemoryAccessOp =
       llvm::MapVector<Value, std::vector<Operation *>>;
@@ -82,15 +91,17 @@ public:
   LogicalResult connectConstantsToControl(ConversionPatternRewriter &rewriter,
                                           bool sourceConstants);
 
+  LogicalResult feedForwardRewriting(ConversionPatternRewriter &rewriter);
   LogicalResult loopNetworkRewriting(ConversionPatternRewriter &rewriter);
 
   BlockOps insertMergeOps(BlockValues blockLiveIns, blockArgPairs &mergePairs,
+                          BackedgeBuilder &edgeBuilder,
                           ConversionPatternRewriter &rewriter);
 
   // Insert appropriate type of Merge CMerge for control-only path,
   // Merge for single-successor blocks, Mux otherwise
-  Operation *insertMerge(Block *block, Value val,
-                         ConversionPatternRewriter &rewriter);
+  MergeOpInfo insertMerge(Block *block, Value val, BackedgeBuilder &edgeBuilder,
+                          ConversionPatternRewriter &rewriter);
 
   // Replaces standard memory ops with their handshake version (i.e.,
   // ops which connect to memory/LSQ). Returns a map with an ordered
@@ -139,8 +150,6 @@ LogicalResult runPartialLowering(
 }
 
 // Helper to check the validity of the dataflow conversion
-LogicalResult checkDataflowConversion(Region &r, bool disableTaskPipelining);
-
 // Driver that applies the partial lowerings expressed in HandshakeLowering to
 // the region encapsulated in it. The region is assumed to have a terminator of
 // type TTerm. See HandshakeLowering for the different lowering steps.
@@ -171,22 +180,13 @@ LogicalResult lowerRegion(HandshakeLowering &hl, bool sourceConstants,
     if (failed(
             runPartialLowering(hl, &HandshakeLowering::loopNetworkRewriting)))
       return failure();
+    if (failed(
+            runPartialLowering(hl, &HandshakeLowering::feedForwardRewriting)))
+      return failure();
   }
-
-  // Fork/sink materialization. @todo: this should be removed and
-  // materialization should be run as a separate pass afterward initial dataflow
-  // conversion! However, connectToMemory has some hard-coded assumptions on the
-  // existence of fork/sink operations...
-  if (failed(partiallyLowerRegion(addSinkOps, hl.getContext(), hl.getRegion())))
-    return failure();
 
   if (failed(runPartialLowering(
           hl, &HandshakeLowering::connectConstantsToControl, sourceConstants)))
-    return failure();
-
-  if (failed(partiallyLowerRegion(addForkOps, hl.getContext(), hl.getRegion())))
-    return failure();
-  if (failed(checkDataflowConversion(hl.getRegion(), disableTaskPipelining)))
     return failure();
 
   bool lsq = false;
@@ -207,13 +207,18 @@ LogicalResult lowerRegion(HandshakeLowering &hl, bool sourceConstants,
 /// be graph regions currently.
 void removeBasicBlocks(Region &r);
 
+/// Lowers the mlir operations into handshake that are not part of the dataflow
+/// conversion.
+LogicalResult postDataflowConvert(Operation *op);
+
 } // namespace handshake
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
 createHandshakeAnalysisPass();
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createStandardToHandshakePass();
+createStandardToHandshakePass(bool sourceConstants = false,
+                              bool disableTaskPipelining = false);
 
 std::unique_ptr<mlir::OperationPass<handshake::FuncOp>>
 createHandshakeCanonicalizePass();

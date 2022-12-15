@@ -321,3 +321,52 @@ hw.module @structAndArrays(%a: ui8, %b: ui8) -> (out: !hw.struct<foo: !hw.array<
     %3 = hw.struct_create (%2) : !hw.struct<foo: !hw.array<2xui8>>
     hw.output %3 : !hw.struct<foo: !hw.array<2xui8>>
 }
+
+// -----
+
+// CHECK: msft.module.extern @externModule(%a: i8, %b: i8) -> (out: !hw.struct<foo: !hw.array<2xi8>>)
+msft.module.extern @externModule(%a: ui8, %b: ui8) -> (out: !hw.struct<foo: !hw.array<2xui8>>) 
+
+// -----
+
+
+// CHECK-LABEL:   hw.module @backedges() {
+// CHECK-NEXT:      %[[VAL_0:.*]] = hw.constant false
+// CHECK-NEXT:      %[[VAL_1:.*]] = comb.concat %[[VAL_0]], %[[VAL_2:.*]] : i1, i1
+// CHECK-NEXT:      %[[VAL_3:.*]] = hw.constant false
+// CHECK-NEXT:      %[[VAL_4:.*]] = comb.concat %[[VAL_3]], %[[VAL_2]] : i1, i1
+// CHECK-NEXT:      %[[VAL_5:.*]] = comb.add %[[VAL_1]], %[[VAL_4]] : i2
+// CHECK-NEXT:      %[[VAL_2]] = hw.constant true
+// CHECK-NEXT:      hw.output
+// CHECK-NEXT:    }
+hw.module @backedges() {
+  %res = hwarith.add %arg, %arg : (ui1, ui1) -> ui2
+  %arg = hwarith.constant 1 : ui1
+}
+
+// -----
+
+// CHECK-LABEL:   hw.module @wires() {
+// CHECK:           %[[VAL_0:.*]] = sv.wire  : !hw.inout<i2>
+// CHECK:           %[[VAL_1:.*]] = sv.reg  : !hw.inout<i2>
+// CHECK:           %[[VAL_2:.*]] = sv.read_inout %[[VAL_0]] : !hw.inout<i2>
+// CHECK:           %[[VAL_3:.*]] = sv.read_inout %[[VAL_1]] : !hw.inout<i2>
+// CHECK:           %[[VAL_4:.*]] = comb.icmp eq %[[VAL_3]], %[[VAL_2]] : i2
+// CHECK:           %[[VAL_5:.*]] = hw.constant -2 : i2
+// CHECK:           sv.assign %[[VAL_0]], %[[VAL_5]] : i2
+// CHECK:           sv.assign %[[VAL_1]], %[[VAL_5]] : i2
+// CHECK:           hw.output
+// CHECK:         }
+hw.module @wires () -> () {
+  %r52 = sv.wire  : !hw.inout<ui2>
+  %r53 = sv.reg : !hw.inout<ui2>
+  %0 = sv.read_inout %r52 : !hw.inout<ui2>
+  %1 = sv.read_inout %r53 : !hw.inout<ui2>
+  %33 = hwarith.cast %0 : (ui2) -> i2
+  %34 = hwarith.cast %1 : (ui2) -> i2
+  %35 = comb.icmp eq %34, %33 : i2
+
+  %c0_ui2 = hwarith.constant 2 : ui2
+  sv.assign %r52, %c0_ui2 : ui2
+  sv.assign %r53, %c0_ui2 : ui2
+}

@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines type type system for the FIRRTL Dialect.
+// This file defines the type system for the FIRRTL Dialect.
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,7 +14,9 @@
 #define CIRCT_DIALECT_FIRRTL_TYPES_H
 
 #include "circt/Dialect/FIRRTL/FIRRTLDialect.h"
+#include "circt/Dialect/HW/HWTypeInterfaces.h"
 #include "circt/Support/LLVM.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Types.h"
 
 namespace circt {
@@ -24,6 +26,7 @@ struct WidthTypeStorage;
 struct BundleTypeStorage;
 struct VectorTypeStorage;
 struct CMemoryTypeStorage;
+struct RefTypeStorage;
 } // namespace detail.
 
 class ClockType;
@@ -34,6 +37,7 @@ class UIntType;
 class AnalogType;
 class BundleType;
 class FVectorType;
+class RefType;
 
 /// A collection of bits indicating the recursive properties of a type.
 struct RecursiveTypeProperties {
@@ -54,6 +58,18 @@ struct RecursiveTypeProperties {
 
 // This is a common base class for all FIRRTL types.
 class FIRRTLType : public Type {
+public:
+  /// Support method to enable LLVM-style type casting.
+  static bool classof(Type type) {
+    return llvm::isa<FIRRTLDialect>(type.getDialect());
+  }
+
+protected:
+  using Type::Type;
+};
+
+// Common base class for all base FIRRTL types.
+class FIRRTLBaseType : public FIRRTLType {
 public:
   /// Return true if this is a "passive" type - one that contains no "flip"
   /// types recursively within itself.
@@ -78,16 +94,16 @@ public:
   RecursiveTypeProperties getRecursiveTypeProperties();
 
   /// Return this type with any flip types recursively removed from itself.
-  FIRRTLType getPassiveType();
+  FIRRTLBaseType getPassiveType();
 
   /// Return this type with all ground types replaced with UInt<1>.  This is
   /// used for `mem` operations.
-  FIRRTLType getMaskType();
+  FIRRTLBaseType getMaskType();
 
   /// Return this type with widths of all ground types removed. This
   /// enables two types to be compared by structure and name ignoring
   /// widths.
-  FIRRTLType getWidthlessType();
+  FIRRTLBaseType getWidthlessType();
 
   /// If this is an IntType, AnalogType, or sugar type for a single bit (Clock,
   /// Reset, etc) then return the bitwidth.  Return -1 if the is one of these
@@ -97,7 +113,7 @@ public:
 
   /// Support method to enable LLVM-style type casting.
   static bool classof(Type type) {
-    return llvm::isa<FIRRTLDialect>(type.getDialect());
+    return llvm::isa<FIRRTLDialect>(type.getDialect()) && !type.isa<RefType>();
   }
 
   /// Return true if this is a valid "reset" type.
@@ -113,11 +129,11 @@ public:
   /// Get the sub-type of a type for a field ID, and the subfield's ID. Strip
   /// off a single layer of this type and return the sub-type and a field ID
   /// targeting the same field, but rebased on the sub-type.
-  std::pair<FIRRTLType, unsigned> getSubTypeByFieldID(unsigned fieldID);
+  std::pair<FIRRTLBaseType, unsigned> getSubTypeByFieldID(unsigned fieldID);
 
   /// Return the final type targeted by this field ID by recursively walking all
   /// nested aggregate types. This is the identity function for ground types.
-  FIRRTLType getFinalTypeByFieldID(unsigned fieldID);
+  FIRRTLBaseType getFinalTypeByFieldID(unsigned fieldID);
 
   /// Returns the effective field id when treating the index field as the
   /// root of the type.  Essentially maps a fieldID to a fieldID after a
@@ -125,8 +141,13 @@ public:
   /// child.
   std::pair<unsigned, bool> rootChildFieldID(unsigned fieldID, unsigned index);
 
+  /// Get the number of ground (non-aggregate) fields in the type.  A field
+  /// which is a bundle or vector is not counted, but the recursive ground
+  /// fields of are.
+  unsigned getGroundFields() const;
+
 protected:
-  using Type::Type;
+  using FIRRTLType::FIRRTLType;
 };
 
 /// Returns whether the two types are equivalent.  This implements the exact
@@ -149,51 +170,46 @@ bool areTypesWeaklyEquivalent(FIRRTLType destType, FIRRTLType srcType,
 /// recursively based on their elements and bundles are compared
 /// field-by-field.  Types with unresolved widths are assumed to fit into or
 /// hold their counterparts.
-bool isTypeLarger(FIRRTLType dstType, FIRRTLType srcType);
+bool isTypeLarger(FIRRTLBaseType dstType, FIRRTLBaseType srcType);
 
 mlir::Type getVectorElementType(mlir::Type array);
-mlir::Type getPassiveType(mlir::Type anyFIRRTLType);
-
-//===----------------------------------------------------------------------===//
-// Ground Types Without Parameters
-//===----------------------------------------------------------------------===//
-
-/// `firrtl.Clock` describe wires and ports meant for carrying clock signals.
-class ClockType
-    : public FIRRTLType::TypeBase<ClockType, FIRRTLType, DefaultTypeStorage> {
-public:
-  using Base::Base;
-  static ClockType get(MLIRContext *context) { return Base::get(context); }
-};
-
-/// `firrtl.Reset`.
-/// TODO(firrtl spec): This is not described in the FIRRTL spec.
-class ResetType
-    : public FIRRTLType::TypeBase<ResetType, FIRRTLType, DefaultTypeStorage> {
-public:
-  using Base::Base;
-  static ResetType get(MLIRContext *context) { return Base::get(context); }
-};
-/// `firrtl.AsyncReset`.
-/// TODO(firrtl spec): This is not described in the FIRRTL spec.
-class AsyncResetType : public FIRRTLType::TypeBase<AsyncResetType, FIRRTLType,
-                                                   DefaultTypeStorage> {
-public:
-  using Base::Base;
-  static AsyncResetType get(MLIRContext *context) { return Base::get(context); }
-};
+mlir::Type getPassiveType(mlir::Type anyBaseFIRRTLType);
 
 //===----------------------------------------------------------------------===//
 // Width Qualified Ground Types
 //===----------------------------------------------------------------------===//
 
+template <typename ConcreteType>
+class WidthQualifiedTrait
+    : public mlir::OpTrait::TraitBase<ConcreteType, WidthQualifiedTrait> {
+public:
+  Optional<int32_t> getWidth() {
+    auto v = static_cast<ConcreteType *>(this)->getBaseWidth();
+    if (v >= 0)
+      return v;
+    return {};
+  }
+  int32_t getWidthOrSentinel() {
+    return static_cast<ConcreteType *>(this)->getBaseWidth();
+  }
+  bool hasWidth() {
+    return static_cast<ConcreteType *>(this)->getBaseWidth() >= 0;
+  }
+  ConcreteType changeWidth(int32_t width) {
+    return ConcreteType::get(static_cast<ConcreteType *>(this)->getContext(),
+                             width);
+  }
+};
+
 template <typename ConcreteType, typename ParentType>
 class WidthQualifiedType
     : public FIRRTLType::TypeBase<ConcreteType, ParentType,
-                                  detail::WidthTypeStorage> {
+                                  detail::WidthTypeStorage,
+                                  circt::hw::FieldIDTypeInterface::Trait> {
 public:
-  using FIRRTLType::TypeBase<ConcreteType, ParentType,
-                             detail::WidthTypeStorage>::Base::Base;
+  using FIRRTLType::TypeBase<
+      ConcreteType, ParentType, detail::WidthTypeStorage,
+      circt::hw::FieldIDTypeInterface::Trait>::Base::Base;
 
   /// Return the bitwidth of this type or None if unknown.
   Optional<int32_t> getWidth() {
@@ -217,9 +233,9 @@ class SIntType;
 class UIntType;
 
 /// This is the common base class between SIntType and UIntType.
-class IntType : public FIRRTLType {
+class IntType : public FIRRTLBaseType {
 public:
-  using FIRRTLType::FIRRTLType;
+  using FIRRTLBaseType::FIRRTLBaseType;
 
   /// Return a SIntType or UInt type with the specified signedness and width.
   static IntType get(MLIRContext *context, bool isSigned, int32_t width = -1);
@@ -265,26 +281,16 @@ public:
   Optional<int32_t> getWidth();
 };
 
-// `firrtl.Analog` can be attached to multiple drivers.
-class AnalogType : public WidthQualifiedType<AnalogType, FIRRTLType> {
-public:
-  using WidthQualifiedType::WidthQualifiedType;
-
-  /// Get an with a known width, or -1 for unknown.
-  static AnalogType get(MLIRContext *context, int32_t width = -1);
-
-  /// Return the bitwidth of this type or None if unknown.
-  Optional<int32_t> getWidth();
-};
-
 //===----------------------------------------------------------------------===//
 // Bundle Type
 //===----------------------------------------------------------------------===//
 
 /// BundleType is an aggregate of named elements.  This is effectively a struct
 /// for FIRRTL.
-class BundleType : public FIRRTLType::TypeBase<BundleType, FIRRTLType,
-                                               detail::BundleTypeStorage> {
+class BundleType
+    : public FIRRTLType::TypeBase<BundleType, FIRRTLBaseType,
+                                  detail::BundleTypeStorage,
+                                  circt::hw::FieldIDTypeInterface::Trait> {
 public:
   using Base::Base;
 
@@ -292,9 +298,9 @@ public:
   struct BundleElement {
     StringAttr name;
     bool isFlip;
-    FIRRTLType type;
+    FIRRTLBaseType type;
 
-    BundleElement(StringAttr name, bool isFlip, FIRRTLType type)
+    BundleElement(StringAttr name, bool isFlip, FIRRTLBaseType type)
         : name(name), isFlip(isFlip), type(type) {}
 
     bool operator==(const BundleElement &rhs) const {
@@ -303,7 +309,7 @@ public:
     bool operator!=(const BundleElement &rhs) const { return !operator==(rhs); }
   };
 
-  static FIRRTLType get(ArrayRef<BundleElement> elements, MLIRContext *context);
+  static BundleType get(ArrayRef<BundleElement> elements, MLIRContext *context);
 
   ArrayRef<BundleElement> getElements() const;
 
@@ -324,17 +330,17 @@ public:
   BundleElement getElement(size_t index);
 
   /// Look up an element type by name.
-  FIRRTLType getElementType(StringAttr name);
-  FIRRTLType getElementType(StringRef name);
+  FIRRTLBaseType getElementType(StringAttr name);
+  FIRRTLBaseType getElementType(StringRef name);
 
   /// Look up an element type by index.
-  FIRRTLType getElementType(size_t index);
+  FIRRTLBaseType getElementType(size_t index);
 
   /// Return the recursive properties of the type.
   RecursiveTypeProperties getRecursiveTypeProperties();
 
   /// Return this type with any flip types recursively removed from itself.
-  FIRRTLType getPassiveType();
+  FIRRTLBaseType getPassiveType();
 
   /// Get an integer ID for the field. Field IDs start at 1, and are assigned
   /// to each field in a bundle in a recursive pre-order walk of all fields,
@@ -350,7 +356,7 @@ public:
 
   /// Strip off a single layer of this type and return the sub-type and a field
   /// ID targeting the same field, but rebased on the sub-type.
-  std::pair<FIRRTLType, unsigned> getSubTypeByFieldID(unsigned fieldID);
+  std::pair<FIRRTLBaseType, unsigned> getSubTypeByFieldID(unsigned fieldID);
 
   /// Get the maximum field ID in this bundle.  This is helpful for constructing
   /// field IDs when this BundleType is nested in another aggregate type.
@@ -371,21 +377,23 @@ public:
 //===----------------------------------------------------------------------===//
 
 /// VectorType is a fixed size collection of elements, like an array.
-class FVectorType : public FIRRTLType::TypeBase<FVectorType, FIRRTLType,
-                                                detail::VectorTypeStorage> {
+class FVectorType
+    : public FIRRTLType::TypeBase<FVectorType, FIRRTLBaseType,
+                                  detail::VectorTypeStorage,
+                                  circt::hw::FieldIDTypeInterface::Trait> {
 public:
   using Base::Base;
 
-  static FIRRTLType get(FIRRTLType elementType, size_t numElements);
+  static FVectorType get(FIRRTLBaseType elementType, size_t numElements);
 
-  FIRRTLType getElementType();
+  FIRRTLBaseType getElementType();
   size_t getNumElements();
 
   /// Return the recursive properties of the type.
   RecursiveTypeProperties getRecursiveTypeProperties();
 
   /// Return this type with any flip types recursively removed from itself.
-  FIRRTLType getPassiveType();
+  FIRRTLBaseType getPassiveType();
 
   /// Get an integer ID for the field. Field IDs start at 1, and are assigned
   /// to each field in a vector in a recursive depth-first walk of all elements.
@@ -399,7 +407,7 @@ public:
 
   /// Strip off a single layer of this type and return the sub-type and a field
   /// ID targeting the same field, but rebased on the sub-type.
-  std::pair<FIRRTLType, size_t> getSubTypeByFieldID(size_t fieldID);
+  std::pair<FIRRTLBaseType, size_t> getSubTypeByFieldID(size_t fieldID);
 
   /// Get the maximum field ID in this vector.  This is helpful for constructing
   /// field IDs when this VectorType is nested in another aggregate type.
@@ -411,16 +419,39 @@ public:
   std::pair<size_t, bool> rootChildFieldID(size_t fieldID, size_t index);
 };
 
+//===----------------------------------------------------------------------===//
+// Reference Type
+//===----------------------------------------------------------------------===//
+
+class RefType
+    : public FIRRTLType::TypeBase<RefType, FIRRTLType, detail::RefTypeStorage> {
+public:
+  using Base::Base;
+  static RefType get(FIRRTLBaseType type);
+
+  /// Return the underlying type.
+  FIRRTLBaseType getType();
+
+  static LogicalResult verify(function_ref<InFlightDiagnostic()> emitErrorFn,
+                              FIRRTLBaseType base);
+};
+
+//===----------------------------------------------------------------------===//
+// Type helpers
+//===----------------------------------------------------------------------===//
+
 // Get the bit width for this type, return None  if unknown. Unlike
 // getBitWidthOrSentinel(), this can recursively compute the bitwidth of
 // aggregate types. For bundle and vectors, recursively get the width of each
 // field element and return the total bit width of the aggregate type. This
 // returns None, if any of the bundle fields is a flip type, or ground type with
 // unknown bit width.
-llvm::Optional<int64_t> getBitWidth(FIRRTLType type);
+llvm::Optional<int64_t> getBitWidth(FIRRTLBaseType type,
+                                    bool ignoreFlip = false);
 
 // Parse a FIRRTL type without a leading `!firrtl.` dialect tag.
 ParseResult parseNestedType(FIRRTLType &result, AsmParser &parser);
+ParseResult parseNestedBaseType(FIRRTLBaseType &result, AsmParser &parser);
 
 // Print a FIRRTL type without a leading `!firrtl.` dialect tag.
 void printNestedType(Type type, AsmPrinter &os);
@@ -448,6 +479,25 @@ struct DenseMapInfo<circt::firrtl::FIRRTLType> {
   }
   static unsigned getHashValue(FIRRTLType val) { return mlir::hash_value(val); }
   static bool isEqual(FIRRTLType LHS, FIRRTLType RHS) { return LHS == RHS; }
+};
+
+template <>
+struct DenseMapInfo<circt::firrtl::FIRRTLBaseType> {
+  using FIRRTLBaseType = circt::firrtl::FIRRTLBaseType;
+  static FIRRTLBaseType getEmptyKey() {
+    auto pointer = llvm::DenseMapInfo<void *>::getEmptyKey();
+    return FIRRTLBaseType(static_cast<mlir::Type::ImplType *>(pointer));
+  }
+  static FIRRTLBaseType getTombstoneKey() {
+    auto pointer = llvm::DenseMapInfo<void *>::getTombstoneKey();
+    return FIRRTLBaseType(static_cast<mlir::Type::ImplType *>(pointer));
+  }
+  static unsigned getHashValue(FIRRTLBaseType val) {
+    return mlir::hash_value(val);
+  }
+  static bool isEqual(FIRRTLBaseType LHS, FIRRTLBaseType RHS) {
+    return LHS == RHS;
+  }
 };
 
 } // namespace llvm

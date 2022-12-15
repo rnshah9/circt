@@ -20,7 +20,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Affine/Utils.h"
-#include "mlir/Dialect/Arithmetic/IR/Arithmetic.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -215,7 +215,7 @@ LogicalResult AffineToPipeline::lowerAffineStructures(
   auto op = getOperation();
 
   ConversionTarget target(*context);
-  target.addLegalDialect<AffineDialect, ArithmeticDialect, MemRefDialect,
+  target.addLegalDialect<AffineDialect, ArithDialect, MemRefDialect,
                          SCFDialect>();
   target.addIllegalOp<AffineIfOp, AffineLoadOp, AffineStoreOp>();
   target.addDynamicallyLegalOp<IfOp>(ifOpLegalityCallback);
@@ -441,7 +441,8 @@ LogicalResult AffineToPipeline::createPipelinePipeline(
     // Create the stage itself.
     auto startTimeAttr = builder.getIntegerAttr(
         builder.getIntegerType(64, /*isSigned=*/true), startTime);
-    auto stage = builder.create<PipelineStageOp>(stageTypes, startTimeAttr);
+    auto stage =
+        builder.create<PipelineWhileStageOp>(stageTypes, startTimeAttr);
     auto &stageBlock = stage.getBodyBlock();
     auto *stageTerminator = stageBlock.getTerminator();
     builder.setInsertionPointToStart(&stageBlock);
@@ -497,8 +498,8 @@ LogicalResult AffineToPipeline::createPipelinePipeline(
     termResults.push_back(valueMap.lookup(value));
   }
 
-  stagesTerminator.iter_argsMutable().append(termIterArgs);
-  stagesTerminator.resultsMutable().append(termResults);
+  stagesTerminator.getIterArgsMutable().append(termIterArgs);
+  stagesTerminator.getResultsMutable().append(termResults);
 
   // Replace loop results with pipeline results.
   for (size_t i = 0; i < forOp.getNumResults(); ++i)

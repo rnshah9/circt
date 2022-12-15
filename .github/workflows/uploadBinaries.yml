@@ -9,8 +9,8 @@ jobs:
     strategy:
       matrix:
         compiler:
-          - cc: gcc-10
-            cxx: g++-10
+          - cc: clang
+            cxx: clang++
             mode: release
             assert: OFF
             shared: OFF
@@ -26,7 +26,7 @@ jobs:
             tar: tar
           - runner: macos-11
             os: macos
-            cmake-args: '-DCMAKE_CXX_FLAGS="-static-libgcc -static-libstdc++"'
+            cmake-args: ''
             tar: gtar
     runs-on: ${{ matrix.runner }}
     steps:
@@ -115,8 +115,11 @@ jobs:
             -DLLVM_ENABLE_TERMINFO=OFF \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DCIRCT_RELEASE_TAG_ENABLED=ON \
+            -DCIRCT_RELEASE_TAG=${{ github.ref_name }} \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF
           ninja
+          ninja check-circt check-circt-unit
       - name: Display Files
         run: file build/bin/*
       - name: Package Binaries

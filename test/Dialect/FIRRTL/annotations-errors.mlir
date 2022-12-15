@@ -1,4 +1,17 @@
-// RUN: circt-opt --pass-pipeline='firrtl.circuit(firrtl-lower-annotations)' -split-input-file %s -verify-diagnostics
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-annotations))' -split-input-file %s -verify-diagnostics
+
+// An unknown annotation should error.
+//
+// expected-error @+1 {{Unhandled annotation}}
+firrtl.circuit "Foo" attributes {rawAnnotations = [
+  {
+    class = "circt.unknown"
+  }
+]} {
+  firrtl.module @Foo() {}
+}
+
+// -----
 
 // An incorrect circuit target should report an error.
 //

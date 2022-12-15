@@ -1,4 +1,4 @@
-; RUN: firtool --firrtl-grand-central --verilog --split-input-file %s | FileCheck %s
+; RUN: firtool --split-input-file %s | FileCheck %s
 
 ; A number of tests use an invalidated wire with a DontTouchAnnotation to block
 ; constant sinking into the XMR.  This is to ensure that the test can check a
@@ -29,6 +29,10 @@ circuit Top : %[[
         "portName":"~Top|DataTap_2>_1"
       }
     ]
+  },
+  {
+    "class": "firrtl.transforms.DontTouchAnnotation",
+    "target": "~Top|Child>always"
   },
   {
     "class":"sifive.enterprise.grandcentral.MemTapAnnotation",
@@ -99,13 +103,14 @@ circuit Top : %[[
     inst DataTap_2 of DataTap_2
     DataTap_2._0 is invalid
     DataTap_2._1 is invalid
-    in <= DataTap_2._0
-    out <= DataTap_2._1
     node _child_io_in_T = and(io.in, in)
     unsigned.io.in <= _child_io_in_T
     node _io_out_T = and(unsigned.io.out, out)
     io.out <= _io_out_T
     inst MemTap_2 of MemTap_2
+
+    in <= or(DataTap_2._0, MemTap_2._0)
+    out <= or(DataTap_2._1, MemTap_2._1)
 
 ; CHECK: module DataTap_2_impl_0(
 ; CHECK:   output _1,
@@ -169,6 +174,8 @@ circuit Top : %[[
     f <= inv
 
   module Top:
+    output io : { b : UInt<1>, c : UInt<1>, d: UInt<1> }
+
     inst foo of Foo
     inst bar of Foo
     inst dataTap of DataTap
@@ -176,6 +183,9 @@ circuit Top : %[[
     inv is invalid
     wire k : UInt<1>
     k <= inv
+    io.b <= dataTap.b
+    io.c <= dataTap.c
+    io.d <= dataTap.d
 
 ; CHECK: module DataTap_impl_0(
 ; CHECK:   output b,
@@ -207,15 +217,21 @@ circuit TestHarness : %[[
   }
 ]]
   module TestHarness :
+    output io : UInt<1>
     inst system of Top
+    io <= system.io
   module Top :
+    output io : UInt<1>
     inst test of Test
     inst Companion of Companion
+    io <= Companion.io
   extmodule DataTap :
     output _0 : UInt<8>
     defname = DataTap
   module Companion :
+    output io : UInt<1>
     inst DataTap of DataTap
+    io <= DataTap._0
   module Test :
     wire inv: UInt<1>
     inv is invalid
@@ -386,6 +402,7 @@ circuit Top : %[[
     wire_Submodule <= inv
 
     inst tap of DataTap_Submodule
+    port_Submodule <= or(tap._0, or(tap._1, or(tap._2, or(tap._3, or(tap._4, tap._5)))))
 
   module DUT :
     output port_DUT: UInt<1>
@@ -400,6 +417,7 @@ circuit Top : %[[
     inst submodule of Submodule
 
     inst tap of DataTap_DUT
+    port_DUT <= or(tap._0, or(tap._1, or(tap._2, or(tap._3, or(tap._4, tap._5)))))
 
   module Top :
     output port_Top : UInt<1>
@@ -413,6 +431,7 @@ circuit Top : %[[
 
     inst dut of DUT
     inst tap of DataTap_Top
+    port_Top <= or(tap._0, or(tap._1, or(tap._2, or(tap._3, or(tap._4, tap._5)))))
 
     ; CHECK:      module DataTap_Submodule
     ; CHECK:      assign _0 = Submodule.wire_Submodule
@@ -459,3 +478,59 @@ circuit ConstantSinking : %[[
   module ConstantSinking:
     inst dataTap of DataTap
     node w = UInt<1>(1)
+
+; // -----
+
+circuit Top : %[[
+  {
+    "class":"firrtl.transforms.DontTouchAnnotation",
+    "target":"~Top|Child>sum"
+  },
+  {
+    "class":"sifive.enterprise.grandcentral.DataTapsAnnotation",
+    "blackBox":"~Top|DataTap",
+    "keys":[
+      {
+        "class":"sifive.enterprise.grandcentral.DataTapModuleSignalKey",
+        "module":"~Top|Child",
+        "internalPath":"sum",
+        "portName":"~Top|DataTap>_0"
+      },
+      {
+        "class":"sifive.enterprise.grandcentral.DataTapModuleSignalKey",
+        "module":"~Top|Child",
+        "internalPath":"not.a.real.path",
+        "portName":"~Top|DataTap>_1"
+      }
+    ]
+  }
+]]
+  module Child :
+    output io : { flip in : UInt<8>, out : UInt<8>}
+
+    node sum = tail(add(io.in, UInt<1>(1)), 1)
+
+    io.out <= sum
+
+  extmodule DataTap :
+    output _0 : UInt<8>
+    output _1 : UInt<8>
+    defname = DataTap
+
+  module Top :
+    output io : { flip in : UInt<8>, out : UInt<8>}
+    output taps : UInt<8>[2]
+
+    inst child of Child
+    io <= child.io
+
+    inst dt of DataTap
+    taps[0] <= dt._0
+    taps[1] <= dt._1
+
+; CHECK: module DataTap_impl_0(
+; CHECK:   output [7:0] _0,
+; CHECK:                _1);
+; CHECK:   assign _0 = Top.child.sum;
+; CHECK:   assign _1 = Top.child.not.a.real.path;
+; CHECK: endmodule

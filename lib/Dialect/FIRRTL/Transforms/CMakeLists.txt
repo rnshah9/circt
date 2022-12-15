@@ -18,16 +18,21 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   InferReadWrite.cpp
   InferWidths.cpp
   InjectDUTHierarchy.cpp
+  InnerSymbolDCE.cpp
   LowerAnnotations.cpp
   LowerCHIRRTL.cpp
+  LowerIntrinsics.cpp
   LowerMemory.cpp
   LowerTypes.cpp
+  LowerXMR.cpp
   MergeConnections.cpp
   MemToRegOfVec.cpp
   ModuleInliner.cpp
   PrefixModules.cpp
   PrintInstanceGraph.cpp
   PrintNLATable.cpp
+  RandomizeRegisterInit.cpp
+  ResolveTraces.cpp
   RemoveUnusedPorts.cpp
   SFCCompat.cpp
   WireDFT.cpp

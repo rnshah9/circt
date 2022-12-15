@@ -15,6 +15,7 @@
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SystemC/SystemCOps.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -41,52 +42,38 @@ struct ConvertHWModule : public OpConversionPattern<HWModuleOp> {
   matchAndRewrite(HWModuleOp module, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Parameterized modules are supported yet.
-    if (module.getParameters().size() > 0)
+    if (!module.getParameters().empty())
       return emitError(module->getLoc(), "module parameters not supported yet");
 
-    // Collect the HW module's port types.
-    FunctionType moduleType = module.getFunctionType();
-    TypeRange moduleOutputs = moduleType.getResults();
-
-    // SystemC module port types are all expressed as block arguments to the op,
-    // so collect all of the types and add them as arguments to the SystemC
-    // module.
-    SmallVector<Type, 4> portTypes((TypeRange)moduleType.getInputs());
-    portTypes.append(moduleOutputs.begin(), moduleOutputs.end());
-
-    // Collect all the port directions.
-    SmallVector<systemc::PortDirection> directions;
-    for (auto port : module.getAllPorts()) {
-      if (port.isInput())
-        directions.push_back(systemc::PortDirection::Input);
-      else if (port.isOutput())
-        directions.push_back(systemc::PortDirection::Output);
-      else
-        return emitError(module->getLoc(), "inout arguments not supported yet");
-    }
-    PortDirectionsAttr portDirections =
-        PortDirectionsAttr::get(rewriter.getContext(), directions);
-
-    // Collect all the port names (inputs and outputs).
-    SmallVector<Attribute> portNames;
-    ArrayRef<Attribute> args = module.getArgNames().getValue();
-    ArrayRef<Attribute> results = module.getResultNames().getValue();
-    portNames.append(args.begin(), args.end());
-    portNames.append(results.begin(), results.end());
+    if (llvm::any_of(module.getAllPorts(),
+                     [](auto port) { return port.isInOut(); }))
+      return emitError(module->getLoc(), "inout arguments not supported yet");
 
     // Create the SystemC module.
-    auto scModule = rewriter.create<SCModuleOp>(
-        module.getLoc(), portDirections,
-        ArrayAttr::get(rewriter.getContext(), portNames));
+    SmallVector<PortInfo> ports = module.getAllPorts();
+    for (size_t i = 0; i < ports.size(); ++i)
+      ports[i].type = typeConverter->convertType(ports[i].type);
 
-    // Create a systemc.ctor operation inside the module.
-    Block *moduleBlock = new Block;
-    scModule.getBodyRegion().push_back(moduleBlock);
-    rewriter.setInsertionPointToStart(moduleBlock);
-    auto ctor = rewriter.create<CtorOp>(module.getLoc());
+    auto scModule = rewriter.create<SCModuleOp>(module.getLoc(),
+                                                module.getNameAttr(), ports);
+    auto *outputOp = module.getBodyBlock()->getTerminator();
+    scModule.setVisibility(module.getVisibility());
+
+    SmallVector<Attribute> portAttrs;
+    if (auto argAttrs = module.getAllArgAttrs())
+      portAttrs.append(argAttrs.begin(), argAttrs.end());
+    else
+      portAttrs.append(module.getNumInputs(), Attribute());
+    if (auto resultAttrs = module.getAllResultAttrs())
+      portAttrs.append(resultAttrs.begin(), resultAttrs.end());
+    else
+      portAttrs.append(module.getNumOutputs(), Attribute());
+
+    scModule.setAllArgAttrs(portAttrs);
 
     // Create a systemc.func operation inside the module after the ctor.
     // TODO: implement logic to extract a better name and properly unique it.
+    rewriter.setInsertionPointToStart(scModule.getBodyBlock());
     auto scFunc = rewriter.create<SCFuncOp>(
         module.getLoc(), rewriter.getStringAttr("innerLogic"));
 
@@ -94,65 +81,182 @@ struct ConvertHWModule : public OpConversionPattern<HWModuleOp> {
     // TODO: do some dominance analysis to detect use-before-def and cycles in
     // the use chain, which are allowed in graph regions but not in SSACFG
     // regions, and when possible fix them.
+    scFunc.getBodyBlock()->erase();
     Region &scFuncBody = scFunc.getBody();
     rewriter.inlineRegionBefore(module.getBody(), scFuncBody, scFuncBody.end());
 
     // Register the systemc.func inside the systemc.ctor
-    Block *ctorBlock = new Block;
-    ctor.getRegion().push_back(ctorBlock);
-    rewriter.setInsertionPointToStart(ctorBlock);
-    rewriter.create<MethodOp>(ctor.getLoc(), scFunc.getHandle());
+    rewriter.setInsertionPointToStart(
+        scModule.getOrCreateCtor().getBodyBlock());
+    rewriter.create<MethodOp>(scModule.getLoc(), scFunc.getHandle());
 
-    // Set the SCModule type and name attributes. Add block arguments for each
-    // output.
-    auto scModuleType = rewriter.getFunctionType(portTypes, {});
-    rewriter.updateRootInPlace(scModule, [&] {
-      scModule->setAttr(scModule.getTypeAttrName(),
-                        TypeAttr::get(scModuleType));
-      scModule.setName(module.getName());
-      scModule.getBodyRegion().addArguments(
-          portTypes,
-          SmallVector<Location, 4>(portTypes.size(), rewriter.getUnknownLoc()));
+    // Register the sensitivities of above SC_METHOD registration.
+    SmallVector<Value> sensitivityValues(
+        llvm::make_filter_range(scModule.getArguments(), [](BlockArgument arg) {
+          return !arg.getType().isa<OutputType>();
+        }));
+    if (!sensitivityValues.empty())
+      rewriter.create<SensitiveOp>(scModule.getLoc(), sensitivityValues);
 
-      // Move the block arguments of the systemc.func (that we got from the
-      // hw.module) to the systemc.module
-      Region &funcBody = scFunc.getBody();
-      for (size_t i = 0, e = scFunc.getRegion().getNumArguments(); i < e; ++i) {
-        funcBody.getArgument(0).replaceAllUsesWith(scModule.getArgument(i));
-        funcBody.eraseArgument(0);
-      }
-    });
+    // Move the block arguments of the systemc.func (that we got from the
+    // hw.module) to the systemc.module
+    rewriter.setInsertionPointToStart(scFunc.getBodyBlock());
+    for (size_t i = 0, e = scFunc.getRegion().getNumArguments(); i < e; ++i) {
+      auto inputRead =
+          rewriter
+              .create<SignalReadOp>(scFunc.getLoc(), scModule.getArgument(i))
+              .getResult();
+      auto converted = typeConverter->materializeSourceConversion(
+          rewriter, scModule.getLoc(), module.getAllPorts()[i].type, inputRead);
+      scFuncBody.getArgument(0).replaceAllUsesWith(converted);
+      scFuncBody.eraseArgument(0);
+    }
 
     // Erase the HW module.
     rewriter.eraseOp(module);
+
+    SmallVector<Value> outPorts;
+    for (auto val : scModule.getArguments()) {
+      if (val.getType().isa<OutputType>())
+        outPorts.push_back(val);
+    }
+
+    rewriter.setInsertionPoint(outputOp);
+    for (auto args : llvm::zip(outPorts, outputOp->getOperands())) {
+      Value portValue = std::get<0>(args);
+      auto converted = typeConverter->materializeTargetConversion(
+          rewriter, scModule.getLoc(), getSignalBaseType(portValue.getType()),
+          std::get<1>(args));
+      rewriter.create<SignalWriteOp>(outputOp->getLoc(), portValue, converted);
+    }
+
+    // Erase the HW OutputOp.
+    outputOp->dropAllReferences();
+    rewriter.eraseOp(outputOp);
 
     return success();
   }
 };
 
-/// Convert output operations to alias operations connecting the result SSA
-/// values to the output block arguments.
-struct ConvertOutput : public OpConversionPattern<OutputOp> {
+/// Convert hw.instance operations to systemc.instance.decl and a
+/// systemc.instance.bind_port operation for each port in the constructor. Also
+/// insert the necessary intermediate signals and write or read their state in
+/// the update function accordingly.
+class ConvertInstance : public OpConversionPattern<InstanceOp> {
   using OpConversionPattern::OpConversionPattern;
 
+private:
+  template <typename PortTy>
   LogicalResult
-  matchAndRewrite(OutputOp outputOp, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+  collectPortInfo(ValueRange ports, ArrayAttr portNames,
+                  SmallVector<ModuleType::PortInfo> &portInfo) const {
+    for (auto inPort : llvm::zip(ports, portNames)) {
+      Type ty = std::get<0>(inPort).getType();
+      ModuleType::PortInfo info;
 
-    SmallVector<Value> moduleOutputs;
-    if (auto scModule = outputOp->getParentOfType<SCModuleOp>()) {
-      scModule.getOutputs(moduleOutputs);
-      for (auto args : llvm::zip(moduleOutputs, outputOp.getOperands())) {
-        rewriter.create<AliasOp>(outputOp->getLoc(), std::get<0>(args),
-                                 std::get<1>(args));
-      }
+      if (ty.isa<hw::InOutType>())
+        return failure();
 
-      // Erase the HW OutputOp.
-      rewriter.eraseOp(outputOp);
-      return success();
+      info.type = typeConverter->convertType(PortTy::get(ty));
+      info.name = std::get<1>(inPort).cast<StringAttr>();
+      portInfo.push_back(info);
     }
 
-    return failure();
+    return success();
+  }
+
+public:
+  LogicalResult
+  matchAndRewrite(InstanceOp instanceOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Make sure the parent is already converted such that we already have a
+    // constructor and update function to insert operations into.
+    auto scModule = instanceOp->getParentOfType<SCModuleOp>();
+    if (!scModule)
+      return rewriter.notifyMatchFailure(instanceOp,
+                                         "parent was not an SCModuleOp");
+
+    // Get the builders for the different places to insert operations.
+    auto ctor = scModule.getOrCreateCtor();
+    OpBuilder stateBuilder(ctor);
+    OpBuilder initBuilder = OpBuilder::atBlockEnd(ctor.getBodyBlock());
+
+    // Collect the port types and names of the instantiated module and convert
+    // them to appropriate systemc types.
+    SmallVector<ModuleType::PortInfo> portInfo;
+    if (failed(collectPortInfo<InputType>(adaptor.getInputs(),
+                                          adaptor.getArgNames(), portInfo)) ||
+        failed(collectPortInfo<OutputType>(instanceOp->getResults(),
+                                           adaptor.getResultNames(), portInfo)))
+      return instanceOp->emitOpError("inout ports not supported");
+
+    Location loc = instanceOp->getLoc();
+    auto instanceName = instanceOp.getInstanceNameAttr();
+    auto instModuleName = instanceOp.getModuleNameAttr();
+
+    // Declare the instance.
+    auto instDecl = stateBuilder.create<InstanceDeclOp>(
+        loc, instanceName, instModuleName, portInfo);
+
+    // Bind the input ports.
+    for (size_t i = 0, numInputs = adaptor.getInputs().size(); i < numInputs;
+         ++i) {
+      Value input = adaptor.getInputs()[i];
+      auto portId = rewriter.getIndexAttr(i);
+      StringAttr signalName = rewriter.getStringAttr(
+          instanceName.getValue() + "_" + portInfo[i].name.getValue());
+
+      if (auto readOp = input.getDefiningOp<SignalReadOp>()) {
+        // Use the read channel directly without adding an
+        // intermediate signal.
+        initBuilder.create<BindPortOp>(loc, instDecl, portId,
+                                       readOp.getInput());
+        continue;
+      }
+
+      // Otherwise, create an intermediate signal to bind the instance port to.
+      Type sigType = SignalType::get(getSignalBaseType(portInfo[i].type));
+      Value channel = stateBuilder.create<SignalOp>(loc, sigType, signalName);
+      initBuilder.create<BindPortOp>(loc, instDecl, portId, channel);
+      rewriter.create<SignalWriteOp>(loc, channel, input);
+    }
+
+    // Bind the output ports.
+    for (size_t i = 0, numOutputs = instanceOp->getNumResults(); i < numOutputs;
+         ++i) {
+      size_t numInputs = adaptor.getInputs().size();
+      Value output = instanceOp->getResult(i);
+      auto portId = rewriter.getIndexAttr(i + numInputs);
+      StringAttr signalName =
+          rewriter.getStringAttr(instanceName.getValue() + "_" +
+                                 portInfo[i + numInputs].name.getValue());
+
+      if (output.hasOneUse()) {
+        if (auto writeOp = dyn_cast<SignalWriteOp>(*output.user_begin())) {
+          // Use the channel written to directly. When there are multiple
+          // channels this value is written to or it is used somewhere else, we
+          // cannot shortcut it and have to insert an intermediate value because
+          // we cannot insert multiple bind statements for one submodule port.
+          // It is also necessary to bind it to an intermediate signal when it
+          // has no uses as every port has to be bound to a channel.
+          initBuilder.create<BindPortOp>(loc, instDecl, portId,
+                                         writeOp.getDest());
+          writeOp->erase();
+          continue;
+        }
+      }
+
+      // Otherwise, create an intermediate signal.
+      Type sigType =
+          SignalType::get(getSignalBaseType(portInfo[i + numInputs].type));
+      Value channel = stateBuilder.create<SignalOp>(loc, sigType, signalName);
+      initBuilder.create<BindPortOp>(loc, instDecl, portId, channel);
+      auto instOut = rewriter.create<SignalReadOp>(loc, channel);
+      output.replaceAllUsesWith(instOut);
+    }
+
+    rewriter.eraseOp(instanceOp);
+    return success();
   }
 };
 
@@ -167,11 +271,65 @@ static void populateLegality(ConversionTarget &target) {
   target.addLegalDialect<mlir::BuiltinDialect>();
   target.addLegalDialect<systemc::SystemCDialect>();
   target.addLegalDialect<comb::CombDialect>();
+  target.addLegalDialect<emitc::EmitCDialect>();
   target.addLegalOp<hw::ConstantOp>();
 }
 
-static void populateOpConversion(RewritePatternSet &patterns) {
-  patterns.add<ConvertHWModule, ConvertOutput>(patterns.getContext());
+static void populateOpConversion(RewritePatternSet &patterns,
+                                 TypeConverter &typeConverter) {
+  patterns.add<ConvertHWModule, ConvertInstance>(typeConverter,
+                                                 patterns.getContext());
+}
+
+static void populateTypeConversion(TypeConverter &converter) {
+  converter.addConversion([](Type type) { return type; });
+  converter.addConversion([&](SignalType type) {
+    return SignalType::get(converter.convertType(type.getBaseType()));
+  });
+  converter.addConversion([&](InputType type) {
+    return InputType::get(converter.convertType(type.getBaseType()));
+  });
+  converter.addConversion([&](systemc::InOutType type) {
+    return systemc::InOutType::get(converter.convertType(type.getBaseType()));
+  });
+  converter.addConversion([&](OutputType type) {
+    return OutputType::get(converter.convertType(type.getBaseType()));
+  });
+  converter.addConversion([](IntegerType type) -> Type {
+    auto bw = type.getIntOrFloatBitWidth();
+    if (bw == 1)
+      return type;
+
+    if (bw <= 64) {
+      if (type.isSigned())
+        return systemc::IntType::get(type.getContext(), bw);
+
+      return UIntType::get(type.getContext(), bw);
+    }
+
+    if (bw <= 512) {
+      if (type.isSigned())
+        return BigIntType::get(type.getContext(), bw);
+
+      return BigUIntType::get(type.getContext(), bw);
+    }
+
+    return BitVectorType::get(type.getContext(), bw);
+  });
+
+  converter.addSourceMaterialization(
+      [](OpBuilder &builder, Type type, ValueRange values, Location loc) {
+        assert(values.size() == 1);
+        auto op = builder.create<ConvertOp>(loc, type, values[0]);
+        return op.getResult();
+      });
+
+  converter.addTargetMaterialization(
+      [](OpBuilder &builder, Type type, ValueRange values, Location loc) {
+        assert(values.size() == 1);
+        auto op = builder.create<ConvertOp>(loc, type, values[0]);
+        return op.getResult();
+      });
 }
 
 //===----------------------------------------------------------------------===//
@@ -194,11 +352,17 @@ void HWToSystemCPass::runOnOperation() {
   MLIRContext &context = getContext();
   ModuleOp module = getOperation();
 
+  // Create the include operation here to have exactly one 'systemc' include at
+  // the top instead of one per module.
+  OpBuilder builder(module.getRegion());
+  builder.create<emitc::IncludeOp>(module->getLoc(), "systemc.h", true);
+
   ConversionTarget target(context);
   TypeConverter typeConverter;
   RewritePatternSet patterns(&context);
   populateLegality(target);
-  populateOpConversion(patterns);
+  populateTypeConversion(typeConverter);
+  populateOpConversion(patterns, typeConverter);
 
   if (failed(applyFullConversion(module, target, std::move(patterns))))
     signalPassFailure();

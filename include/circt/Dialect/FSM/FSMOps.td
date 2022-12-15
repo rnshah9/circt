@@ -19,7 +19,7 @@ def HasCustomSSAName : DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResul
 def MachineOp : FSMOp<"machine", [
       FunctionOpInterface,
       Symbol, SymbolTable, NoTerminator,
-      HWModuleLike]> {
+      DeclareOpInterfaceMethods<HWModuleLike>]> {
   let summary = "Define a finite-state machine";
   let description = [{
     `fsm.machine` represents a finite-state machine, including a machine name,
@@ -29,6 +29,8 @@ def MachineOp : FSMOp<"machine", [
 
   let arguments = (ins StrAttr:$sym_name, StrAttr:$initialState,
                        TypeAttrOf<FunctionType>:$function_type,
+                       OptionalAttr<DictArrayAttr>:$arg_attrs,
+                       OptionalAttr<DictArrayAttr>:$res_attrs,
                        OptionalAttr<StrArrayAttr>:$argNames,
                        OptionalAttr<StrArrayAttr>:$resNames);
   let regions = (region SizedRegion<1>:$body);
@@ -47,11 +49,6 @@ def MachineOp : FSMOp<"machine", [
     /// Get the port information of the machine.
     void getHWPortInfo(SmallVectorImpl<hw::PortInfo> &);
 
-    /// Returns the type of this function.
-    FunctionType getFunctionType() {
-      return getFunctionTypeAttr().getValue().cast<FunctionType>();
-    }
-
     /// Returns the number of states in this machhine.
     size_t getNumStates() {
       auto stateOps = getBody().getOps<fsm::StateOp>();
@@ -69,7 +66,7 @@ def MachineOp : FSMOp<"machine", [
     LogicalResult verifyType() {
       auto type = getFunctionTypeAttr().getValue();
       if (!type.isa<FunctionType>())
-        return emitOpError("requires '" + getTypeAttrName() +
+        return emitOpError("requires '" + getFunctionTypeAttrName().getValue() +
                            "' attribute of function type");
       return success();
     }
@@ -79,6 +76,21 @@ def MachineOp : FSMOp<"machine", [
 
     /// Return the name of the i'th result of this machine.
     StringAttr getResName(size_t i);
+  }];
+
+  let extraClassDefinition = [{
+    size_t $cppClass::getNumPorts() {
+      auto machineType = getFunctionType();
+      return machineType.getNumInputs() + machineType.getNumResults();
+    }
+
+    circt::hw::InnerSymAttr $cppClass::getPortSymbolAttr(size_t portIndex) {
+      for (NamedAttribute argAttr :
+           mlir::function_interface_impl::getArgAttrs(*this, portIndex))
+        if (auto sym = argAttr.getValue().dyn_cast<circt::hw::InnerSymAttr>())
+          return sym;
+      return circt::hw::InnerSymAttr();
+    }
   }];
 
   let skipDefaultBuilders = 1;
@@ -100,7 +112,7 @@ def InstanceOp : FSMOp<"instance", [Symbol, HasCustomSSAName]> {
 
   let extraClassDeclaration = [{
     /// Lookup the machine for the symbol. This returns null on invalid IR.
-    MachineOp getMachine();
+    MachineOp getMachineOp();
   }];
 
   let hasVerifier = 1;
@@ -123,7 +135,7 @@ def TriggerOp : FSMOp<"trigger", []> {
 
   let extraClassDeclaration = [{
     /// Lookup the machine for the symbol. This returns null on invalid IR.
-    MachineOp getMachine();
+    MachineOp getMachineOp();
   }];
 
   let hasVerifier = 1;
@@ -152,22 +164,22 @@ def HWInstanceOp : FSMOp<"hw_instance", [
 
   let extraClassDeclaration = [{
     /// Lookup the machine for the symbol. This returns null on invalid IR.
-    MachineOp getMachine();
+    MachineOp getMachineOp();
 
     /// Module name is the same as the machine name.
     StringRef getModuleName() {
-      return machine();
+      return getMachine();
     }
     FlatSymbolRefAttr getModuleNameAttr() {
-      return machineAttr();
+      return getMachineAttr();
     }
 
     // HWInstanceLike interface
     StringRef getInstanceName() {
-      return sym_name();
+      return getSymName();
     }
     StringAttr getInstanceNameAttr() {
-      return sym_nameAttr();
+      return getSymNameAttr();
     }
   }];
 
@@ -198,7 +210,7 @@ def StateOp : FSMOp<"state", [HasParent<"MachineOp">, Symbol, NoTerminator]> {
 
     /// Returns the OutputOp of this state.
     OutputOp getOutputOp() {
-      auto outputOp = output().getOps<fsm::OutputOp>();
+      auto outputOp = getOutput().getOps<fsm::OutputOp>();
       assert(!outputOp.empty() &&
            "Expected an fsm.output op inside the state output region");
       return *outputOp.begin();
@@ -255,7 +267,7 @@ def TransitionOp : FSMOp<"transition", [HasParent<"StateOp">, NoTerminator]> {
 
   let extraClassDeclaration = [{
     /// Lookup the next state for the symbol. This returns null on invalid IR.
-    StateOp getNextState();
+    StateOp getNextStateOp();
 
     /// Get the current state, this should never fail.
     StateOp getCurrentState() {
@@ -264,18 +276,18 @@ def TransitionOp : FSMOp<"transition", [HasParent<"StateOp">, NoTerminator]> {
 
     /// Get the return operation of the guard region, this should never fail.
     ReturnOp getGuardReturn() {
-      assert(!guard().empty() && "this transition has no guard");
-      return cast<ReturnOp>(guard().front().getTerminator());
+      assert(!getGuard().empty() && "this transition has no guard");
+      return cast<ReturnOp>(getGuard().front().getTerminator());
     }
 
     /// Return whether this transition has a guard.
     bool hasGuard() {
-      return !guard().empty();
+      return !getGuard().empty();
     }
 
     /// Return whether this transition has an action.
     bool hasAction() {
-      return !action().empty();
+      return !getAction().empty();
     }
 
     /// Returns true if this transition is always taken.
@@ -343,7 +355,7 @@ def UpdateOp : FSMOp<"update", [HasParent<"TransitionOp">, SameTypeOperands]> {
 
   let extraClassDeclaration = [{
     /// Get the targeted variable operation. This returns null on invalid IR.
-    VariableOp getVariable();
+    VariableOp getVariableOp();
   }];
 
   let hasVerifier = 1;

@@ -42,9 +42,14 @@ static Attribute convertJSONToAttribute(MLIRContext *context,
     // that the Scala FIRRTL Compiler doesn't know about.
     auto unquotedValue = json::parse(*a);
     auto err = unquotedValue.takeError();
-    // If this parsed without an error, then it's more JSON and recurse on
-    // that.
-    if (!err)
+    // If this parsed without an error and we didn't just unquote a number, then
+    // it's more JSON and recurse on that.
+    //
+    // We intentionally do not want to unquote a number as, in JSON, the string
+    // "0" is different from the number 0.  If we conflate these, then later
+    // expectations about annotation structure may be broken.  I.e., an
+    // annotation expecting a string may see a number.
+    if (!err && !unquotedValue.get().getAsNumber())
       return convertJSONToAttribute(context, unquotedValue.get(), p);
     // If there was an error, then swallow it and handle this as a string.
     handleAllErrors(std::move(err), [&](const json::ParseError &a) {});
@@ -90,7 +95,7 @@ static Attribute convertJSONToAttribute(MLIRContext *context,
 /// Convert a JSON value containing OMIR JSON (an array of OMNodes), convert
 /// this to an OMIRAnnotation, and add it to a mutable `annotationMap` argument.
 bool circt::firrtl::fromOMIRJSON(json::Value &value, StringRef circuitTarget,
-                                 llvm::StringMap<ArrayAttr> &annotationMap,
+                                 SmallVectorImpl<Attribute> &annotations,
                                  json::Path path, MLIRContext *context) {
   // The JSON value must be an array of objects.  Anything else is reported as
   // invalid.
@@ -101,111 +106,12 @@ bool circt::firrtl::fromOMIRJSON(json::Value &value, StringRef circuitTarget,
     return false;
   }
 
-  // Build a mutable map of Target to Annotation.
-  SmallVector<Attribute> omnodes;
-  for (size_t i = 0, e = (*array).size(); i != e; ++i) {
-    auto *object = (*array)[i].getAsObject();
-    auto p = path.index(i);
-    if (!object) {
-      p.report("Expected OMIR to be an array of objects, but found an array of "
-               "something else.");
-      return false;
-    }
-
-    // Manually built up OMNode.
-    NamedAttrList omnode;
-
-    // Validate that this looks like an OMNode.  This should have three fields:
-    //   - "info": String
-    //   - "id": String that starts with "OMID:"
-    //   - "fields": Array<Object>
-    // Fields is optional and is a dictionary encoded as an array of objects:
-    //   - "info": String
-    //   - "name": String
-    //   - "value": JSON
-    // The dictionary is keyed by the "name" member and the array of fields is
-    // guaranteed to not have collisions of the "name" key.
-    auto maybeInfo = object->getString("info");
-    if (!maybeInfo) {
-      p.report("OMNode missing mandatory member \"info\" with type \"string\"");
-      return false;
-    }
-    auto maybeID = object->getString("id");
-    if (!maybeID || !maybeID->startswith("OMID:")) {
-      p.report("OMNode missing mandatory member \"id\" with type \"string\" "
-               "that starts with \"OMID:\"");
-      return false;
-    }
-    auto *maybeFields = object->get("fields");
-    if (maybeFields && !maybeFields->getAsArray()) {
-      p.report("OMNode has \"fields\" member with incorrect type (expected "
-               "\"array\")");
-      return false;
-    }
-    Attribute fields;
-    if (!maybeFields)
-      fields = DictionaryAttr::get(context, {});
-    else {
-      auto array = *maybeFields->getAsArray();
-      NamedAttrList fieldAttrs;
-      for (size_t i = 0, e = array.size(); i != e; ++i) {
-        auto *field = array[i].getAsObject();
-        auto pI = p.field("fields").index(i);
-        if (!field) {
-          pI.report("OMNode has field that is not an \"object\"");
-          return false;
-        }
-        auto maybeInfo = field->getString("info");
-        if (!maybeInfo) {
-          pI.report(
-              "OMField missing mandatory member \"info\" with type \"string\"");
-          return false;
-        }
-        auto maybeName = field->getString("name");
-        if (!maybeName) {
-          pI.report(
-              "OMField missing mandatory member \"name\" with type \"string\"");
-          return false;
-        }
-        auto *maybeValue = field->get("value");
-        if (!maybeValue) {
-          pI.report("OMField missing mandatory member \"value\"");
-          return false;
-        }
-        NamedAttrList values;
-        values.append("info", StringAttr::get(context, *maybeInfo));
-        values.append("value", convertJSONToAttribute(context, *maybeValue,
-                                                      pI.field("value")));
-        fieldAttrs.append(*maybeName, DictionaryAttr::get(context, values));
-      }
-      fields = DictionaryAttr::get(context, fieldAttrs);
-    }
-
-    omnode.append("info", StringAttr::get(context, *maybeInfo));
-    omnode.append("id", convertJSONToAttribute(context, *object->get("id"),
-                                               p.field("id")));
-    omnode.append("fields", fields);
-    omnodes.push_back(DictionaryAttr::get(context, omnode));
-  }
-
   NamedAttrList omirAnnoFields;
   omirAnnoFields.append("class", StringAttr::get(context, omirAnnoClass));
   omirAnnoFields.append("nodes", convertJSONToAttribute(context, value, path));
 
   DictionaryAttr omirAnno = DictionaryAttr::get(context, omirAnnoFields);
-
-  // If no circuit annotations exist, just insert the OMIRAnnotation.
-  auto &oldAnnotations = annotationMap[rawAnnotations];
-  if (!oldAnnotations) {
-    oldAnnotations = ArrayAttr::get(context, {omirAnno});
-    return true;
-  }
-
-  // Rewrite the ArrayAttr for the circuit.
-  SmallVector<Attribute> newAnnotations(oldAnnotations.begin(),
-                                        oldAnnotations.end());
-  newAnnotations.push_back(omirAnno);
-  oldAnnotations = ArrayAttr::get(context, newAnnotations);
+  annotations.push_back(omirAnno);
 
   return true;
 }
@@ -215,7 +121,7 @@ bool circt::firrtl::fromOMIRJSON(json::Value &value, StringRef circuitTarget,
 /// checked, at runtime, to be an array of objects.  Returns true if successful,
 /// false if unsuccessful.
 bool circt::firrtl::fromJSONRaw(json::Value &value, StringRef circuitTarget,
-                                SmallVectorImpl<Attribute> &attrs,
+                                SmallVectorImpl<Attribute> &annotations,
                                 json::Path path, MLIRContext *context) {
 
   // The JSON value must be an array of objects.  Anything else is reported as
@@ -248,7 +154,7 @@ bool circt::firrtl::fromJSONRaw(json::Value &value, StringRef circuitTarget,
       return false;
     }
 
-    attrs.push_back(DictionaryAttr::get(context, metadata));
+    annotations.push_back(DictionaryAttr::get(context, metadata));
   }
 
   return true;

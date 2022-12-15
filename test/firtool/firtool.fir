@@ -1,9 +1,8 @@
 ; RUN: firtool %s --format=fir --ir-fir    | circt-opt | FileCheck %s --check-prefix=MLIR
-; RUN: firtool %s --format=fir --ir-fir --annotation-file %s.anno.json,%s.anno.1.json | circt-opt | FileCheck %s --check-prefix=ANNOTATIONS
-; RUN: firtool %s --format=fir --ir-fir --annotation-file %s.anno.json --annotation-file %s.anno.1.json | circt-opt | FileCheck %s --check-prefix=ANNOTATIONS
+; RUN: firtool %s --format=fir --parse-only --annotation-file %s.anno.json,%s.anno.1.json | circt-opt | FileCheck %s --check-prefix=ANNOTATIONS
+; RUN: firtool %s --format=fir --parse-only --annotation-file %s.anno.json --annotation-file %s.anno.1.json | circt-opt | FileCheck %s --check-prefix=ANNOTATIONS
 ; RUN: firtool %s --format=fir --ir-hw | circt-opt | FileCheck %s --check-prefix=MLIRLOWER
 ; RUN: firtool %s --format=fir -verilog | FileCheck %s --check-prefix=VERILOG
-; RUN: firtool %s --annotation-file %s.anno.json,%s.anno.1.json --parse-only | FileCheck %s --check-prefix=RAWANNOTATIONS
 ; RUN: firtool %s --omir-file %s.omir.anno.json --parse-only | circt-opt -firrtl-lower-annotations | FileCheck %s --check-prefix=OMIR
 ; RUN: firtool %s --omir-file %s.omir.anno.json --output-omir meta.omir.json --verilog | FileCheck %s --check-prefix=OMIROUT
 ; RUN: firtool %s --format=fir --ir-verilog | circt-opt | FileCheck %s --check-prefix=VERILOG-IR
@@ -19,26 +18,20 @@ circuit test_mod : %[[{"class": "circt.testNT", "data": "a"}]]
 ; ANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitTarget Annotation"}
 ; ANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitName Annotation"}
 
-; RAWANNOTATIONS-LABEL: firrtl.circuit "test_mod"
-; RAWANNOTATIONS-SAME: {class = "circt.testNT", data = "a"}
-; RAWANNOTATIONS-SAME: {class = "circt.testNT", info = "a NoTargetAnnotation"}
-; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitTarget Annotation", target = "~test_mod"}
-; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a ModuleTarget Annotation", target = "~test_mod|test_mod"}
-; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a CircuitName Annotation", target = "test_mod"}
-; RAWANNOTATIONS-SAME: {class = "circt.test", info = "a ModuleName Annotation", target = "test_mod.test_mod"}
-
-; OMIR:       #loc0 = loc(fused["Foo.scala":64:64, "Bar.scala":128:128])
-; OMIR-NEXT:  #loc1 = loc("Foo.scala":32:32)
+; OMIR-DAG:   [[loc2:#loc[0-9]*]] = loc("Foo.scala":64:64) 
+; OMIR-DAG:   [[loc3:#loc[0-9]*]] = loc("Bar.scala":128:128) 
+; OMIR-DAG:   [[loc0:#loc[0-9]*]] = loc(fused[[[loc2]], [[loc3]]])
+; OMIR-DAG:   [[loc1:#loc[0-9]*]] = loc("Foo.scala":32:32)
 ; OMIR-LABEL: firrtl.circuit "test_mod"
 ; OMIR-SAME:  {class = "freechips.rocketchip.objectmodel.OMIRAnnotation",
 ; OMIR-SAME:   nodes = [
 ; OMIR-SAME:     {fields = {
 ; OMIR-SAME:        stringVal = {
 ; OMIR-SAME:          index = 0 : i64,
-; OMIR-SAME:          info = #loc0,
+; OMIR-SAME:          info = [[loc0]],
 ; OMIR-SAME:          value = "OMString:hello"}},
 ; OMIR-SAME:      id = "OMID:0",
-; OMIR-SAME:      info = #loc1}]}
+; OMIR-SAME:      info = [[loc1]]}]}
 
 
 ; OMIROUT-LABEL: FILE "meta.omir.json" -----
@@ -101,7 +94,7 @@ circuit test_mod : %[[{"class": "circt.testNT", "data": "a"}]]
     out_multibitMux <= multibitMux.b
 
 
-; MLIR-LABEL: firrtl.module @test_mod(in %clock: !firrtl.clock, in %a: !firrtl.uint<1>, in %b: !firrtl.uint<2>, out %c: !firrtl.uint<1>, in %vec_0: !firrtl.uint<1>, in %vec_1: !firrtl.uint<1>, in %vec_2: !firrtl.uint<1>, out %out_implicitTrunc: !firrtl.uint<1>, out %out_prettifyExample: !firrtl.uint<1>, out %out_multibitMux: !firrtl.uint<1>) {
+; MLIR-LABEL: firrtl.module @test_mod(in %clock: !firrtl.clock, in %a: !firrtl.uint<1>, in %b: !firrtl.uint<2>, out %c: !firrtl.uint<1>, in %vec_0: !firrtl.uint<1>, in %vec_1: !firrtl.uint<1>, in %vec_2: !firrtl.uint<1>, out %out_implicitTrunc: !firrtl.uint<1>, out %out_prettifyExample: !firrtl.uint<1>, out %out_multibitMux: !firrtl.uint<1>) {{.*}}{
 ; MLIR-NEXT:    %cat_a, %cat_b, %cat_c, %cat_d = firrtl.instance cat @Cat(in a: !firrtl.uint<2>, in b: !firrtl.uint<2>, in c: !firrtl.uint<2>, out d: !firrtl.uint<6>)
 ; MLIR-NEXT:    firrtl.strictconnect %cat_a, %b : !firrtl.uint<2>
 ; MLIR-NEXT:    firrtl.strictconnect %cat_b, %b : !firrtl.uint<2>
@@ -150,7 +143,6 @@ circuit test_mod : %[[{"class": "circt.testNT", "data": "a"}]]
 ; VERILOG-NEXT:    wire [2:0] _implicitTrunc_out1;
 ; VERILOG-NEXT:    wire [2:0] _implicitTrunc_out2;
 ; VERILOG-NEXT:    wire [5:0] _cat_d;
-; VERILOG-EMPTY:
 ; VERILOG-NEXT:    Cat cat (
 ; VERILOG-NEXT:      .a (b),
 ; VERILOG-NEXT:      .b (b),
@@ -214,7 +206,7 @@ circuit test_mod : %[[{"class": "circt.testNT", "data": "a"}]]
 ; MLIRLOWER-NEXT:    %0 = comb.extract %inp_2 from 4 : (i5) -> i1
 ; MLIRLOWER-NEXT:    %1 = comb.concat %0, %inp_2 : i1, i5
 ; MLIRLOWER-NEXT:    %2 = comb.concat %c0_i5, %inp_1 : i5, i1
-; MLIRLOWER-NEXT:    %3 = comb.shl %1, %2 : i6
+; MLIRLOWER-NEXT:    %3 = comb.shl bin %1, %2 : i6
 ; MLIRLOWER-NEXT:    %4 = comb.extract %3 from 0 : (i6) -> i3
 ; MLIRLOWER-NEXT:    %5 = comb.extract %inp_2 from 0 : (i5) -> i3
 ; MLIRLOWER-NEXT:    hw.output %4, %5 : i3, i3
@@ -274,12 +266,12 @@ circuit test_mod : %[[{"class": "circt.testNT", "data": "a"}]]
     output b : UInt<1>
     b <= a[sel]
 ; VERILOG-LABEL: module MultibitMux(
-; VERILOG:       wire [[T1:.*]];
-; VERILOG-EMPTY:
-; VERILOG-NEXT:  wire [2:0] [[T2:.*]] =
-; VERILOG-SAME{LITERAL}: {{a_2}, {a_1}, {a_0}};
-; VERILOG-NEXT:  assign [[T1]] = [[T2]][sel] /* cadence map_to_mux */; /* synopsys infer_mux_override */
-; VERILOG-NEXT:  assign b = &sel ? a_0 : [[T1]];
+; VERILOG:  wire [3:0] [[T2:.*]] =
+; VERILOG-SAME{LITERAL}: {{a_0}, {a_2}, {a_1}, {a_0}};
+; VERILOG:  wire [[T1:.*]];
+; VERILOG-NEXT:  /* synopsys infer_mux_override */
+; VERILOG-NEXT:  assign [[T1]] = [[T2]][sel] /* cadence map_to_mux */;
+; VERILOG-NEXT:  assign b = [[T1]];
 
   module UnusedPortsMod :
     input in : UInt<1>

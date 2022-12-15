@@ -134,7 +134,7 @@ LowerMemoryPass::getMemoryModulePorts(const FirMemory &mem) {
   auto addPort = [&](const Twine &name, FIRRTLType type, Direction direction) {
     auto nameAttr = StringAttr::get(context, name);
     ports.push_back(
-        {nameAttr, type, direction, InnerSymAttr{}, loc, annotations});
+        {nameAttr, type, direction, hw::InnerSymAttr{}, loc, annotations});
   };
 
   auto makePortCommon = [&](StringRef prefix, size_t idx, FIRRTLType addrType) {
@@ -178,10 +178,12 @@ LowerMemoryPass::emitMemoryModule(MemOp op, const FirMemory &mem,
   // Insert the memory module at the bottom of the circuit.
   auto b = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
   ++numCreatedMemModules;
-  return b.create<FMemModuleOp>(mem.loc, moduleName, ports, mem.numReadPorts,
-                                mem.numWritePorts, mem.numReadWritePorts,
-                                mem.dataWidth, mem.maskBits, mem.readLatency,
-                                mem.writeLatency, mem.depth);
+  auto moduleOp = b.create<FMemModuleOp>(
+      mem.loc, moduleName, ports, mem.numReadPorts, mem.numWritePorts,
+      mem.numReadWritePorts, mem.dataWidth, mem.maskBits, mem.readLatency,
+      mem.writeLatency, mem.depth);
+  SymbolTable::setSymbolVisibility(moduleOp, SymbolTable::Visibility::Private);
+  return moduleOp;
 }
 
 FMemModuleOp
@@ -220,6 +222,7 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
   // Create the wrapper module, inserting it into the bottom of the circuit.
   auto b = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
   auto wrapper = b.create<FModuleOp>(mem->getLoc(), wrapperName, ports);
+  SymbolTable::setSymbolVisibility(wrapper, SymbolTable::Visibility::Private);
 
   // Create an instance of the external memory module. The instance has the
   // same name as the target module.
@@ -268,7 +271,8 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
     if (newNLAIter == processedNLAs.end()) {
 
       // Update the NLA path to have the additional wrapper module.
-      auto nla = dyn_cast<HierPathOp>(symbolTable->lookup(nlaSym.getAttr()));
+      auto nla =
+          dyn_cast<hw::HierPathOp>(symbolTable->lookup(nlaSym.getAttr()));
       auto namepath = nla.getNamepath().getValue();
       SmallVector<Attribute> newNamepath(namepath.begin(), namepath.end());
       if (!nla.isComponent())
@@ -279,7 +283,7 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
       newNamepath.push_back(leafAttr);
 
       nlaBuilder.setInsertionPointAfter(nla);
-      auto newNLA = cast<HierPathOp>(nlaBuilder.clone(*nla));
+      auto newNLA = cast<hw::HierPathOp>(nlaBuilder.clone(*nla));
       newNLA.setSymNameAttr(StringAttr::get(
           context, circuitNamespace.newName(nla.getNameAttr().getValue())));
       newNLA.setNamepathAttr(ArrayAttr::get(context, newNamepath));
@@ -293,7 +297,7 @@ void LowerMemoryPass::lowerMemory(MemOp mem, const FirMemory &summary,
     return true;
   });
   if (nlaUpdated) {
-    memInst.setInnerSymAttr(InnerSymAttr::get(leafSym));
+    memInst.setInnerSymAttr(hw::InnerSymAttr::get(leafSym));
     AnnotationSet newAnnos(memInst);
     newAnnos.addAnnotations(newMemModAnnos);
     newAnnos.applyToOperation(memInst);

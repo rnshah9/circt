@@ -20,6 +20,7 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
+#include <numeric>
 
 #define DEBUG_TYPE "lower-memory"
 
@@ -54,6 +55,12 @@ struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
       // How many mask bits each field type requires.
       SmallVector<unsigned> maskWidths;
 
+      // Cannot flatten a memory if it has debug ports, because debug port
+      // implies a memtap and we cannot transform the datatype for a memory that
+      // is tapped.
+      for (auto res : memOp.getResults())
+        if (res.getType().cast<FIRRTLType>().isa<RefType>())
+          return;
       // If subannotations present on aggregate fields, we cannot flatten the
       // memory. It must be split into one memory per aggregate field.
       // Do not overwrite the pass flag!
@@ -62,17 +69,21 @@ struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
 
       SmallVector<Operation *, 8> flatData;
       SmallVector<int32_t> memWidths;
+      size_t memFlatWidth = 0;
       // Get the width of individual aggregate leaf elements.
       for (auto f : flatMemType) {
         LLVM_DEBUG(llvm::dbgs() << "\n field type:" << f);
-        memWidths.push_back(f.getWidth().value());
+        auto w = f.getWidth().value();
+        memWidths.push_back(w);
+        memFlatWidth += w;
       }
+      // If all the widths are zero, ignore the memory.
+      if (!memFlatWidth)
+        return;
       maskGran = memWidths[0];
-      size_t memFlatWidth = 0;
       // Compute the GCD of all data bitwidths.
       for (auto w : memWidths) {
-        memFlatWidth += w;
-        maskGran = llvm::GreatestCommonDivisor64(maskGran, w);
+        maskGran = std::gcd(maskGran, w);
       }
       for (auto w : memWidths) {
         // How many mask bits required for each flattened field.
@@ -137,7 +148,7 @@ struct FlattenMemoryPass : public FlattenMemoryBase<FlattenMemoryPass> {
           } else {
             // Cast the input aggregate write data to flat type.
             // Cast the input aggregate write data to flat type.
-            auto newFieldType = newField.getType().cast<FIRRTLType>();
+            auto newFieldType = newField.getType().cast<FIRRTLBaseType>();
             auto oldFieldBitWidth = getBitWidth(oldField.getType());
             // Following condition is true, if a data field is 0 bits. Then
             // newFieldType is of smaller bits than old.
@@ -203,7 +214,8 @@ private:
           })
           .Default([&](auto) { return false; });
     };
-    if (flatten(type) && !results.empty())
+    // Return true only if this is an aggregate with more than one element.
+    if (flatten(type) && results.size() > 1)
       return true;
     return false;
   }

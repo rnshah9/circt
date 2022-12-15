@@ -9,8 +9,9 @@
 include "circt/Dialect/HW/HWTypes.td"
 include "mlir/IR/RegionKindInterface.td"
 
-def ServiceDeclOp : ESI_Op<"service.decl",
-          [SingleBlock, NoTerminator, HasParent<"::mlir::ModuleOp">, Symbol]> {
+def CustomServiceDeclOp : ESI_Op<"service.decl",
+          [SingleBlock, NoTerminator, HasParent<"::mlir::ModuleOp">,
+          Symbol, DeclareOpInterfaceMethods<ServiceDeclOpInterface>]> {
   let summary = "An ESI service interface declaration";
   let description = [{
     A declaration of an ESI service interface. Defines a contract between a
@@ -35,22 +36,34 @@ def ServiceDeclOp : ESI_Op<"service.decl",
 }
 
 def ToServerOp : ESI_Op<"service.to_server",
-                        [HasParent<"::circt::esi::ServiceDeclOp">]> {
+                        [HasParent<"::circt::esi::CustomServiceDeclOp">]> {
   let summary = "An ESI service port headed to the service";
 
-  let arguments = (ins SymbolNameAttr:$inner_sym, TypeAttr:$type);
+  let arguments = (ins SymbolNameAttr:$inner_sym, TypeAttr:$toServerType);
   let assemblyFormat = [{
-    $inner_sym attr-dict `:` $type
+    $inner_sym attr-dict `:` $toServerType
   }];
 }
 
 def ToClientOp : ESI_Op<"service.to_client",
-                        [HasParent<"::circt::esi::ServiceDeclOp">]> {
+                        [HasParent<"::circt::esi::CustomServiceDeclOp">]> {
   let summary = "An ESI service port headed to a particular client";
 
-  let arguments = (ins SymbolNameAttr:$inner_sym, TypeAttr:$type);
+  let arguments = (ins SymbolNameAttr:$inner_sym, TypeAttr:$toClientType);
   let assemblyFormat = [{
-    $inner_sym  attr-dict `:` $type
+    $inner_sym  attr-dict `:` $toClientType
+  }];
+}
+
+def ServiceDeclInOutOp : ESI_Op<"service.inout",
+                        [HasParent<"::circt::esi::CustomServiceDeclOp">]> {
+  let summary = "An ESI service port which has both directions";
+
+  let arguments = (ins SymbolNameAttr:$inner_sym,
+                       TypeAttr:$toServerType, TypeAttr:$toClientType);
+  let assemblyFormat = [{
+    $inner_sym attr-dict
+    `:` qualified($toServerType) `->` qualified($toClientType)
   }];
 }
 
@@ -65,6 +78,10 @@ def ServiceInstanceOp : ESI_Op<"service.instance"> {
     creating the necessary ESI channel ports, groups them appropriately, then
     replaces this op with a `service.impl_req`.
 
+    If 'service_symbol' isn't specified, this instance will be used to implement
+    all of the service requests which get surfaced to here. This option is
+    generally used at the top level to specify host connectivity.
+
     Since implementing the server will usually need "normal" I/O, `inputs` and
     `results` act like normal `hw.instance` ports.
 
@@ -72,13 +89,13 @@ def ServiceInstanceOp : ESI_Op<"service.instance"> {
     implementation to use for this service.
   }];
 
-  let arguments = (ins FlatSymbolRefAttr:$service_symbol,
-                       AnyAttr:$impl_type,
+  let arguments = (ins OptionalAttr<FlatSymbolRefAttr>:$service_symbol,
+                       StrAttr:$impl_type,
                        OptionalAttr<DictionaryAttr>:$impl_opts,
                        Variadic<AnyType>:$inputs);
   let results = (outs Variadic<AnyType>);
   let assemblyFormat = [{
-    $service_symbol `impl` `as` $impl_type (`opts` $impl_opts^)?
+    (`svc` $service_symbol^)? `impl` `as` $impl_type (`opts` $impl_opts^)?
       `(` $inputs `)` attr-dict `:` functional-type($inputs, results)
   }];
 }
@@ -96,15 +113,24 @@ def ServiceImplementReqOp : ESI_Op<"service.impl_req", [NoTerminator]> {
     implementation.
   }];
 
-  let arguments = (ins FlatSymbolRefAttr:$service_symbol,
-                       AnyAttr:$impl_type,
+  let arguments = (ins OptionalAttr<FlatSymbolRefAttr>:$service_symbol,
+                       StrAttr:$impl_type,
                        OptionalAttr<DictionaryAttr>:$impl_opts,
                        Variadic<AnyType>:$inputs);
   let results = (outs Variadic<AnyType>:$outputs);
   let regions = (region SizedRegion<1>:$portReqs);
 
+  let extraClassDeclaration = [{
+    /// Find pairs of toServer and toClient requests with the same client path.
+    /// In cases where there doesn't exist a pair, one of the two entries will
+    /// be null. Should never contain a pair with both entries null.
+    void gatherPairedReqs(
+      llvm::SmallVectorImpl<std::pair<RequestToServerConnectionOp,
+                                      RequestToClientConnectionOp>>&);
+  }];
+
   let assemblyFormat = [{
-    $service_symbol `impl` `as` $impl_type (`opts` $impl_opts^)?
+    (`svc` $service_symbol^)? `impl` `as` $impl_type (`opts` $impl_opts^)?
      `(` $inputs `)` attr-dict `:` functional-type($inputs, results)
       $portReqs
   }];
@@ -115,10 +141,10 @@ def RequestToServerConnectionOp : ESI_Op<"service.req.to_server", [
   let summary = "Request a connection to send data";
 
   let arguments = (ins HWInnerRefAttr:$servicePort,
-                       ChannelType:$sending, StrArrayAttr:$clientNamePath);
+                       ChannelType:$toServer, StrArrayAttr:$clientNamePath);
   let assemblyFormat = [{
-    $sending `->` $servicePort `(` $clientNamePath `)`
-      attr-dict `:` qualified(type($sending))
+    $toServer `->` $servicePort `(` $clientNamePath `)`
+      attr-dict `:` qualified(type($toServer))
   }];
 }
 
@@ -128,9 +154,40 @@ def RequestToClientConnectionOp : ESI_Op<"service.req.to_client", [
 
   let arguments = (ins HWInnerRefAttr:$servicePort,
                        StrArrayAttr:$clientNamePath);
-  let results = (outs ChannelType:$receiving);
+  let results = (outs ChannelType:$toClient);
   let assemblyFormat = [{
     $servicePort `(` $clientNamePath `)`
-      attr-dict `:` qualified(type($receiving))
+      attr-dict `:` qualified(type($toClient))
+  }];
+}
+
+def RequestInOutChannelOp : ESI_Op<"service.req.inout", [
+        DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Request a bidirectional channel";
+
+  let arguments = (ins HWInnerRefAttr:$servicePort,
+                       ChannelType:$toServer,
+                       StrArrayAttr:$clientNamePath);
+  let results = (outs ChannelType:$toClient);
+
+  let assemblyFormat = [{
+    $toServer `->` $servicePort `(` $clientNamePath `)` attr-dict `:`
+      qualified(type($toServer)) `->` qualified(type($toClient))
+  }];
+}
+
+def ServiceHierarchyMetadataOp : ESI_Op<"service.hierarchy.metadata", [
+        DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Metadata about a service in the service hierarchy";
+
+  let arguments = (ins OptionalAttr<FlatSymbolRefAttr>:$service_symbol,
+                       ArrayAttr:$serverNamePath,
+                       StrAttr:$impl_type,
+                       OptionalAttr<DictionaryAttr>:$impl_details,
+                       ArrayAttr:$clients);
+  let assemblyFormat = [{
+    `path` $serverNamePath (`implementing` $service_symbol^)?
+      `impl` `as` $impl_type (`opts` $impl_details^)?
+      `clients` $clients attr-dict 
   }];
 }

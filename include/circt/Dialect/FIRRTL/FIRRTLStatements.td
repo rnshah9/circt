@@ -30,14 +30,14 @@ def ConnectOp : FIRRTLOp<"connect", [FConnectLike]> {
     ```
     }];
 
-  let arguments = (ins FIRRTLType:$dest, FIRRTLType:$src);
+  let arguments = (ins ConnectableType:$dest, ConnectableType:$src);
   let results = (outs);
 
   let assemblyFormat =
     "$dest `,` $src  attr-dict `:` qualified(type($dest)) `,` qualified(type($src))";
 
   let hasVerifier = 1;
-  let hasCanonicalizeMethod = true;
+  let hasCanonicalizer = true;
 }
 
 def StrictConnectOp : FIRRTLOp<"strictconnect", [SameTypeOperands, FConnectLike]> {
@@ -49,7 +49,8 @@ def StrictConnectOp : FIRRTLOp<"strictconnect", [SameTypeOperands, FConnectLike]
     ```
     }];
 
-  let arguments = (ins SizedType:$dest, SizedType:$src);
+  let arguments = (ins SizedBaseOrRefTypeOrForeignType:$dest,
+                       SizedBaseOrRefTypeOrForeignType:$src);
   let results = (outs);
   let hasCanonicalizeMethod = true;
 
@@ -63,7 +64,7 @@ def PrintFOp : FIRRTLOp<"printf"> {
   let summary = "Formatted Print Statement";
 
   let arguments = (ins ClockType:$clock, UInt1Type:$cond, StrAttr:$formatString,
-                       Variadic<FIRRTLType>:$substitutions, StrAttr:$name);
+                       Variadic<FIRRTLBaseType>:$substitutions, StrAttr:$name);
   let results = (outs);
 
   let assemblyFormat = [{
@@ -72,7 +73,7 @@ def PrintFOp : FIRRTLOp<"printf"> {
   }];
 }
 
-def SkipOp : FIRRTLOp<"skip", [NoSideEffect]> {
+def SkipOp : FIRRTLOp<"skip", [Pure]> {
   let summary = "Skip statement";
   let description = [{
     Skip Statement:
@@ -144,7 +145,7 @@ def CoverOp : VerifOp<"cover"> {
 }
 
 def WhenOp : FIRRTLOp<"when", [SingleBlock, NoTerminator, NoRegionArguments,
-                               RecursiveSideEffects]> {
+                               RecursiveMemoryEffects, RecursivelySpeculatable]> {
   let summary = "When Statement";
   let description = [{
     The "firrtl.when" operation represents a conditional.  Connections within
@@ -199,7 +200,7 @@ def WhenOp : FIRRTLOp<"when", [SingleBlock, NoTerminator, NoRegionArguments,
 def ForceOp : FIRRTLOp<"force", [SameTypeOperands]> {
   let summary = "Force procedural statement";
   let description = "Maps to the corresponding `sv.force` operation.";
-  let arguments = (ins FIRRTLType:$dest, FIRRTLType:$src);
+  let arguments = (ins FIRRTLBaseType:$dest, FIRRTLBaseType:$src);
   let results = (outs);
   let assemblyFormat =
     "$dest `,` $src attr-dict `:` qualified(type($dest)) `,` qualified(type($src))";
@@ -210,9 +211,8 @@ def ProbeOp : FIRRTLOp<"probe"> {
   let description = [{
     Captures values without binding to any accidental name.
   }];
-  let arguments = (ins SymbolNameAttr:$inner_sym, Variadic<FIRRTLType>:$captured);
+  let arguments = (ins SymbolNameAttr:$inner_sym, Variadic<FIRRTLBaseType>:$captured);
   let results = (outs);
 
   let assemblyFormat = "$inner_sym attr-dict ( `,` $captured^  `:` qualified(type($captured)))?";
 }
-

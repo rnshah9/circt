@@ -24,8 +24,7 @@ firrtl.module @X(in %b : !firrtl.uint<32>, in %d : !firrtl.uint<16>, in %out : !
 // expected-error @+1 {{'firrtl.circuit' op must contain one module that matches main name 'MyCircuit'}}
 firrtl.circuit "MyCircuit" {
 
-"firrtl.module"() ( {
-}) { type = () -> ()} : () -> ()
+firrtl.module @X() {}
 
 }
 
@@ -48,13 +47,6 @@ firrtl.module @Bar() {}
 
 // expected-error @+1 {{'firrtl.circuit' op must have a non-empty name}}
 firrtl.circuit "" {
-}
-
-// -----
-
-firrtl.circuit "foo" {
-// expected-error @+1 {{ports should all be FIRRTL types}}
-firrtl.module @foo(in %a: i1) {}
 }
 
 // -----
@@ -523,7 +515,7 @@ firrtl.circuit "MemoryZeroDepth" {
 
 firrtl.circuit "MemoryBadPortType" {
   firrtl.module @MemoryBadPortType() {
-    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port "r" (expected '!firrtl.bundle<...>'}}
+    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port "r"}}
     %memory_r = firrtl.mem Undefined {depth = 16 : i64, name = "memory", portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.uint<1>
   }
 }
@@ -541,7 +533,7 @@ firrtl.circuit "MemoryPortNamesCollide" {
 
 firrtl.circuit "MemoryUnexpectedNumberOfFields" {
   firrtl.module @MemoryUnexpectedNumberOfFields() {
-    // expected-error @+1 {{'firrtl.mem' op has an invalid number of fields on port "r" (expected 4 for read, 5 for write, or 7 for read/write)}}
+    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port "r"}}
     %memory_r = firrtl.mem Undefined {depth = 16 : i64, name = "memory", portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<a: uint<1>>
   }
 }
@@ -550,7 +542,7 @@ firrtl.circuit "MemoryUnexpectedNumberOfFields" {
 
 firrtl.circuit "MemoryMissingDataField" {
   firrtl.module @MemoryMissingDataField() {
-    // expected-error @+1 {{'firrtl.mem' op has no data field on port "r" (expected to see "data" for a read or write port or "rdata" for a read/write port)}}
+    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port}}
     %memory_r = firrtl.mem Undefined {depth = 16 : i64, name = "memory", portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<8>>
   }
 }
@@ -559,7 +551,7 @@ firrtl.circuit "MemoryMissingDataField" {
 
 firrtl.circuit "MemoryMissingDataField2" {
   firrtl.module @MemoryMissingDataField2() {
-    // expected-error @+1 {{'firrtl.mem' op has no data field on port "rw" (expected to see "data" for a read or write port or "rdata" for a read/write port)}}
+    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port}}
     %memory_rw = firrtl.mem Undefined {depth = 16 : i64, name = "memory2", portNames = ["rw"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, writedata: uint<8>, wmask: uint<1>>
   }
 }
@@ -586,7 +578,7 @@ firrtl.circuit "MemoryDataContainsAnalog" {
 
 firrtl.circuit "MemoryPortInvalidReadKind" {
   firrtl.module @MemoryPortInvalidReadKind() {
-    // expected-error @+1 {{'firrtl.mem' op has an invalid type for port "r" of determined kind "read" (expected '!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: uint<8>>', but got '!firrtl.bundle<BAD: uint<4>, en: uint<1>, clk: clock, data flip: uint<8>>')}}
+    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port}}
     %memory_r= firrtl.mem Undefined {depth = 16 : i64, name = "memory", portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<BAD: uint<4>, en: uint<1>, clk: clock, data flip: uint<8>>
   }
 }
@@ -595,7 +587,7 @@ firrtl.circuit "MemoryPortInvalidReadKind" {
 
 firrtl.circuit "MemoryPortInvalidWriteKind" {
   firrtl.module @MemoryPortInvalidWriteKind() {
-    // expected-error @+1 {{'firrtl.mem' op has an invalid type for port "w" of determined kind "write" (expected '!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<8>, mask: uint<1>>', but got '!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<8>, BAD: uint<1>>')}}
+    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port}}
     %memory_r= firrtl.mem Undefined {depth = 16 : i64, name = "memory", portNames = ["w"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data: uint<8>, BAD: uint<1>>
   }
 }
@@ -604,7 +596,7 @@ firrtl.circuit "MemoryPortInvalidWriteKind" {
 
 firrtl.circuit "MemoryPortInvalidReadWriteKind" {
   firrtl.module @MemoryPortInvalidReadWriteKind() {
-    // expected-error @+1 {{'firrtl.mem' op has an invalid type for port "rw" of determined kind "readwrite" (expected '!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>', but got '!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, BAD: uint<1>>')}}
+    // expected-error @+1 {{'firrtl.mem' op has an invalid type on port}}
     %memory_r= firrtl.mem Undefined {depth = 16 : i64, name = "memory", portNames = ["rw"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, BAD: uint<1>>
   }
 }
@@ -620,11 +612,42 @@ firrtl.circuit "MemoryPortsWithDifferentTypes" {
 
 // -----
 
-firrtl.circuit "SubfieldOpFieldError" {
+firrtl.circuit "SubfieldOpWithIntegerFieldIndex" {
   firrtl.module @SubfieldOpFieldError() {
     %w = firrtl.wire  : !firrtl.bundle<a: uint<2>, b: uint<2>>
-    // expected-error @+1 {{}}
-    %w_a = firrtl.subfield %w(2) : (!firrtl.bundle<a : uint<2>, b : uint<2>>) -> !firrtl.uint<2>
+    // expected-error @+1 {{'firrtl.subfield' expected valid keyword or string}}
+    %w_a = firrtl.subfield %w[2] : !firrtl.bundle<a : uint<2>, b : uint<2>>
+  }
+}
+
+// -----
+
+firrtl.circuit "SubfieldOpFieldUnknown" {
+  firrtl.module @SubfieldOpFieldError() {
+    %w = firrtl.wire  : !firrtl.bundle<a: uint<2>, b: uint<2>>
+    // expected-error @+1 {{'firrtl.subfield' unknown field c in bundle type '!firrtl.bundle<a: uint<2>, b: uint<2>>'}}
+    %w_a = firrtl.subfield %w[c] : !firrtl.bundle<a : uint<2>, b : uint<2>>
+  }
+}
+
+// -----
+
+firrtl.circuit "SubfieldOpInputTypeMismatch" {
+  firrtl.module @SubfieldOpFieldError() {
+    %w = firrtl.wire : !firrtl.bundle<a: uint<2>, b: uint<2>>
+    // expected-error @+2 {{use of value '%w' expects different type than prior uses}}
+    // expected-note  @-2 {{prior use here}}
+    %w_a = firrtl.subfield %w[a] : !firrtl.uint<1>
+  }
+}
+
+// -----
+
+firrtl.circuit "SubfieldOpNonBundleInputType" {
+  firrtl.module @SubfieldOpFieldError() {
+    %w = firrtl.wire : !firrtl.uint<1>
+    // expected-error @+1 {{'firrtl.subfield' input must be bundle type, got '!firrtl.uint<1>'}}
+    %w_a = firrtl.subfield %w[a] : !firrtl.uint<1>
   }
 }
 
@@ -663,7 +686,7 @@ firrtl.circuit "BitCast4" {
 firrtl.circuit "NLAWithNestedReference" {
 firrtl.module @NLAWithNestedReference() { }
 // expected-error @below {{only one nested reference is allowed}}
-firrtl.hierpath @nla [@A::@B::@C]
+hw.hierpath private @nla [@A::@B::@C]
 }
 
 // -----
@@ -671,8 +694,8 @@ firrtl.hierpath @nla [@A::@B::@C]
 
 firrtl.circuit "LowerToBind" {
  // expected-error @+1 {{the instance path cannot be empty/single element}}
-firrtl.hierpath @NLA1 []
-firrtl.hierpath @NLA2 [@LowerToBind::@s1]
+hw.hierpath private @NLA1 []
+hw.hierpath private @NLA2 [@LowerToBind::@s1]
 firrtl.module @InstanceLowerToBind() {}
 firrtl.module @LowerToBind() {
   firrtl.instance foo sym @s1 {lowerToBind} @InstanceLowerToBind()
@@ -684,8 +707,8 @@ firrtl.module @LowerToBind() {
 firrtl.circuit "NLATop" {
 
  // expected-error @+1 {{the instance path can only contain inner sym reference, only the leaf can refer to a module symbol}}
-  firrtl.hierpath @nla [@NLATop::@test, @Aardvark, @Zebra]
-  firrtl.hierpath @nla_1 [@NLATop::@test,@Aardvark::@test_1, @Zebra]
+  hw.hierpath private @nla [@NLATop::@test, @Aardvark, @Zebra]
+  hw.hierpath private @nla_1 [@NLATop::@test,@Aardvark::@test_1, @Zebra]
   firrtl.module @NLATop() {
     firrtl.instance test  sym @test @Aardvark()
     firrtl.instance test2 @Zebra()
@@ -704,8 +727,8 @@ firrtl.circuit "NLATop" {
 
 firrtl.circuit "NLATop1" {
   // expected-error @+1 {{instance path is incorrect. Expected module: "Aardvark" instead found: "Zebra"}}
-  firrtl.hierpath @nla [@NLATop1::@test, @Zebra::@test,@Aardvark::@test]
-  firrtl.hierpath @nla_1 [@NLATop1::@test,@Aardvark::@test_1, @Zebra]
+  hw.hierpath private @nla [@NLATop1::@test, @Zebra::@test,@Aardvark::@test]
+  hw.hierpath private @nla_1 [@NLATop1::@test,@Aardvark::@test_1, @Zebra]
   firrtl.module @NLATop1() {
     firrtl.instance test  sym @test @Aardvark()
     firrtl.instance test2 @Zebra()
@@ -730,8 +753,8 @@ firrtl.circuit "NLATop1" {
 // This should not error out. Note that there is no symbol on the %bundle. This handles a special case, when the nonlocal is applied to a subfield.
 firrtl.circuit "fallBackName" {
 
-  firrtl.hierpath @nla [@fallBackName::@test, @Aardvark::@test, @Zebra::@bundle]
-  firrtl.hierpath @nla_1 [@fallBackName::@test,@Aardvark::@test_1, @Zebra]
+  hw.hierpath private @nla [@fallBackName::@test, @Aardvark::@test, @Zebra::@bundle]
+  hw.hierpath private @nla_1 [@fallBackName::@test,@Aardvark::@test_1, @Zebra]
   firrtl.module @fallBackName() {
     firrtl.instance test  sym @test @Aardvark()
     firrtl.instance test2 @Zebra()
@@ -751,7 +774,7 @@ firrtl.circuit "fallBackName" {
 
 firrtl.circuit "Foo"   {
   // expected-error @+1 {{operation with symbol: #hw.innerNameRef<@Bar::@b> was not found}}
-  firrtl.hierpath @nla_1 [@Foo::@bar, @Bar::@b]
+  hw.hierpath private @nla_1 [@Foo::@bar, @Bar::@b]
   firrtl.module @Bar(in %a: !firrtl.uint<1>, out %b: !firrtl.bundle<baz: uint<1>, qux: uint<1>> [{circt.fieldID = 2 : i32, circt.nonlocal = @nla_1, three}], out %c: !firrtl.uint<1>) {
   }
   firrtl.module @Foo() {
@@ -763,9 +786,9 @@ firrtl.circuit "Foo"   {
 
 firrtl.circuit "Top"   {
  // Legal nla would be:
-//firrtl.hierpath @nla [@Top::@mid, @Mid::@leaf, @Leaf::@w]
+//hw.hierpath private @nla [@Top::@mid, @Mid::@leaf, @Leaf::@w]
   // expected-error @+1 {{instance path is incorrect. Expected module: "Middle" instead found: "Leaf"}}
-  firrtl.hierpath @nla [@Top::@mid, @Leaf::@w]
+  hw.hierpath private @nla [@Top::@mid, @Leaf::@w]
   firrtl.module @Leaf() {
     %w = firrtl.wire sym @w  {annotations = [{circt.nonlocal = @nla, class = "fake1"}]} : !firrtl.uint<3>
   }
@@ -782,7 +805,7 @@ firrtl.circuit "Top"   {
 firrtl.circuit "Top" {
   firrtl.module @Top (in %in : !firrtl.uint) {
     %a = firrtl.wire : !firrtl.uint
-    // expected-error @+1 {{op operand #0 must be a sized type}}
+    // expected-error @+1 {{op operand #0 must be a sized base or ref type}}
     firrtl.strictconnect %a, %in : !firrtl.uint
   }
 }
@@ -791,7 +814,7 @@ firrtl.circuit "Top" {
 
 firrtl.circuit "AnalogRegister" {
   firrtl.module @AnalogRegister(in %clock: !firrtl.clock) {
-    // expected-error @+1 {{'firrtl.reg' op result #0 must be a passive type that does not contain analog, but got '!firrtl.analog'}}
+    // expected-error @+1 {{'firrtl.reg' op result #0 must be a passive base type that does not contain analog, but got '!firrtl.analog'}}
     %r = firrtl.reg %clock : !firrtl.analog
   }
 }
@@ -800,7 +823,7 @@ firrtl.circuit "AnalogRegister" {
 
 firrtl.circuit "AnalogVectorRegister" {
   firrtl.module @AnalogVectorRegister(in %clock: !firrtl.clock) {
-    // expected-error @+1 {{'firrtl.reg' op result #0 must be a passive type that does not contain analog, but got '!firrtl.vector<analog, 2>'}}
+    // expected-error @+1 {{'firrtl.reg' op result #0 must be a passive base type that does not contain analog, but got '!firrtl.vector<analog, 2>'}}
     %r = firrtl.reg %clock : !firrtl.vector<analog, 2>
   }
 }
@@ -902,4 +925,172 @@ firrtl.circuit "DupSymField" {
     // expected-error @+1 {{redefinition of inner symbol named 'x'}}
     %w3 = firrtl.wire sym [<@x,1,public>] : !firrtl.vector<uint<1>,1>
   }
+}
+
+// -----
+// Node ops cannot have reference type
+
+firrtl.circuit "NonRefNode" {
+firrtl.module @NonRefNode(in %in1 : !firrtl.ref<uint<8>>) {
+  // expected-error @+1 {{'firrtl.node' op operand #0 must be a passive base type (contain no flips), but got '!firrtl.ref<uint<8>>'}}
+  %n1 = firrtl.node %in1 : !firrtl.ref<uint<8>>
+  %a = firrtl.wire : !firrtl.bundle<valid: uint<1>, ready: uint<1>, data: uint<64>>
+}
+}
+
+// -----
+// Registers cannot be reference type.
+
+firrtl.circuit "NonRefRegister" {
+  firrtl.module @NonRefRegister(in %clock: !firrtl.clock) {
+    // expected-error @+1 {{'firrtl.reg' op result #0 must be a passive base type that does not contain analog}}
+    %r = firrtl.reg %clock : !firrtl.ref<uint<8>>
+  }
+}
+
+// -----
+// Ref types must be ground
+
+firrtl.circuit "RefBundle" {
+  // expected-error @+1 {{reference base type must be passive}}
+  firrtl.module @RefBundle(in %in1 : !firrtl.ref<bundle<valid flip : uint<1>>>) {
+  }
+}
+
+// -----
+// Ref types cannot be ref
+
+firrtl.circuit "RefRef" {
+  // expected-error @+1 {{expected base type, found '!firrtl.ref<uint<1>>'}}
+  firrtl.module @RefRef(in %in1 : !firrtl.ref<ref<uint<1>>>) {
+  }
+}
+
+// -----
+// No ref in bundle
+
+firrtl.circuit "RefField" {
+  // expected-error @+1 {{expected base type, found '!firrtl.ref<uint<1>>'}}
+  firrtl.module @RefField(in %in1 : !firrtl.bundle<r: ref<uint<1>>>) {
+  }
+}
+
+// -----
+// Invalid
+
+firrtl.circuit "InvalidRef" {
+  firrtl.module @InvalidRef() {
+    // expected-error @+1 {{'firrtl.invalidvalue' op result #0 must be a base type, but got '!firrtl.ref<uint<1>>'}}
+    %0 = firrtl.invalidvalue : !firrtl.ref<uint<1>>
+  }
+}
+
+// -----
+// Mux ref
+
+firrtl.circuit "MuxRef" {
+  firrtl.module @MuxRef(in %a: !firrtl.ref<uint<1>>, in %b: !firrtl.ref<uint<1>>,
+                          in %cond: !firrtl.uint<1>) {
+    // expected-error @+1 {{'firrtl.mux' op operand #1 must be a passive base type (contain no flips), but got '!firrtl.ref<uint<1>>'}}
+    %a_or_b = firrtl.mux(%cond, %a, %b) : (!firrtl.uint<1>, !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>) -> !firrtl.ref<uint<1>>
+  }
+}
+
+// -----
+// Bitcast ref
+
+firrtl.circuit "BitcastRef" {
+  firrtl.module @BitcastRef(in %a: !firrtl.ref<uint<1>>) {
+    // expected-error @+1 {{'firrtl.bitcast' op operand #0 must be a base type, but got '!firrtl.ref<uint<1>>}}
+    %0 = firrtl.bitcast %a : (!firrtl.ref<uint<1>>) -> (!firrtl.ref<uint<1>>)
+  }
+}
+
+// -----
+// Cannot strictconnect unsized types, even when ref's.
+
+firrtl.circuit "Top" {
+  firrtl.module @Foo (in %in: !firrtl.ref<uint>) {}
+  firrtl.module @Top (in %in : !firrtl.ref<uint>) {
+    %foo_in = firrtl.instance foo @Foo(in in: !firrtl.ref<uint>)
+    // expected-error @+1 {{op operand #0 must be a sized base or ref type}}
+    firrtl.strictconnect %foo_in, %in : !firrtl.ref<uint>
+  }
+}
+
+// -----
+// Cannot connect different ref types
+
+firrtl.circuit "Top" {
+  firrtl.module @Foo (in %in: !firrtl.ref<uint<2>>) {}
+  firrtl.module @Top (in %in: !firrtl.ref<uint<1>>) {
+    %foo_in = firrtl.instance foo @Foo(in in: !firrtl.ref<uint<2>>)
+    // expected-error @+1 {{may not connect different non-base types}}
+    firrtl.connect %foo_in, %in : !firrtl.ref<uint<2>>, !firrtl.ref<uint<1>>
+  }
+}
+
+// -----
+// Check flow semantics for ref.send
+
+firrtl.circuit "Foo" {
+  // expected-note @+1 {{destination was defined here}}
+  firrtl.module @Foo(in  %_a: !firrtl.ref<uint<1>>) {
+    %a = firrtl.wire : !firrtl.uint<1>
+    %1 = firrtl.ref.send %a : !firrtl.uint<1>
+    // expected-error @+1 {{connect has invalid flow: the destination expression "_a" has source flow, expected sink or duplex flow}}
+    firrtl.strictconnect %_a, %1 : !firrtl.ref<uint<1>>
+  }
+}
+
+// -----
+// Output reference port cannot be reused
+
+firrtl.circuit "Bar" {
+  firrtl.module @Bar(out %_a: !firrtl.ref<uint<1>>) {
+    %x = firrtl.instance x @Bar2(out _a: !firrtl.ref<uint<1>>)
+    %y = firrtl.instance y @Bar2(out _a: !firrtl.ref<uint<1>>)
+    // expected-error @+1 {{output reference port cannot be reused by multiple operations, it can only capture a unique dataflow}}
+    firrtl.strictconnect %_a, %x : !firrtl.ref<uint<1>>
+    firrtl.strictconnect %_a, %y : !firrtl.ref<uint<1>>
+  }
+}
+
+// -----
+// Output reference port cannot be reused
+
+firrtl.circuit "Bar" {
+  firrtl.module @Bar(out %_a: !firrtl.ref<uint<1>>) {
+    %x = firrtl.instance x @Bar2(out _a: !firrtl.ref<uint<1>>)
+    %y = firrtl.wire : !firrtl.uint<1>
+    // expected-error @+1 {{output reference port cannot be reused by multiple operations, it can only capture a unique dataflow}}
+    firrtl.strictconnect %_a, %x : !firrtl.ref<uint<1>>
+    %1 = firrtl.ref.send %y : !firrtl.uint<1>
+    firrtl.strictconnect %_a, %1 : !firrtl.ref<uint<1>>
+  }
+}
+
+// -----
+// Output reference port cannot be reused
+
+firrtl.circuit "Bar" {
+  firrtl.module @Bar(out %_a: !firrtl.ref<uint<1>>) {
+    %x = firrtl.wire : !firrtl.uint<1>
+    %y = firrtl.wire : !firrtl.uint<1>
+    %1 = firrtl.ref.send %x : !firrtl.uint<1>
+    %2 = firrtl.ref.send %y : !firrtl.uint<1>
+    // expected-error @+1 {{output reference port cannot be reused by multiple operations, it can only capture a unique dataflow}}
+    firrtl.strictconnect %_a, %1 : !firrtl.ref<uint<1>>
+    firrtl.strictconnect %_a, %2 : !firrtl.ref<uint<1>>
+  }
+}
+
+// -----
+// Issue 4174-- handle duplicate module names.
+
+firrtl.circuit "hi" {
+    // expected-note @below {{see existing symbol definition here}}
+    firrtl.module @hi() {}
+    // expected-error @below {{redefinition of symbol named 'hi'}}
+    firrtl.module @hi() {}
 }

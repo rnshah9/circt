@@ -40,7 +40,7 @@ jobs:
         uses: actions/cache@v2
         with:
           path: |
-            llvm/build
+            llvm/build/bin/llvm-lit.py
             llvm/install
           key: ${{ runner.os }}-llvm-relobj-${{ steps.get-llvm-hash.outputs.hash }}
 
@@ -75,10 +75,11 @@ jobs:
           cd build_release
           cmake ../ -GNinja `
             -DLLVM_ENABLE_ASSERTIONS=ON `
-            -DMLIR_DIR="$(pwd)/../llvm/build/lib/cmake/mlir/" `
-            -DLLVM_DIR="$(pwd)/../llvm/build/lib/cmake/llvm/" `
-            -DLLVM_EXTERNAL_LIT="$(pwd)/../llvm/build/Release/bin/llvm-lit.py" `
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build . --config Release
+            -DMLIR_DIR="$(pwd)/../llvm/install/lib/cmake/mlir/" `
+            -DLLVM_DIR="$(pwd)/../llvm/install/lib/cmake/llvm/" `
+            -DLLVM_EXTERNAL_LIT="$(pwd)/../llvm/build/bin/llvm-lit.py" `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build . --config RelWithDebInfo
+          cmake --build . --target check-circt
 
     # --- end of build-circt job.

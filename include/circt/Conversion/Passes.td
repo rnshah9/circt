@@ -29,7 +29,7 @@ def AffineToPipeline : Pass<"convert-affine-to-pipeline", "mlir::func::FuncOp"> 
   let constructor = "circt::createAffineToPipeline()";
   let dependentDialects = [
     "circt::pipeline::PipelineDialect",
-    "mlir::arith::ArithmeticDialect",
+    "mlir::arith::ArithDialect",
     "mlir::cf::ControlFlowDialect",
     "mlir::memref::MemRefDialect",
     "mlir::scf::SCFDialect",
@@ -38,19 +38,70 @@ def AffineToPipeline : Pass<"convert-affine-to-pipeline", "mlir::func::FuncOp"> 
 }
 
 //===----------------------------------------------------------------------===//
+// ExportChiselInterface and ExportSplitChiselInterface
+//===----------------------------------------------------------------------===//
+
+def ExportChiselInterface : Pass<"export-chisel-interface", "firrtl::CircuitOp"> {
+  let summary = "Emit a Chisel interface to a FIRRTL circuit";
+  let description = [{
+    This pass generates a Scala Chisel interface for the top level module of
+    a FIRRTL circuit.
+  }];
+
+  let constructor = "createExportChiselInterfacePass()";
+  let dependentDialects = [
+    "circt::firrtl::FIRRTLDialect"
+  ];
+}
+
+def ExportSplitChiselInterface : Pass<"export-split-chisel-interface", "firrtl::CircuitOp"> {
+  let summary = "Emit a Chisel interface to a FIRRTL circuit to a directory of files";
+  let description = [{
+    This pass generates a Scala Chisel interface for the top level module of
+    a FIRRTL circuit.
+  }];
+
+  let constructor = "createExportSplitChiselInterfacePass()";
+  let dependentDialects = [
+    "circt::firrtl::FIRRTLDialect"
+  ];
+  let options = [
+    Option<"directoryName", "dir-name", "std::string",
+            "", "Directory to emit into">
+   ];
+}
+
+//===----------------------------------------------------------------------===//
 // ExportVerilog and ExportSplitVerilog
 //===----------------------------------------------------------------------===//
 
-def TestPrepareForEmission : Pass<"test-prepare-for-emission",
-                                  "hw::HWModuleOp"> {
+def TestApplyLoweringOption : Pass<"test-apply-lowering-options",
+                                   "mlir::ModuleOp"> {
+  let summary = "Apply lowering options";
+  let description = [{
+    This pass allows overriding lowering options.  It is intended for test
+    construction.
+  }];
+
+  let constructor = "createTestApplyLoweringOptionPass()";
+  let dependentDialects = [
+    "circt::sv::SVDialect", "circt::comb::CombDialect", "circt::hw::HWDialect"
+  ];
+  let options = [
+    Option<"options", "options", "std::string", "", "Lowering Options">
+  ];
+}
+
+def PrepareForEmission : Pass<"prepare-for-emission",
+                              "hw::HWModuleOp"> {
   let summary = "Prepare IR for ExportVerilog";
   let description = [{
-    This pass runs only PrepareForEmission logic for testing purpose.
+    This pass runs only PrepareForEmission.
     It is not necessary for users to run this pass explicitly since
     ExportVerilog internally runs PrepareForEmission.
   }];
 
-  let constructor = "createTestPrepareForEmissionPass()";
+  let constructor = "createPrepareForEmissionPass()";
   let dependentDialects = [
     "circt::sv::SVDialect", "circt::comb::CombDialect", "circt::hw::HWDialect"
   ];
@@ -79,43 +130,6 @@ def ExportSplitVerilog : Pass<"export-split-verilog", "mlir::ModuleOp"> {
   let constructor = "createExportSplitVerilogPass()";
   let dependentDialects = [
     "circt::sv::SVDialect", "circt::comb::CombDialect", "circt::hw::HWDialect"
-  ];
-
-  let options = [
-    Option<"directoryName", "dir-name", "std::string",
-            "", "Directory to emit into">
-   ];
-}
-
-//===----------------------------------------------------------------------===//
-// ExportSystemC and ExportSplitSystemC
-//===----------------------------------------------------------------------===//
-
-def ExportSystemC : Pass<"export-systemc", "mlir::ModuleOp"> {
-  let summary = "Emit the IR to a SystemC C++ file";
-  let description = [{
-    This pass generates SystemC code for the current design. It outputs
-    the entire design to a single output stream.
-  }];
-
-  let constructor = "createExportSystemCPass()";
-  let dependentDialects = [
-    "circt::comb::CombDialect", "circt::hw::HWDialect",
-    "circt::systemc::SystemCDialect"
-  ];
-}
-
-def ExportSplitSystemC : Pass<"export-split-systemc", "mlir::ModuleOp"> {
-  let summary = "Emit the IR to a directory of SystemC C++ files";
-  let description = [{
-    This pass generates SystemC code for the current design. It creates a new
-    header file for every module in the design.
-  }];
-
-  let constructor = "createExportSplitSystemCPass()";
-  let dependentDialects = [
-    "circt::comb::CombDialect", "circt::hw::HWDialect",
-    "circt::systemc::SystemCDialect"
   ];
 
   let options = [
@@ -167,6 +181,21 @@ def PipelineToCalyx : Pass<"lower-static-logic-to-calyx", "mlir::ModuleOp"> {
             " of the Calyx program.">,
     Option<"ciderSourceLocationMetadata", "cider-source-location-metadata", "bool", "",
             "Whether to track source location for the Cider debugger.">
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// PipelineTHW
+//===----------------------------------------------------------------------===//
+
+def PipelineToHW : Pass<"lower-pipeline-to-hw", "hw::HWModuleOp"> {
+  let summary = "Lower Pipeline to HW";
+  let description = [{
+    This pass lowers `pipeline.rtp` operations to HW.
+  }];
+  let constructor = "circt::createPipelineToHWPass()";
+  let dependentDialects = [
+    "hw::HWDialect", "comb::CombDialect", "seq::SeqDialect"
   ];
 }
 
@@ -259,11 +288,17 @@ def LowerFIRRTLToHW : Pass<"lower-firrtl-to-hw", "mlir::ModuleOp"> {
   let dependentDialects = ["comb::CombDialect", "hw::HWDialect",
                            "seq::SeqDialect", "sv::SVDialect"];
   let options = [
+    Option<"disableMemRandomization", "disable-mem-randomization", "bool", "false",
+            "Disable emission of memory randomization code">,
+    Option<"disableRegRandomization", "disable-reg-randomization", "bool", "false",
+            "Disable emission of register randomization code">,
     Option<"enableAnnotationWarning", "warn-on-unprocessed-annotations",
            "bool", "false",
     "Emit warnings on unprocessed annotations during lower-to-hw pass">,
     Option<"emitChiselAssertsAsSVA", "emit-chisel-asserts-as-sva",
-           "bool", "false","Convert all Chisel asserts to SVA">
+           "bool", "false","Convert all Chisel asserts to SVA">,
+    Option<"stripMuxPragmas", "strip-mux-pragmas", "bool", "false",
+            "Do not annotate mux pragmas to multibit mux and subacess results">
   ];
 }
 
@@ -277,7 +312,8 @@ def HandshakeToHW : Pass<"lower-handshake-to-hw", "mlir::ModuleOp"> {
     Lower Handshake to ESI/HW/Comb/Seq.
   }];
   let constructor = "circt::createHandshakeToHWPass()";
-  let dependentDialects = ["hw::HWDialect", "esi::ESIDialect"];
+  let dependentDialects = ["hw::HWDialect", "esi::ESIDialect", "comb::CombDialect",
+                           "seq::SeqDialect"];
 }
 
 //===----------------------------------------------------------------------===//
@@ -361,7 +397,7 @@ def HWArithToHW : Pass<"lower-hwarith-to-hw", "mlir::ModuleOp"> {
     This pass lowers HWArith to HW/Comb.
   }];
   let constructor = "circt::createHWArithToHWPass()";
-  let dependentDialects = ["hw::HWDialect", "comb::CombDialect"];
+  let dependentDialects = ["hw::HWDialect", "comb::CombDialect", "sv::SVDialect"];
 }
 
 //===----------------------------------------------------------------------===//
@@ -388,7 +424,7 @@ def ConvertHWToSystemC : Pass<"convert-hw-to-systemc", "mlir::ModuleOp"> {
     This pass translates a HW design into an equivalent SystemC design.
   }];
   let constructor = "circt::createConvertHWToSystemCPass()";
-  let dependentDialects = ["systemc::SystemCDialect"];
+  let dependentDialects = ["systemc::SystemCDialect", "mlir::emitc::EmitCDialect"];
 }
 
 //===----------------------------------------------------------------------===//
@@ -430,16 +466,6 @@ def InsertMergeBlocks : Pass<"insert-merge-blocks", "::mlir::ModuleOp"> {
   }];
   let constructor = "circt::createInsertMergeBlocksPass()";
   let dependentDialects = ["mlir::cf::ControlFlowDialect", "mlir::func::FuncDialect"];
-}
-
-//===----------------------------------------------------------------------===//
-// StandardToPipeline
-//===----------------------------------------------------------------------===//
-
-def CreatePipeline : Pass<"create-pipeline", "mlir::func::FuncOp"> {
-  let summary = "Create Pipeline pipeline operations";
-  let constructor = "circt::createCreatePipelinePass()";
-  let dependentDialects = ["pipeline::PipelineDialect"];
 }
 
 #endif // CIRCT_CONVERSION_PASSES_TD

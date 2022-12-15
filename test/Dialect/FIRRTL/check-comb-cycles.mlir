@@ -1,4 +1,4 @@
-// RUN: circt-opt --pass-pipeline='firrtl.circuit(firrtl-check-comb-cycles{print-simple-cycle=false})' --split-input-file --verify-diagnostics %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-check-comb-cycles{print-simple-cycle=false}))' --split-input-file --verify-diagnostics %s | FileCheck %s
 
 module  {
   // Loop-free circuit
@@ -90,15 +90,15 @@ module  {
       %z = firrtl.wire  : !firrtl.uint<1>
       firrtl.connect %c, %b : !firrtl.uint<1>, !firrtl.uint<1>
       %m_r = firrtl.mem Undefined  {depth = 2 : i64, name = "m", portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>
-      %0 = firrtl.subfield %m_r(2) : (!firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>) -> !firrtl.clock
+      %0 = firrtl.subfield %m_r[clk] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>
       firrtl.connect %0, %clk : !firrtl.clock, !firrtl.clock
       // expected-note @+1 {{this operation is part of the combinational cycle}}
-      %1 = firrtl.subfield %m_r(0) : (!firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>) -> !firrtl.uint<1>
+      %1 = firrtl.subfield %m_r[addr] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>
       firrtl.connect %1, %y : !firrtl.uint<1>, !firrtl.uint<1>
-      %2 = firrtl.subfield %m_r(1) : (!firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>) -> !firrtl.uint<1>
+      %2 = firrtl.subfield %m_r[en] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>
       %c1_ui = firrtl.constant 1 : !firrtl.uint
       firrtl.connect %2, %c1_ui : !firrtl.uint<1>, !firrtl.uint
-      %3 = firrtl.subfield %m_r(3) : (!firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>) -> !firrtl.uint<1>
+      %3 = firrtl.subfield %m_r[data] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: uint<1>>
       firrtl.connect %z, %3 : !firrtl.uint<1>, !firrtl.uint<1>
       firrtl.connect %y, %z : !firrtl.uint<1>, !firrtl.uint<1>
       firrtl.connect %d, %z : !firrtl.uint<1>, !firrtl.uint<1>
@@ -174,5 +174,53 @@ firrtl.circuit "strictConnectAndConnect" {
   firrtl.module @strictConnectAndConnect(out %a: !firrtl.uint<11>, out %b: !firrtl.uint<11>) {
     firrtl.connect %a, %b : !firrtl.uint<11>, !firrtl.uint<11>
     firrtl.strictconnect %b, %a : !firrtl.uint<11>
+  }
+}
+
+// -----
+
+firrtl.circuit "vectorRegInit"   {
+  firrtl.module @vectorRegInit(in %clk: !firrtl.clock) {
+    %reg = firrtl.reg %clk : !firrtl.vector<uint<8>, 2>
+    %0 = firrtl.subindex %reg[0] : !firrtl.vector<uint<8>, 2>
+    firrtl.connect %0, %0 : !firrtl.uint<8>, !firrtl.uint<8>
+  }
+}
+
+// -----
+
+firrtl.circuit "bundleRegInit"   {
+  firrtl.module @bundleRegInit(in %clk: !firrtl.clock) {
+    %reg = firrtl.reg %clk : !firrtl.bundle<a: uint<1>>
+    %0 = firrtl.subfield %reg[a] : !firrtl.bundle<a: uint<1>>
+    firrtl.connect %0, %0 : !firrtl.uint<1>, !firrtl.uint<1>
+  }
+}
+
+// -----
+
+firrtl.circuit "Foo"  {
+  firrtl.extmodule private @Bar(in a: !firrtl.uint<1>)
+  // expected-error @+2 {{detected combinational cycle in a FIRRTL module}}
+  // expected-note @+1 {{this operation is part of the combinational cycle}}
+  firrtl.module @Foo(out %a: !firrtl.uint<1>) {
+    // expected-note @+1 {{this operation is part of the combinational cycle}}
+    %bar_a = firrtl.instance bar interesting_name  @Bar(in a: !firrtl.uint<1>)
+    firrtl.strictconnect %bar_a, %a : !firrtl.uint<1>
+    firrtl.strictconnect %a, %bar_a : !firrtl.uint<1>
+  }
+}
+
+// -----
+
+firrtl.circuit "Foo"  {
+  firrtl.module private @Bar(in %a: !firrtl.uint<1>) {}
+  // expected-error @+2 {{detected combinational cycle in a FIRRTL module}}
+  // expected-note @+1 {{this operation is part of the combinational cycle}}
+  firrtl.module @Foo(out %a: !firrtl.uint<1>) {
+    // expected-note @+1 {{this operation is part of the combinational cycle}}
+    %bar_a = firrtl.instance bar interesting_name  @Bar(in a: !firrtl.uint<1>)
+    firrtl.strictconnect %bar_a, %a : !firrtl.uint<1>
+    firrtl.strictconnect %a, %bar_a : !firrtl.uint<1>
   }
 }

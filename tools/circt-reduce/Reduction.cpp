@@ -23,6 +23,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/Debug.h"
 
@@ -356,7 +357,7 @@ static void invalidateOutputs(ImplicitLocOpBuilder &builder, Value value,
 /// Connect a value to every leave of a destination value.
 static void connectToLeafs(ImplicitLocOpBuilder &builder, Value dest,
                            Value value) {
-  auto type = dest.getType().dyn_cast<firrtl::FIRRTLType>();
+  auto type = dest.getType().dyn_cast<firrtl::FIRRTLBaseType>();
   if (!type)
     return;
   if (auto bundleType = type.dyn_cast<firrtl::BundleType>()) {
@@ -372,7 +373,7 @@ static void connectToLeafs(ImplicitLocOpBuilder &builder, Value dest,
                      value);
     return;
   }
-  auto valueType = value.getType().dyn_cast<firrtl::FIRRTLType>();
+  auto valueType = value.getType().dyn_cast<firrtl::FIRRTLBaseType>();
   if (!valueType)
     return;
   auto destWidth = type.getBitWidthOrSentinel();
@@ -548,18 +549,23 @@ struct MemoryStubber : public Reduction {
         input = builder.createOrFold<firrtl::SubfieldOp>(wire, 5);
         output = builder.createOrFold<firrtl::SubfieldOp>(wire, 3);
         break;
+      case firrtl::MemOp::PortKind::Debug:
+        output = wire;
+        break;
       }
 
-      // Reduce all input ports to a single one through an XOR tree.
-      unsigned numFields =
-          wire.getType().cast<firrtl::BundleType>().getNumElements();
-      for (unsigned i = 0; i != numFields; ++i) {
-        if (i != 2 && i != 3 && i != 5)
-          reduceXor(builder, xorInputs,
-                    builder.createOrFold<firrtl::SubfieldOp>(wire, i));
+      if (!result.getType().cast<firrtl::FIRRTLType>().isa<firrtl::RefType>()) {
+        // Reduce all input ports to a single one through an XOR tree.
+        unsigned numFields =
+            wire.getType().cast<firrtl::BundleType>().getNumElements();
+        for (unsigned i = 0; i != numFields; ++i) {
+          if (i != 2 && i != 3 && i != 5)
+            reduceXor(builder, xorInputs,
+                      builder.createOrFold<firrtl::SubfieldOp>(wire, i));
+        }
+        if (input)
+          reduceXor(builder, xorInputs, input);
       }
-      if (input)
-        reduceXor(builder, xorInputs, input);
 
       // Track the output port to hook it up to the XORd input later.
       if (output)
@@ -616,8 +622,10 @@ struct OperandForwarder : public Reduction {
       return 0;
     if (isFlowSensitiveOp(op))
       return 0;
-    auto resultTy = op->getResult(0).getType().dyn_cast<firrtl::FIRRTLType>();
-    auto opTy = op->getOperand(OpNum).getType().dyn_cast<firrtl::FIRRTLType>();
+    auto resultTy =
+        op->getResult(0).getType().dyn_cast<firrtl::FIRRTLBaseType>();
+    auto opTy =
+        op->getOperand(OpNum).getType().dyn_cast<firrtl::FIRRTLBaseType>();
     return resultTy && opTy &&
            resultTy.getWidthlessType() == opTy.getWidthlessType() &&
            (resultTy.getBitWidthOrSentinel() == -1) ==
@@ -629,8 +637,8 @@ struct OperandForwarder : public Reduction {
     ImplicitLocOpBuilder builder(op->getLoc(), op);
     auto result = op->getResult(0);
     auto operand = op->getOperand(OpNum);
-    auto resultTy = result.getType().cast<firrtl::FIRRTLType>();
-    auto operandTy = operand.getType().cast<firrtl::FIRRTLType>();
+    auto resultTy = result.getType().cast<firrtl::FIRRTLBaseType>();
+    auto operandTy = operand.getType().cast<firrtl::FIRRTLBaseType>();
     auto resultWidth = resultTy.getBitWidthOrSentinel();
     auto operandWidth = operandTy.getBitWidthOrSentinel();
     Value newOp;
@@ -659,13 +667,13 @@ struct Constantifier : public Reduction {
       return 0;
     if (isFlowSensitiveOp(op))
       return 0;
-    auto type = op->getResult(0).getType().dyn_cast<firrtl::FIRRTLType>();
+    auto type = op->getResult(0).getType().dyn_cast<firrtl::FIRRTLBaseType>();
     return type && type.isa<firrtl::UIntType, firrtl::SIntType>();
   }
   LogicalResult rewrite(Operation *op) override {
     assert(match(op));
     OpBuilder builder(op);
-    auto type = op->getResult(0).getType().cast<firrtl::FIRRTLType>();
+    auto type = op->getResult(0).getType().cast<firrtl::FIRRTLBaseType>();
     auto width = type.getBitWidthOrSentinel();
     if (width == -1)
       width = 64;
@@ -684,8 +692,10 @@ struct Constantifier : public Reduction {
 /// connects and creates opportunities for reduction in DCE/CSE.
 struct ConnectInvalidator : public Reduction {
   uint64_t match(Operation *op) override {
-    return isa<firrtl::ConnectOp, firrtl::StrictConnectOp>(op) &&
-           op->getOperand(1).getType().cast<firrtl::FIRRTLType>().isPassive() &&
+    if (!isa<firrtl::ConnectOp, firrtl::StrictConnectOp>(op))
+      return false;
+    auto type = op->getOperand(1).getType().dyn_cast<firrtl::FIRRTLBaseType>();
+    return type && type.isPassive() &&
            !op->getOperand(1).getDefiningOp<firrtl::InvalidValueOp>();
   }
   LogicalResult rewrite(Operation *op) override {
@@ -768,10 +778,11 @@ struct RootPortPruner : public Reduction {
   LogicalResult rewrite(Operation *op) override {
     assert(match(op));
     auto module = cast<firrtl::FModuleOp>(op);
-    SmallVector<unsigned> dropPorts;
-    for (unsigned i = 0, e = module.getNumPorts(); i != e; ++i) {
+    size_t numPorts = module.getNumPorts();
+    llvm::BitVector dropPorts(numPorts);
+    for (unsigned i = 0; i != numPorts; ++i) {
       if (onlyInvalidated(module.getArgument(i))) {
-        dropPorts.push_back(i);
+        dropPorts.set(i);
         for (auto *user :
              llvm::make_early_inc_range(module.getArgument(i).getUsers()))
           user->erase();
@@ -900,9 +911,9 @@ struct ConnectSourceOperandForwarder : public Reduction {
     if (!srcOp || OpNum >= srcOp->getNumOperands())
       return 0;
 
-    auto resultTy = dest.getType().dyn_cast<firrtl::FIRRTLType>();
+    auto resultTy = dest.getType().dyn_cast<firrtl::FIRRTLBaseType>();
     auto opTy =
-        srcOp->getOperand(OpNum).getType().dyn_cast<firrtl::FIRRTLType>();
+        srcOp->getOperand(OpNum).getType().dyn_cast<firrtl::FIRRTLBaseType>();
 
     return resultTy && opTy &&
            resultTy.getWidthlessType() == opTy.getWidthlessType() &&
@@ -1011,7 +1022,7 @@ struct NodeSymbolRemover : public Reduction {
 
   LogicalResult rewrite(Operation *op) override {
     auto nodeOp = cast<firrtl::NodeOp>(op);
-    nodeOp.removeInner_symAttr();
+    nodeOp.removeInnerSymAttr();
     return success();
   }
 

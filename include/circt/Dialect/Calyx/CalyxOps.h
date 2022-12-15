@@ -97,7 +97,7 @@ struct PortInfo {
       return identifier == idToAttribute.getName();
     });
     if (it == attributes.end())
-      return None;
+      return std::nullopt;
     return it->getValue();
   }
 
@@ -110,6 +110,9 @@ struct PortInfo {
     return identifiers;
   }
 };
+
+/// A helper function to verify each operation with the Ccomponent trait.
+LogicalResult verifyComponent(Operation *op);
 
 /// A helper function to verify each operation with the Cell trait.
 LogicalResult verifyCell(Operation *op);

@@ -38,7 +38,7 @@ StringAttr ExportVerilog::getDeclarationName(Operation *op) {
 /// Given a name that may have collisions or invalid symbols, return a
 /// replacement name to use, or null if the original name was ok.
 StringRef NameCollisionResolver::getLegalName(StringRef originalName) {
-  return legalizeName(originalName, usedNames, nextGeneratedNameID);
+  return legalizeName(originalName, nextGeneratedNameIDs);
 }
 
 //===----------------------------------------------------------------------===//
@@ -48,7 +48,7 @@ StringRef NameCollisionResolver::getLegalName(StringRef originalName) {
 void FieldNameResolver::setRenamedFieldName(StringAttr fieldName,
                                             StringAttr newFieldName) {
   renamedFieldNames[fieldName] = newFieldName;
-  usedFieldNames.insert(newFieldName);
+  nextGeneratedNameIDs.insert({newFieldName, 0});
 }
 
 StringAttr FieldNameResolver::getRenamedFieldName(StringAttr fieldName) {
@@ -58,20 +58,33 @@ StringAttr FieldNameResolver::getRenamedFieldName(StringAttr fieldName) {
 
   // If a field name is not verilog name or used already, we have to rename it.
   bool hasToBeRenamed = !sv::isNameValid(fieldName.getValue()) ||
-                        usedFieldNames.count(fieldName.getValue());
+                        nextGeneratedNameIDs.count(fieldName.getValue());
 
   if (!hasToBeRenamed) {
     setRenamedFieldName(fieldName, fieldName);
     return fieldName;
   }
 
-  StringRef newFieldName = sv::legalizeName(
-      fieldName.getValue(), usedFieldNames, nextGeneratedNameID);
+  StringRef newFieldName =
+      sv::legalizeName(fieldName.getValue(), nextGeneratedNameIDs);
 
   auto newFieldNameAttr = StringAttr::get(fieldName.getContext(), newFieldName);
 
   setRenamedFieldName(fieldName, newFieldNameAttr);
   return newFieldNameAttr;
+}
+
+std::string FieldNameResolver::getEnumFieldName(hw::EnumFieldAttr attr) {
+  auto aliasType = attr.getType().getValue().dyn_cast<hw::TypeAliasType>();
+  if (!aliasType)
+    return attr.getField().getValue().str();
+
+  auto fieldStr = attr.getField().getValue().str();
+  if (auto prefix = globalNames.getEnumPrefix(aliasType))
+    return (prefix.getValue() + "_" + fieldStr).str();
+
+  // No prefix registered, just use the bare field name.
+  return fieldStr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -100,6 +113,9 @@ private:
   /// globalNameTable.
   void legalizeModuleNames(HWModuleOp module);
   void legalizeInterfaceNames(InterfaceOp interface);
+
+  // Gathers prefixes of enum types by inspecting typescopes in the module.
+  void gatherEnumPrefixes(mlir::ModuleOp topLevel);
 
   /// Set of globally visible names, to ensure uniqueness.
   NameCollisionResolver globalNameResolver;
@@ -146,6 +162,26 @@ GlobalNameResolver::GlobalNameResolver(mlir::ModuleOp topLevel) {
       continue;
     }
   }
+
+  // Gather enum prefixes.
+  gatherEnumPrefixes(topLevel);
+}
+
+// Gathers prefixes of enum types by investigating typescopes in the module.
+void GlobalNameResolver::gatherEnumPrefixes(mlir::ModuleOp topLevel) {
+  auto *ctx = topLevel.getContext();
+  for (auto typeScope : topLevel.getOps<hw::TypeScopeOp>()) {
+    for (auto typeDecl : typeScope.getOps<hw::TypedeclOp>()) {
+      auto enumType = typeDecl.getType().dyn_cast<hw::EnumType>();
+      if (!enumType)
+        continue;
+
+      // Register the enum type as the alias type of the typedecl, since this is
+      // how users will request the prefix.
+      globalNameTable.enumPrefixes[typeDecl.getAliasType()] =
+          StringAttr::get(ctx, typeDecl.getPreferredName());
+    }
+  }
 }
 
 /// Check to see if the port names of the specified module conflict with
@@ -163,7 +199,6 @@ void GlobalNameResolver::legalizeModuleNames(HWModuleOp module) {
   NameCollisionResolver nameResolver;
   auto verilogNameAttr = StringAttr::get(ctxt, "hw.verilogName");
   // Legalize the port names.
-  size_t portIdx = 0;
   SmallVector<Attribute, 4> argNames, resultNames;
   for (const PortInfo &port : getAllModulePortInfos(module)) {
     auto newName = nameResolver.getLegalName(port.name);
@@ -175,7 +210,6 @@ void GlobalNameResolver::legalizeModuleNames(HWModuleOp module) {
         module.setArgAttr(port.argNum, verilogNameAttr,
                           StringAttr::get(ctxt, newName));
     }
-    ++portIdx;
   }
 
   // Legalize the parameter names.

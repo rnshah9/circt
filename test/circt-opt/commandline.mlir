@@ -11,6 +11,7 @@
 // DIALECT-NEXT: cf
 // DIALECT-NEXT: chirrtl
 // DIALECT-NEXT: comb
+// DIALECT-NEXT: emitc
 // DIALECT-NEXT: esi
 // DIALECT-NEXT: firrtl
 // DIALECT-NEXT: fsm
@@ -18,6 +19,7 @@
 // DIALECT-NEXT: handshake
 // DIALECT-NEXT: hw
 // DIALECT-NEXT: hwarith
+// DIALECT-NEXT: interop
 // DIALECT-NEXT: llhd
 // DIALECT-NEXT: llvm
 // DIALECT-NEXT: memref

@@ -2,6 +2,7 @@
 set(LLVM_OPTIONAL_SOURCES
   Comb.cpp
   ESI.cpp
+  FIRRTL.cpp
   MSFT.cpp
   HW.cpp
   HWArith.cpp
@@ -10,6 +11,7 @@ set(LLVM_OPTIONAL_SOURCES
   Seq.cpp
   SV.cpp
   FSM.cpp
+  Handshake.cpp
 )
 
 add_mlir_public_c_api_library(CIRCTCAPIComb
@@ -28,6 +30,14 @@ add_mlir_public_c_api_library(CIRCTCAPIESI
   CIRCTESI
 )
 
+add_mlir_public_c_api_library(CIRCTCAPIFIRRTL
+  FIRRTL.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTFIRRTL
+)
+
 add_mlir_public_c_api_library(CIRCTCAPIMSFT
   MSFT.cpp
 
@@ -38,6 +48,7 @@ add_mlir_public_c_api_library(CIRCTCAPIMSFT
   MLIRCAPIIR
   MLIRTransforms
   CIRCTMSFT
+  CIRCTMSFTTransforms
 )
 
 add_mlir_public_c_api_library(CIRCTCAPIHW
@@ -90,6 +101,17 @@ add_mlir_public_c_api_library(CIRCTCAPIFSM
   CIRCTFSM
   CIRCTFSMTransforms
   CIRCTFSMToSV
+)
+
+add_mlir_public_c_api_library(CIRCTCAPIHandshake
+  Handshake.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTHandshake
+  CIRCTHandshakeTransforms
+  CIRCTHandshakeToHW
+  CIRCTStandardToHandshake
 )
 
 add_mlir_public_c_api_library(CIRCTCAPIHWArith

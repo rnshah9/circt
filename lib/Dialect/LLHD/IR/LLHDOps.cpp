@@ -71,10 +71,6 @@ static Attribute constFoldTernaryOp(ArrayRef<Attribute> operands,
   assert(operands.size() == 3 && "ternary op takes three operands");
   if (!operands[0] || !operands[1] || !operands[2])
     return {};
-  if (operands[0].getType() != operands[1].getType())
-    return {};
-  if (operands[0].getType() != operands[2].getType())
-    return {};
 
   if (operands[0].isa<AttrElementT>() && operands[1].isa<AttrElementT>() &&
       operands[2].isa<AttrElementT>()) {
@@ -362,8 +358,8 @@ parseArgumentList(OpAsmParser &parser,
     OpAsmParser::Argument argument;
     Type argType;
     auto optArg = parser.parseOptionalArgument(argument);
-    if (optArg.hasValue()) {
-      if (succeeded(optArg.getValue())) {
+    if (optArg.has_value()) {
+      if (succeeded(optArg.value())) {
         if (!argument.ssaName.name.empty() &&
             succeeded(parser.parseColonType(argType))) {
           args.push_back(argument);
@@ -412,9 +408,10 @@ ParseResult llhd::EntityOp::parse(OpAsmParser &parser, OperationState &result) {
   if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
     return failure();
 
-  auto type = parser.getBuilder().getFunctionType(argTypes, llvm::None);
-  result.addAttribute(circt::llhd::EntityOp::getTypeAttrName(),
-                      TypeAttr::get(type));
+  auto type = parser.getBuilder().getFunctionType(argTypes, std::nullopt);
+  result.addAttribute(
+      circt::llhd::EntityOp::getFunctionTypeAttrName(result.name),
+      TypeAttr::get(type));
 
   auto &body = *result.addRegion();
   if (parser.parseRegion(body, args))
@@ -459,7 +456,7 @@ void llhd::EntityOp::print(OpAsmPrinter &printer) {
   printer.printOptionalAttrDictWithKeyword(
       (*this)->getAttrs(),
       /*elidedAttrs =*/{SymbolTable::getSymbolAttrName(),
-                        llhd::EntityOp::getTypeAttrName(), "ins"});
+                        getFunctionTypeAttrName(), "ins"});
   printer << " ";
   printer.printRegion(getBody(), false, false);
 }
@@ -502,8 +499,8 @@ LogicalResult circt::llhd::EntityOp::verifyType() {
 
 LogicalResult circt::llhd::EntityOp::verifyBody() {
   // check signal names are unique
-  llvm::StringSet sigSet;
-  llvm::StringSet instSet;
+  llvm::StringSet<> sigSet;
+  llvm::StringSet<> instSet;
   auto walkResult = walk([&sigSet, &instSet](Operation *op) -> WalkResult {
     return TypeSwitch<Operation *, WalkResult>(op)
         .Case<SigOp>([&](auto sigOp) -> WalkResult {
@@ -594,8 +591,8 @@ parseProcArgumentList(OpAsmParser &parser, SmallVectorImpl<Type> &argTypes,
     OpAsmParser::Argument argument;
     Type argumentType;
     auto optArg = parser.parseOptionalArgument(argument);
-    if (optArg.hasValue()) {
-      if (succeeded(optArg.getValue())) {
+    if (optArg.has_value()) {
+      if (succeeded(optArg.value())) {
         // Reject this if the preceding argument was missing a name.
         if (argNames.empty() && !argTypes.empty())
           return parser.emitError(loc,
@@ -658,8 +655,8 @@ ParseResult llhd::ProcOp::parse(OpAsmParser &parser, OperationState &result) {
   if (parseProcArgumentList(parser, argTypes, argNames))
     return failure();
 
-  auto type = builder.getFunctionType(argTypes, llvm::None);
-  result.addAttribute(circt::llhd::ProcOp::getTypeAttrName(),
+  auto type = builder.getFunctionType(argTypes, std::nullopt);
+  result.addAttribute(circt::llhd::ProcOp::getFunctionTypeAttrName(result.name),
                       TypeAttr::get(type));
 
   auto *body = result.addRegion();
@@ -904,7 +901,7 @@ ParseResult llhd::RegOp::parse(OpAsmParser &parser, OperationState &result) {
   operandSizes.push_back(delayOperands.size());
   operandSizes.push_back(gateOperands.size());
   result.addAttribute("operand_segment_sizes",
-                      parser.getBuilder().getI32VectorAttr(operandSizes));
+                      parser.getBuilder().getDenseI32ArrayAttr(operandSizes));
 
   return success();
 }

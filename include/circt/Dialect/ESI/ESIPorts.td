@@ -36,21 +36,13 @@ def ChannelType : ESI_Port<"Channel"> {
   let parameters = (ins "Type":$inner);
 
   let assemblyFormat = "`<` $inner `>`";
-
-  let extraClassDeclaration = [{
-    /// Returns true if this channel carries a data value.
-    bool hasData() {
-      return !getInner().isa<mlir::NoneType>();
-    }
-  }];
-
 }
 
 //=========
 // Operations on ports.
 
 def WrapValidReadyOp : ESI_Op<"wrap.vr", [
-    NoSideEffect,
+    Pure,
     DeclareOpInterfaceMethods<ChannelOpInterface>
   ]> {
   let summary = "Wrap a value into an ESI port";
@@ -71,7 +63,7 @@ def WrapValidReadyOp : ESI_Op<"wrap.vr", [
 }
 
 def UnwrapValidReadyOp : ESI_Op<"unwrap.vr", [
-    NoSideEffect,
+    Pure,
     DeclareOpInterfaceMethods<ChannelOpInterface>
   ]> {
   let summary = "Unwrap a value from an ESI port";
@@ -94,7 +86,7 @@ def ModportType:
   Type<CPred<"$_self.isa<::circt::sv::ModportType>()">, "sv.interface">;
 
 def WrapSVInterfaceOp: ESI_Op<"wrap.iface", [
-    NoSideEffect,
+    Pure,
     DeclareOpInterfaceMethods<ChannelOpInterface>
   ]> {
   let summary = "Wrap an SV interface into an ESI port";

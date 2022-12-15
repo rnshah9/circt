@@ -22,6 +22,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -64,7 +65,7 @@ public:
     loweredOps.clear();
     addLegalDialect<HandshakeDialect>();
     addLegalDialect<mlir::func::FuncDialect>();
-    addLegalDialect<mlir::arith::ArithmeticDialect>();
+    addLegalDialect<mlir::arith::ArithDialect>();
     addIllegalDialect<mlir::scf::SCFDialect>();
     addIllegalDialect<mlir::AffineDialect>();
 
@@ -325,6 +326,13 @@ static std::vector<Value> vectorDiff(ArrayRef<Value> v1, ArrayRef<Value> v2) {
   return d;
 }
 
+static LogicalResult isValidMemrefType(Location loc, mlir::MemRefType type) {
+  if (type.getNumDynamicDims() != 0 || type.getShape().size() != 1)
+    return emitError(loc) << "memref's must be both statically sized and "
+                             "unidimensional.";
+  return success();
+}
+
 static HandshakeLowering::BlockValues livenessAnalysis(Region &f) {
   // Liveness analysis algorithm adapted from:
   // https://suif.stanford.edu/~courses/cs243/lectures/l2.pdf
@@ -377,45 +385,68 @@ static unsigned getBlockPredecessorCount(Block *block) {
 
 // Insert appropriate type of Merge CMerge for control-only path,
 // Merge for single-successor blocks, Mux otherwise
-Operation *HandshakeLowering::insertMerge(Block *block, Value val,
-                                          ConversionPatternRewriter &rewriter) {
+HandshakeLowering::MergeOpInfo
+HandshakeLowering::insertMerge(Block *block, Value val,
+                               BackedgeBuilder &edgeBuilder,
+                               ConversionPatternRewriter &rewriter) {
   unsigned numPredecessors = getBlockPredecessorCount(block);
+  auto insertLoc = block->front().getLoc();
+  SmallVector<Backedge> dataEdges;
+  SmallVector<Value> operands;
 
   // Control-only path originates from StartOp
-  if (!val.isa<BlockArgument>()) {
-    if (isa<StartOp>(val.getDefiningOp())) {
-      auto cmerge = rewriter.create<handshake::ControlMergeOp>(
-          block->front().getLoc(), val, numPredecessors);
-      setBlockEntryControl(block, cmerge.result());
-      return cmerge;
+  if (!val.isa<BlockArgument>() && isa<StartOp>(val.getDefiningOp())) {
+    for (unsigned i = 0; i < numPredecessors; i++) {
+      auto edge = edgeBuilder.get(rewriter.getNoneType());
+      dataEdges.push_back(edge);
+      operands.push_back(Value(edge));
     }
+    auto cmerge =
+        rewriter.create<handshake::ControlMergeOp>(insertLoc, operands);
+    setBlockEntryControl(block, cmerge.getResult());
+    return MergeOpInfo{cmerge, val, dataEdges};
   }
 
-  // If there are no block predecessors (i.e., entry block)
+  // If there is at most one block predecessor
   if (numPredecessors <= 1) {
-    SmallVector<Value> mergeOperands;
-    mergeOperands.append(2, val); // 2 dummy values used here due to
-                                  // hard-coded logic of reconnectMergeOps.
-    return rewriter.create<handshake::MergeOp>(block->front().getLoc(),
-                                               mergeOperands);
+    // Dummy merge used here due to hard-coded logic of reconnectMergeOps
+    if (numPredecessors == 0) {
+      operands.push_back(val);
+    } else {
+      auto edge = edgeBuilder.get(val.getType());
+      dataEdges.push_back(edge);
+      operands.push_back(Value(edge));
+    }
+    auto merge = rewriter.create<handshake::MergeOp>(insertLoc, operands);
+    return MergeOpInfo{merge, val, dataEdges};
   }
 
-  return rewriter.create<handshake::MuxOp>(block->front().getLoc(), val,
-                                           numPredecessors);
+  // Create a backedge for the index operand, and another one for each data
+  // operand
+  Backedge indexEdge = edgeBuilder.get(rewriter.getIndexType());
+  for (unsigned i = 0; i < numPredecessors; i++) {
+    auto edge = edgeBuilder.get(val.getType());
+    dataEdges.push_back(edge);
+    operands.push_back(Value(edge));
+  }
+  auto mux =
+      rewriter.create<handshake::MuxOp>(insertLoc, Value(indexEdge), operands);
+  return MergeOpInfo{mux, val, dataEdges, indexEdge};
 }
 
 HandshakeLowering::BlockOps
 HandshakeLowering::insertMergeOps(HandshakeLowering::BlockValues blockLiveIns,
                                   HandshakeLowering::blockArgPairs &mergePairs,
+                                  BackedgeBuilder &edgeBuilder,
                                   ConversionPatternRewriter &rewriter) {
   HandshakeLowering::BlockOps blockMerges;
   for (Block &block : r) {
     // Live-ins identified by liveness analysis
     rewriter.setInsertionPointToStart(&block);
     for (auto &val : blockLiveIns[&block]) {
-      Operation *newOp = insertMerge(&block, val, rewriter);
-      blockMerges[&block].push_back(newOp);
-      mergePairs[val] = newOp;
+      auto mergeInfo = insertMerge(&block, val, edgeBuilder, rewriter);
+      blockMerges[&block].push_back(mergeInfo);
+      mergePairs[val] = mergeInfo.op;
     }
     // Block arguments are not in livein list as they are defined inside the
     // block
@@ -424,9 +455,9 @@ HandshakeLowering::insertMergeOps(HandshakeLowering::BlockValues blockLiveIns,
       if (arg.getType().isa<mlir::MemRefType>())
         continue;
 
-      Operation *newOp = insertMerge(&block, arg, rewriter);
-      blockMerges[&block].push_back(newOp);
-      mergePairs[arg] = newOp;
+      auto mergeInfo = insertMerge(&block, arg, edgeBuilder, rewriter);
+      blockMerges[&block].push_back(mergeInfo);
+      mergePairs[arg] = mergeInfo.op;
     }
   }
   return blockMerges;
@@ -438,18 +469,21 @@ static bool blockHasSrcOp(Value val, Block *block) {
   if (val.isa<BlockArgument>())
     return false;
 
+  // If the value isn't a block argument, it should be one of the results of
+  // another operation
   auto *op = val.getDefiningOp();
-  assert(op != NULL);
+  assert(op != nullptr);
   return (op->getBlock() == block);
 }
 
 // Get value from predBlock which will be set as operand of op (merge)
-static Value getMergeOperand(Operation *op, Block *predBlock,
+static Value getMergeOperand(HandshakeLowering::MergeOpInfo mergeInfo,
+                             Block *predBlock,
                              HandshakeLowering::BlockOps blockMerges) {
   // Helper value (defining value of merge) to identify Merges which propagate
   // the same defining value
-  Value srcVal = op->getOperand(0);
-  Block *block = op->getBlock();
+  Value srcVal = mergeInfo.val;
+  Block *block = mergeInfo.op->getBlock();
 
   // Value comes from predecessor block (i.e., not an argument of this block)
   if (std::find(block->getArguments().begin(), block->getArguments().end(),
@@ -457,9 +491,9 @@ static Value getMergeOperand(Operation *op, Block *predBlock,
     // Value is not defined by operation in predBlock
     if (!blockHasSrcOp(srcVal, predBlock)) {
       // Find the corresponding Merge
-      for (Operation *predOp : blockMerges[predBlock])
-        if (predOp->getOperand(0) == srcVal)
-          return predOp->getResult(0);
+      for (auto &predMergeInfo : blockMerges[predBlock])
+        if (predMergeInfo.val == srcVal)
+          return predMergeInfo.op->getResult(0);
     } else
       return srcVal;
   }
@@ -470,13 +504,13 @@ static Value getMergeOperand(Operation *op, Block *predBlock,
     unsigned index = srcVal.cast<BlockArgument>().getArgNumber();
     Operation *termOp = predBlock->getTerminator();
     if (mlir::cf::CondBranchOp br = dyn_cast<mlir::cf::CondBranchOp>(termOp)) {
+      // Block should be one of the two destinations of the conditional branch
       if (block == br.getTrueDest())
         return br.getTrueOperand(index);
-      else {
-        assert(block == br.getFalseDest());
-        return br.getFalseOperand(index);
-      }
-    } else if (isa<mlir::cf::BranchOp>(termOp))
+      assert(block == br.getFalseDest());
+      return br.getFalseOperand(index);
+    }
+    if (isa<mlir::cf::BranchOp>(termOp))
       return termOp->getOperand(index);
   }
   return nullptr;
@@ -516,59 +550,57 @@ static ConditionalBranchOp getControlCondBranch(Block *block) {
   return nullptr;
 }
 
-static void reconnectMergeOps(Region &f,
+static void reconnectMergeOps(Region &r,
                               HandshakeLowering::BlockOps blockMerges,
                               HandshakeLowering::blockArgPairs &mergePairs) {
-  // All merge operands are initially set to original (defining) value
-  // We here replace defining value with appropriate value from predecessor
-  // block The predecessor can either be a merge, the original defining value,
-  // or a branch Operand Operand(0) is helper defining value for identifying
-  // matching merges, it does not correspond to any predecessor block
+  // At this point all merge-like operations have backedges as operands.
+  // We here replace all backedge values with appropriate value from
+  // predecessor block. The predecessor can either be a merge, the original
+  // defining value, or a branch operand.
 
-  for (Block &block : f) {
-    for (Operation *op : blockMerges[&block]) {
-      int count = 1;
-      // Set appropriate operand from predecessor block
+  for (Block &block : r) {
+    for (auto &mergeInfo : blockMerges[&block]) {
+      int operandIdx = 0;
+      // Set appropriate operand from each predecessor block
       for (auto *predBlock : block.getPredecessors()) {
-        Value mgOperand = getMergeOperand(op, predBlock, blockMerges);
+        Value mgOperand = getMergeOperand(mergeInfo, predBlock, blockMerges);
         assert(mgOperand != nullptr);
         if (!mgOperand.getDefiningOp()) {
           assert(mergePairs.count(mgOperand));
           mgOperand = mergePairs[mgOperand]->getResult(0);
         }
-        op->setOperand(count, mgOperand);
-        count++;
+        mergeInfo.dataEdges[operandIdx].setValue(mgOperand);
+        operandIdx++;
       }
+
       // Reconnect all operands originating from livein defining value through
       // corresponding merge of that block
       for (Operation &opp : block)
         if (!isa<MergeLikeOpInterface>(opp))
-          opp.replaceUsesOfWith(op->getOperand(0), op->getResult(0));
+          opp.replaceUsesOfWith(mergeInfo.val, mergeInfo.op->getResult(0));
     }
   }
 
-  // Disconnect original value (Operand(0), used as helper) from all merges
-  // If the original value must be a merge operand, it is still set as some
-  // subsequent operand
-  // If block has multiple predecessors, connect Muxes to ControlMerge
-  for (Block &block : f) {
-    unsigned numPredecessors = getBlockPredecessorCount(&block);
-
-    if (numPredecessors <= 1) {
-      for (Operation *op : blockMerges[&block])
-        op->eraseOperand(0);
-    } else {
+  // Connect select operand of muxes to control merge's index result in all
+  // blocks with more than one predecessor
+  for (Block &block : r) {
+    if (getBlockPredecessorCount(&block) > 1) {
       Operation *cntrlMg = getControlMerge(&block);
       assert(cntrlMg != nullptr);
-      cntrlMg->eraseOperand(0);
 
-      for (Operation *op : blockMerges[&block])
-        if (op != cntrlMg)
-          op->setOperand(0, cntrlMg->getResult(1));
+      for (auto &mergeInfo : blockMerges[&block]) {
+        if (mergeInfo.op != cntrlMg) {
+          // If the block has multiple predecessors, merge-like operation that
+          // are not the block's control merge must have an index operand (at
+          // this point, an index backedge)
+          assert(mergeInfo.indexEdge.has_value());
+          mergeInfo.indexEdge.value().setValue(cntrlMg->getResult(1));
+        }
+      }
     }
   }
 
-  removeBlockOperands(f);
+  removeBlockOperands(r);
 }
 
 LogicalResult
@@ -579,8 +611,13 @@ HandshakeLowering::addMergeOps(ConversionPatternRewriter &rewriter) {
   // blockLiveIns: live in variables of block
   BlockValues liveIns = livenessAnalysis(r);
 
+  // Create backedge builder to manage operands of merge operations between
+  // insertion and reconnection
+  BackedgeBuilder edgeBuilder{rewriter, r.front().front().getLoc()};
+
   // Insert merge operations
-  BlockOps mergeOps = insertMergeOps(liveIns, mergePairs, rewriter);
+  BlockOps mergeOps =
+      insertMergeOps(liveIns, mergePairs, edgeBuilder, rewriter);
 
   // Set merge operands and uses
   reconnectMergeOps(r, mergeOps, mergePairs);
@@ -612,6 +649,254 @@ static int getBranchCount(Value val, Block *block) {
     uses = (curr > uses) ? curr : uses;
   }
   return uses;
+}
+
+namespace {
+
+/// This class inserts a reorder prevention mechanism for blocks with multiple
+/// successors. Such a mechanism is required to guarantee correct execution in a
+/// multi-threaded usage of the circuits.
+///
+/// The order of the results matches the order of the traversals of the
+/// divergence point. A FIFO buffer stores the condition of the conditional
+/// branch. The buffer feeds a mux that guarantees the correct out-order.
+class FeedForwardNetworkRewriter {
+public:
+  FeedForwardNetworkRewriter(HandshakeLowering &hl,
+                             ConversionPatternRewriter &rewriter)
+      : hl(hl), rewriter(rewriter), postDomInfo(hl.getRegion().getParentOp()),
+        domInfo(hl.getRegion().getParentOp()), loopAnalysis(hl.getRegion()) {}
+  LogicalResult apply();
+
+private:
+  HandshakeLowering &hl;
+  ConversionPatternRewriter &rewriter;
+  PostDominanceInfo postDomInfo;
+  DominanceInfo domInfo;
+  ControlFlowLoopAnalysis loopAnalysis;
+
+  using BlockPair = std::pair<Block *, Block *>;
+  using BlockPairs = SmallVector<BlockPair>;
+  LogicalResult findBlockPairs(BlockPairs &blockPairs);
+
+  BufferOp buildSplitNetwork(Block *splitBlock,
+                             handshake::ConditionalBranchOp &ctrlBr);
+  void buildMergeNetwork(Block *mergeBlock, BufferOp buf,
+                         handshake::ConditionalBranchOp &ctrlBr);
+
+  // Determines if the cmerge inpus match the cond_br output order.
+  bool requiresOperandFlip(ControlMergeOp &ctrlMerge,
+                           handshake::ConditionalBranchOp &ctrlBr);
+  bool formsIrreducibleCF(Block *splitBlock, Block *mergeBlock);
+};
+} // namespace
+
+LogicalResult
+HandshakeLowering::feedForwardRewriting(ConversionPatternRewriter &rewriter) {
+  return FeedForwardNetworkRewriter(*this, rewriter).apply();
+}
+
+static bool loopsHaveSingleExit(ControlFlowLoopAnalysis &loopAnalysis) {
+  for (LoopInfo &info : loopAnalysis.topLevelLoops)
+    if (info.exitBlocks.size() > 1)
+      return false;
+  return true;
+}
+
+bool FeedForwardNetworkRewriter::formsIrreducibleCF(Block *splitBlock,
+                                                    Block *mergeBlock) {
+  LoopInfo *info = loopAnalysis.getLoopInfoForHeader(mergeBlock);
+  for (auto mergePred : mergeBlock->getPredecessors()) {
+    // Skip loop predecessors
+    if (info && info->inLoop.contains(mergePred))
+      continue;
+
+    // A DAG-CFG is irreducible, iff a merge block has a predecessor that can be
+    // reached from both successors of a split node, e.g., neither is a
+    // dominator.
+    // => Their control flow can merge in other places, which makes this
+    // irreducible.
+    if (llvm::none_of(splitBlock->getSuccessors(), [&](Block *splitSucc) {
+          if (splitSucc == mergeBlock || mergePred == splitBlock)
+            return true;
+          return domInfo.dominates(splitSucc, mergePred);
+        }))
+      return true;
+  }
+  return false;
+}
+
+static Operation *findBranchToBlock(Block *block) {
+  Block *pred = *block->getPredecessors().begin();
+  return pred->getTerminator();
+}
+
+LogicalResult
+FeedForwardNetworkRewriter::findBlockPairs(BlockPairs &blockPairs) {
+  // assumes that merge block insertion happended beforehand
+  // Thus, for each split block, there exists one merge block which is the post
+  // dominator of the child nodes.
+  Region &r = hl.getRegion();
+  Operation *parentOp = r.getParentOp();
+
+  // Assumes that each loop has only one exit block. Such an error should
+  // already be reported by the loop rewriting.
+  assert(loopsHaveSingleExit(loopAnalysis) &&
+         "expected loop to only have one exit block.");
+
+  for (Block &b : r) {
+    if (b.getNumSuccessors() < 2)
+      continue;
+
+    // Loop headers cannot be merge blocks.
+    if (loopAnalysis.isLoopElement(&b))
+      continue;
+
+    assert(b.getNumSuccessors() == 2);
+    Block *succ0 = b.getSuccessor(0);
+    Block *succ1 = b.getSuccessor(1);
+
+    if (succ0 == succ1)
+      continue;
+
+    Block *mergeBlock = postDomInfo.findNearestCommonDominator(succ0, succ1);
+
+    // Precondition checks
+    if (formsIrreducibleCF(&b, mergeBlock)) {
+      return parentOp->emitError("expected only reducible control flow.")
+                 .attachNote(findBranchToBlock(mergeBlock)->getLoc())
+             << "This branch is involved in the irreducible control flow";
+    }
+
+    unsigned nonLoopPreds = 0;
+    LoopInfo *info = loopAnalysis.getLoopInfoForHeader(mergeBlock);
+    for (auto pred : mergeBlock->getPredecessors()) {
+      if (info && info->inLoop.contains(pred))
+        continue;
+      nonLoopPreds++;
+    }
+    if (nonLoopPreds > 2)
+      return parentOp
+                 ->emitError("expected a merge block to have two predecessors. "
+                             "Did you run the merge block insertion pass?")
+                 .attachNote(findBranchToBlock(mergeBlock)->getLoc())
+             << "This branch jumps to the illegal block";
+
+    blockPairs.emplace_back(&b, mergeBlock);
+  }
+
+  return success();
+}
+
+LogicalResult FeedForwardNetworkRewriter::apply() {
+  if (failed(loopAnalysis.analyzeRegion()))
+    return failure();
+
+  BlockPairs pairs;
+  if (failed(findBlockPairs(pairs)))
+    return failure();
+
+  for (auto [splitBlock, mergeBlock] : pairs) {
+    handshake::ConditionalBranchOp ctrlBr;
+    BufferOp buffer = buildSplitNetwork(splitBlock, ctrlBr);
+    buildMergeNetwork(mergeBlock, buffer, ctrlBr);
+  }
+
+  return success();
+}
+
+BufferOp FeedForwardNetworkRewriter::buildSplitNetwork(
+    Block *splitBlock, handshake::ConditionalBranchOp &ctrlBr) {
+  SmallVector<handshake::ConditionalBranchOp> branches;
+  llvm::copy(splitBlock->getOps<handshake::ConditionalBranchOp>(),
+             std::back_inserter(branches));
+
+  auto *findRes = llvm::find_if(branches, [](auto br) {
+    return br.getDataOperand().getType().template isa<NoneType>();
+  });
+
+  assert(findRes && "expected one branch for the ctrl signal");
+  ctrlBr = *findRes;
+
+  Value cond = ctrlBr.getConditionOperand();
+  assert(llvm::all_of(branches, [&](auto branch) {
+    return branch.getConditionOperand() == cond;
+  }));
+
+  Location loc = cond.getLoc();
+  rewriter.setInsertionPointAfterValue(cond);
+
+  // The buffer size defines the number of threads that can be concurently
+  // traversing the sub-CFG starting at the splitBlock.
+  size_t bufferSize = 2;
+  // TODO how to size these?
+  // Longest path in a CFG-DAG would be O(#blocks)
+
+  return rewriter.create<handshake::BufferOp>(loc, cond, bufferSize,
+                                              BufferTypeEnum::fifo);
+}
+
+void FeedForwardNetworkRewriter::buildMergeNetwork(
+    Block *mergeBlock, BufferOp buf, handshake::ConditionalBranchOp &ctrlBr) {
+  // Replace control merge with mux
+  auto ctrlMerges = mergeBlock->getOps<handshake::ControlMergeOp>();
+  assert(std::distance(ctrlMerges.begin(), ctrlMerges.end()) == 1);
+
+  handshake::ControlMergeOp ctrlMerge = *ctrlMerges.begin();
+  rewriter.setInsertionPointAfter(ctrlMerge);
+  Location loc = ctrlMerge->getLoc();
+
+  // The newly inserted mux has to select the results from the correct operand.
+  // As there is no guarantee on the order of cmerge inputs, the correct order
+  // has to be determined first.
+  bool requiresFlip = requiresOperandFlip(ctrlMerge, ctrlBr);
+  SmallVector<Value> muxOperands;
+  if (requiresFlip)
+    muxOperands = llvm::to_vector(llvm::reverse(ctrlMerge.getOperands()));
+  else
+    muxOperands = llvm::to_vector(ctrlMerge.getOperands());
+
+  Value newCtrl = rewriter.create<handshake::MuxOp>(loc, buf, muxOperands);
+
+  Value cond = buf.getResult();
+  if (requiresFlip) {
+    // As the mux operand order is the flipped cmerge input order, the index
+    // which replaces the output of the cmerge has to be flipped/negated as
+    // well.
+    cond = rewriter.create<arith::XOrIOp>(
+        loc, cond.getType(), cond,
+        rewriter.create<arith::ConstantOp>(
+            loc, rewriter.getIntegerAttr(rewriter.getI1Type(), 1)));
+  }
+
+  // Require a cast to index to stick to the type of the mux input.
+  Value condAsIndex =
+      rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), cond);
+
+  hl.setBlockEntryControl(mergeBlock, newCtrl);
+
+  // Replace with new ctrl value from mux and the index
+  rewriter.replaceOp(ctrlMerge, {newCtrl, condAsIndex});
+}
+
+bool FeedForwardNetworkRewriter::requiresOperandFlip(
+    ControlMergeOp &ctrlMerge, handshake::ConditionalBranchOp &ctrlBr) {
+  assert(ctrlMerge.getNumOperands() == 2 &&
+         "Loops should already have been handled");
+
+  Value fstOperand = ctrlMerge.getOperand(0);
+
+  assert(ctrlBr.getTrueResult().hasOneUse() &&
+         "expected the result of a branch to only have one user");
+  Operation *trueUser = *ctrlBr.getTrueResult().user_begin();
+  if (trueUser == ctrlBr)
+    // The cmerge directly consumes the cond_br output.
+    return ctrlBr.getTrueResult() == fstOperand;
+
+  // The cmerge is consumed in an intermediate block. Find out if this block is
+  // a predecessor of the "true" successor of the cmerge.
+  Block *trueBlock = trueUser->getBlock();
+  return domInfo.dominates(trueBlock, fstOperand.getDefiningOp()->getBlock());
 }
 
 namespace {
@@ -695,7 +980,7 @@ LoopNetworkRewriter::processRegion(Region &r,
 
 // Returns the operand of the 'mux' operation which originated from 'block'.
 static Value getOperandFromBlock(MuxOp mux, Block *block) {
-  auto inValueIt = llvm::find_if(mux.dataOperands(), [&](Value operand) {
+  auto inValueIt = llvm::find_if(mux.getDataOperands(), [&](Value operand) {
     return block == operand.getParentBlock();
   });
   assert(
@@ -768,9 +1053,8 @@ BufferOp LoopNetworkRewriter::buildContinueNetwork(Block *loopHeader,
   // Create loop mux and the loop priming register. The loop mux will on select
   // "0" select external control, and internal control at "1". This convention
   // must be followed by the loop exit network.
-  auto primingRegister = rewriter->create<BufferOp>(
-      loc, rewriter->getI1Type(), /*size=*/1, loopPrimingInput,
-      /*bufferType=*/BufferTypeEnum::seq);
+  auto primingRegister =
+      rewriter->create<BufferOp>(loc, loopPrimingInput, 1, BufferTypeEnum::seq);
   // Initialize the priming register to path 0.
   primingRegister->setAttr("initValues", rewriter->getI64ArrayAttr({0}));
 
@@ -778,7 +1062,7 @@ BufferOp LoopNetworkRewriter::buildContinueNetwork(Block *loopHeader,
   // the loop from any external block or the single loop backedge.
   auto loopCtrlMux = rewriter->create<MuxOp>(
       loc, primingRegister.getResult(),
-      llvm::SmallVector<Value>{externalCtrlMerge.result(), loopCtrl});
+      llvm::SmallVector<Value>{externalCtrlMerge.getResult(), loopCtrl});
 
   // Replace the existing control merge 'result' output with the loop control
   // mux.
@@ -805,7 +1089,7 @@ BufferOp LoopNetworkRewriter::buildContinueNetwork(Block *loopHeader,
     externalDataInputs[muxOp] = getSortedInputs(externalCtrlMerge, muxOp);
     loopDataInputs[muxOp] = getOperandFromBlock(muxOp, loopLatch);
     assert(/*loop latch input*/ 1 + externalDataInputs[muxOp].size() ==
-               muxOp.dataOperands().size() &&
+               muxOp.getDataOperands().size() &&
            "Expected all mux operands to be partitioned between loop and "
            "external data inputs");
   }
@@ -817,7 +1101,7 @@ BufferOp LoopNetworkRewriter::buildContinueNetwork(Block *loopHeader,
   // priming register.
   for (MuxOp mux : muxesToReplace) {
     auto externalDataMux = rewriter->create<MuxOp>(
-        loc, externalCtrlMerge.index(), externalDataInputs[mux]);
+        loc, externalCtrlMerge.getIndex(), externalDataInputs[mux]);
 
     rewriter->replaceOp(
         mux, rewriter
@@ -853,15 +1137,15 @@ void LoopNetworkRewriter::buildExitNetwork(
     assert(
         condBr &&
         "Expected a conditional control branch op in the loop condition block");
-    Operation *trueUser = *condBr.trueResult().getUsers().begin();
+    Operation *trueUser = *condBr.getTrueResult().getUsers().begin();
     bool isTrueParity = trueUser->getBlock() == exitBlock;
     assert(isTrueParity ^
-               ((*condBr.falseResult().getUsers().begin())->getBlock() ==
+               ((*condBr.getFalseResult().getUsers().begin())->getBlock() ==
                 exitBlock) &&
            "The user of either the true or the false result should be in the "
            "exit block");
 
-    Value condValue = condBr.conditionOperand();
+    Value condValue = condBr.getConditionOperand();
     if (isTrueParity) {
       // This goes against the convention, and we have to invert the condition
       // value before connecting it to the exit network.
@@ -929,10 +1213,10 @@ static Value getSuccResult(Operation *termOp, Operation *newOp,
   // For conditional block, check if result goes to true or to false successor
   if (auto condBranchOp = dyn_cast<mlir::cf::CondBranchOp>(termOp)) {
     if (condBranchOp.getTrueDest() == succBlock)
-      return dyn_cast<handshake::ConditionalBranchOp>(newOp).trueResult();
+      return dyn_cast<handshake::ConditionalBranchOp>(newOp).getTrueResult();
     else {
       assert(condBranchOp.getFalseDest() == succBlock);
-      return dyn_cast<handshake::ConditionalBranchOp>(newOp).falseResult();
+      return dyn_cast<handshake::ConditionalBranchOp>(newOp).getFalseResult();
     }
   }
   // If the block is unconditional, newOp has only one result
@@ -999,7 +1283,8 @@ HandshakeLowering::addBranchOps(ConversionPatternRewriter &rewriter) {
 
     SmallVector<mlir::Block *, 8> results(block.getSuccessors());
     rewriter.setInsertionPointToEnd(&block);
-    rewriter.create<handshake::TerminatorOp>(termOp->getLoc(), results);
+    rewriter.create<handshake::TerminatorOp>(termOp->getLoc(),
+                                             ArrayRef<mlir::Block *>{results});
 
     // Remove the Operands to keep the single-use rule.
     for (int i = 0, e = termOp->getNumOperands(); i < e; ++i)
@@ -1021,9 +1306,11 @@ LogicalResult HandshakeLowering::connectConstantsToControl(
     for (auto constantOp : llvm::make_early_inc_range(
              r.template getOps<mlir::arith::ConstantOp>())) {
       rewriter.setInsertionPointAfter(constantOp);
+      auto value = constantOp.getValue();
       rewriter.replaceOpWithNewOp<handshake::ConstantOp>(
-          constantOp, constantOp.getValue(),
-          rewriter.create<handshake::SourceOp>(constantOp.getLoc()));
+          constantOp, value.getType(), value,
+          rewriter.create<handshake::SourceOp>(constantOp.getLoc(),
+                                               rewriter.getNoneType()));
     }
   } else {
     for (Block &block : r) {
@@ -1031,134 +1318,51 @@ LogicalResult HandshakeLowering::connectConstantsToControl(
       for (auto constantOp : llvm::make_early_inc_range(
                block.template getOps<mlir::arith::ConstantOp>())) {
         rewriter.setInsertionPointAfter(constantOp);
+        auto value = constantOp.getValue();
         rewriter.replaceOpWithNewOp<handshake::ConstantOp>(
-            constantOp, constantOp.getValue(), blockEntryCtrl);
+            constantOp, value.getType(), value, blockEntryCtrl);
       }
     }
   }
   return success();
 }
 
-static LogicalResult checkUseCount(Operation *op, Value res) {
-  // Checks if every result has single use
-  if (!res.hasOneUse()) {
-    int i = 0;
-    for (auto *user : res.getUsers()) {
-      user->emitWarning("user here");
-      i++;
-    }
-    return op->emitOpError("every result must have exactly one user, but had ")
-           << i;
-  }
-  return success();
-}
+/// Holds information about an handshake "basic block terminator" control
+/// operation
+struct BlockControlTerm {
+  /// The operation
+  Operation *op;
+  /// The operation's control operand (must have type NoneType)
+  Value ctrlOperand;
 
-// Checks if op successors are in appropriate blocks
-static LogicalResult checkSuccessorBlocks(Operation *op, Value res) {
-  for (auto &u : res.getUses()) {
-    Operation *succOp = u.getOwner();
-    // Non-branch ops: succesors must be in same block
-    if (!(isa<handshake::ConditionalBranchOp>(op) ||
-          isa<handshake::BranchOp>(op))) {
-      if (op->getBlock() != succOp->getBlock())
-        return op->emitOpError("cannot be block live-out");
-    } else {
-      // Branch ops: must have successor per successor block
-      if (op->getBlock()->getNumSuccessors() != op->getNumResults())
-        return op->emitOpError("incorrect successor count");
-      bool found = false;
-      for (int i = 0, e = op->getBlock()->getNumSuccessors(); i < e; ++i) {
-        Block *succ = op->getBlock()->getSuccessor(i);
-        if (succOp->getBlock() == succ || isa<SinkOp>(succOp))
-          found = true;
-      }
-      if (!found)
-        return op->emitOpError("branch successor in incorrect block");
-    }
-  }
-  return success();
-}
-
-// Checks if merge predecessors are in appropriate block
-static LogicalResult checkMergeOps(MergeLikeOpInterface mergeOp,
-                                   bool disableTaskPipelining) {
-  Block *block = mergeOp->getBlock();
-  unsigned operand_count = mergeOp.dataOperands().size();
-
-  // Merges in entry block have single predecessor (argument)
-  if (block->isEntryBlock()) {
-    if (operand_count != 1)
-      return mergeOp->emitOpError(
-                 "merge operations in entry block must have a ")
-             << "single predecessor";
-  } else {
-    if (operand_count > getBlockPredecessorCount(block))
-      return mergeOp->emitOpError("merge operation has ")
-             << operand_count << " data inputs, but only "
-             << getBlockPredecessorCount(block) << " predecessor blocks";
+  BlockControlTerm(Operation *op, Value ctrlOperand)
+      : op(op), ctrlOperand(ctrlOperand) {
+    assert(op && ctrlOperand);
+    assert(ctrlOperand.getType().isa<NoneType>() &&
+           "Control operand must be a NoneType");
   }
 
-  if (disableTaskPipelining) {
-    // There must be a predecessor from each predecessor block
-    for (auto *predBlock : block->getPredecessors()) {
-      bool found = false;
-      for (auto operand : mergeOp.dataOperands()) {
-        auto *operandOp = operand.getDefiningOp();
-        if (operandOp->getBlock() == predBlock) {
-          found = true;
-          break;
-        }
-      }
-      if (!found)
-        return mergeOp->emitOpError(
-            "missing predecessor from predecessor block");
-    }
+  /// Checks for member-wise equality
+  friend bool operator==(const BlockControlTerm &lhs,
+                         const BlockControlTerm &rhs) {
+    return lhs.op == rhs.op && lhs.ctrlOperand == rhs.ctrlOperand;
   }
+};
 
-  // Select operand must come from same block
-  if (auto muxOp = dyn_cast<MuxOp>(mergeOp.getOperation())) {
-    auto *operand = muxOp.selectOperand().getDefiningOp();
-    if (operand->getBlock() != block)
-      return mergeOp->emitOpError("mux select operand must be from same block");
-  }
-  return success();
-}
-
-LogicalResult handshake::checkDataflowConversion(Region &r,
-                                                 bool disableTaskPipelining) {
-  for (Operation &op : r.getOps()) {
-    if (isa<mlir::cf::CondBranchOp, mlir::cf::BranchOp, memref::LoadOp,
-            arith::ConstantOp, mlir::AffineReadOpInterface, mlir::AffineForOp>(
-            op))
-      continue;
-
-    if (op.getNumResults() > 0) {
-      for (auto result : op.getResults()) {
-        if (checkUseCount(&op, result).failed() ||
-            checkSuccessorBlocks(&op, result).failed())
-          return failure();
-      }
-    }
-    if (auto mergeOp = dyn_cast<MergeLikeOpInterface>(op); mergeOp)
-      if (checkMergeOps(mergeOp, disableTaskPipelining).failed())
-        return failure();
-  }
-  return success();
-}
-
-static Value getBlockControlValue(Block *block) {
-  // Get control-only value sent to the block terminator
+static BlockControlTerm getBlockControlTerminator(Block *block) {
+  // Identify the control terminator operation and its control operand in the
+  // given block. One such operation must exist in the block
   for (Operation &op : *block) {
-    if (auto BranchOp = dyn_cast<handshake::BranchOp>(op))
-      if (BranchOp.isControl())
-        return BranchOp.dataOperand();
-    if (auto BranchOp = dyn_cast<handshake::ConditionalBranchOp>(op))
-      if (BranchOp.isControl())
-        return BranchOp.dataOperand();
+    if (auto branchOp = dyn_cast<handshake::BranchOp>(op))
+      if (branchOp.isControl())
+        return {branchOp, branchOp.getDataOperand()};
+    if (auto branchOp = dyn_cast<handshake::ConditionalBranchOp>(op))
+      if (branchOp.isControl())
+        return {branchOp, branchOp.getDataOperand()};
     if (auto endOp = dyn_cast<handshake::ReturnOp>(op))
-      return endOp.control();
+      return {endOp, endOp.getOperands().back()};
   }
-  return nullptr;
+  assert(false && "Block terminator must exist");
 }
 
 static LogicalResult getOpMemRef(Operation *op, Value &out) {
@@ -1189,8 +1393,12 @@ HandshakeLowering::replaceMemoryOps(ConversionPatternRewriter &rewriter,
 
   // Enrich the memRefOps context with BlockArguments, in case they aren't used.
   for (auto arg : r.getArguments()) {
-    if (!arg.getType().isa<MemRefType>())
+    auto memrefType = dyn_cast<mlir::MemRefType>(arg.getType());
+    if (!memrefType)
       continue;
+    // Ensure that this is a valid memref-typed value.
+    if (failed(isValidMemrefType(arg.getLoc(), memrefType)))
+      return failure();
     memRefOps.insert(std::make_pair(arg, std::vector<Operation *>()));
   }
 
@@ -1255,7 +1463,7 @@ HandshakeLowering::replaceMemoryOps(ConversionPatternRewriter &rewriter,
                 auto loadOp = rewriter.create<handshake::LoadOp>(
                     op.getLoc(), access.memref, *operands);
                 newOp = loadOp;
-                op.getResult(0).replaceAllUsesWith(loadOp.dataResult());
+                op.getResult(0).replaceAllUsesWith(loadOp.getDataResult());
               } else {
                 newOp = rewriter.create<handshake::StoreOp>(
                     op.getLoc(), op.getOperand(0), *operands);
@@ -1288,7 +1496,7 @@ static SmallVector<Value, 8> getResultsToMemory(Operation *op) {
   if (handshake::LoadOp loadOp = dyn_cast<handshake::LoadOp>(op)) {
     // For load, get all address outputs/indices
     // (load also has one data output which goes to successor operation)
-    SmallVector<Value, 8> results(loadOp.addressResults());
+    SmallVector<Value, 8> results(loadOp.getAddressResults());
     return results;
 
   } else {
@@ -1303,40 +1511,22 @@ static SmallVector<Value, 8> getResultsToMemory(Operation *op) {
 static void addLazyForks(Region &f, ConversionPatternRewriter &rewriter) {
 
   for (Block &block : f) {
-    Value res = getBlockControlValue(&block);
-    if (!res.hasOneUse())
-      insertFork(res, true, rewriter);
+    Value ctrl = getBlockControlTerminator(&block).ctrlOperand;
+    if (!ctrl.hasOneUse())
+      insertFork(ctrl, true, rewriter);
   }
 }
 
-static void addMemOpForks(Region &f, ConversionPatternRewriter &rewriter) {
-
-  for (Block &block : f) {
-    for (Operation &op : block) {
-      if (isa<MemoryOp, ExternalMemoryOp, StartOp, ControlMergeOp>(op)) {
-        for (auto result : op.getResults()) {
-          // If there is a result and it is used more than once
-          if (!result.use_empty() && !result.hasOneUse())
-            insertFork(result, false, rewriter);
-        }
-      }
-    }
-  }
-}
-
-static void removeAllocOps(Region &f, ConversionPatternRewriter &rewriter) {
+static void removeUnusedAllocOps(Region &f,
+                                 ConversionPatternRewriter &rewriter) {
   std::vector<Operation *> opsToDelete;
 
   /// TODO(mortbopet): use explicit template parameter when moving to C++20
   auto remover = [&](auto allocType) {
-    for (auto allocOp : f.getOps<decltype(allocType)>()) {
-      assert(allocOp.getResult().hasOneUse());
-      for (auto &u : allocOp.getResult().getUses()) {
-        Operation *useOp = u.getOwner();
-        if (isa<SinkOp>(useOp))
-          opsToDelete.push_back(allocOp);
-      }
-    }
+    for (auto allocOp : f.getOps<decltype(allocType)>())
+      // Remove alloc operations whose result has no use
+      if (allocOp.getResult().use_empty())
+        opsToDelete.push_back(allocOp);
   };
 
   remover(memref::AllocOp());
@@ -1344,58 +1534,35 @@ static void removeAllocOps(Region &f, ConversionPatternRewriter &rewriter) {
   llvm::for_each(opsToDelete, [&](auto allocOp) { rewriter.eraseOp(allocOp); });
 }
 
-static void removeRedundantSinks(Region &f,
-                                 ConversionPatternRewriter &rewriter) {
-  std::vector<Operation *> redundantSinks;
-
-  for (Block &block : f)
-    for (Operation &op : block) {
-      if (!isa<SinkOp>(op))
-        continue;
-
-      if (!op.getOperand(0).hasOneUse() ||
-          isa<memref::AllocOp, memref::AllocaOp>(
-              op.getOperand(0).getDefiningOp()))
-        redundantSinks.push_back(&op);
-    }
-  for (unsigned i = 0, e = redundantSinks.size(); i != e; ++i) {
-    auto *op = redundantSinks[i];
-    rewriter.eraseOp(op);
-    // op->erase();
-  }
-}
-
 static void addJoinOps(ConversionPatternRewriter &rewriter,
-                       ArrayRef<Value> controlVals) {
-  for (auto val : controlVals) {
-    assert(val.hasOneUse());
-    auto srcOp = val.getDefiningOp();
+                       ArrayRef<BlockControlTerm> controlTerms) {
+  for (auto term : controlTerms) {
+    auto &[op, ctrl] = term;
+    auto *srcOp = ctrl.getDefiningOp();
 
     // Insert only single join per block
     if (!isa<JoinOp>(srcOp)) {
       rewriter.setInsertionPointAfter(srcOp);
-      Operation *newOp = rewriter.create<JoinOp>(srcOp->getLoc(), val);
-      for (auto &u : val.getUses())
-        if (u.getOwner() != newOp)
-          u.getOwner()->replaceUsesOfWith(val, newOp->getResult(0));
+      Operation *newJoin = rewriter.create<JoinOp>(srcOp->getLoc(), ctrl);
+      op->replaceUsesOfWith(ctrl, newJoin->getResult(0));
     }
   }
 }
 
-static std::vector<Value> getControlValues(ArrayRef<Operation *> memOps) {
-  std::vector<Value> vals;
+static std::vector<BlockControlTerm>
+getControlTerminators(ArrayRef<Operation *> memOps) {
+  std::vector<BlockControlTerm> terminators;
 
   for (Operation *op : memOps) {
     // Get block from which the mem op originates
     Block *block = op->getBlock();
-    // Add control signal from each block
-    // Use result which goes to the branch
-    Value res = getBlockControlValue(block);
-    assert(res != nullptr);
-    if (std::find(vals.begin(), vals.end(), res) == vals.end())
-      vals.push_back(res);
+    // Identify the control terminator in the block
+    auto term = getBlockControlTerminator(block);
+    if (std::find(terminators.begin(), terminators.end(), term) ==
+        terminators.end())
+      terminators.push_back(term);
   }
-  return vals;
+  return terminators;
 }
 
 static void addValueToOperands(Operation *op, Value val) {
@@ -1421,8 +1588,8 @@ static LogicalResult setJoinControlInputs(ArrayRef<Operation *> memOps,
   // ops terminate before a new block starts)
   for (int i = 0, e = memOps.size(); i < e; ++i) {
     auto *op = memOps[i];
-    Value val = getBlockControlValue(op->getBlock());
-    auto srcOp = val.getDefiningOp();
+    Value ctrl = getBlockControlTerminator(op->getBlock()).ctrlOperand;
+    auto *srcOp = ctrl.getDefiningOp();
     if (!isa<JoinOp, StartOp>(srcOp)) {
       return srcOp->emitOpError("Op expected to be a JoinOp or StartOp");
     }
@@ -1484,21 +1651,20 @@ HandshakeLowering::connectToMemory(ConversionPatternRewriter &rewriter,
 
     mlir::MemRefType memrefType =
         memrefOperand.getType().cast<mlir::MemRefType>();
-    if (memrefType.getNumDynamicDims() != 0 ||
-        memrefType.getShape().size() != 1)
-      return emitError(memrefOperand.getLoc())
-             << "memref's must be both statically sized and "
-                "unidimensional.";
+    if (failed(isValidMemrefType(memrefOperand.getLoc(), memrefType)))
+      return failure();
 
     std::vector<Value> operands;
 
-    // Get control values which need to connect to memory
-    std::vector<Value> controlVals = getControlValues(memory.second);
+    // Get control terminators whose control operand need to connect to memory
+    std::vector<BlockControlTerm> controlTerms =
+        getControlTerminators(memory.second);
 
     // In case of LSQ interface, set control values as inputs (used to
     // trigger allocation to LSQ)
     if (lsq)
-      operands.insert(operands.end(), controlVals.begin(), controlVals.end());
+      for (auto valOp : controlTerms)
+        operands.push_back(valOp.ctrlOperand);
 
     // Add load indices and store data+indices to memory operands
     // Count number of loads so that we can generate appropriate number of
@@ -1556,7 +1722,7 @@ HandshakeLowering::connectToMemory(ConversionPatternRewriter &rewriter,
     if (!lsq) {
       // Create Joins which join done signals from memory with the
       // control-only network
-      addJoinOps(rewriter, controlVals);
+      addJoinOps(rewriter, controlTerms);
 
       // Connect all load/store done signals to the join of their block
       // Ensure that the block terminates only after all its accesses have
@@ -1565,18 +1731,9 @@ HandshakeLowering::connectToMemory(ConversionPatternRewriter &rewriter,
       // user-determined)
       bool control = true;
 
-      if (control) {
-        if (setJoinControlInputs(memory.second, newOp, ld_count, newInd)
-                .failed())
-          return failure();
-
-      } else {
-        for (int i = 0, e = cntrl_count; i < e; ++i) {
-          rewriter.setInsertionPointAfter(newOp);
-          rewriter.create<SinkOp>(newOp->getLoc(),
-                                  newOp->getResult(ld_count + i));
-        }
-      }
+      if (control)
+        returnOnError(
+            setJoinControlInputs(memory.second, newOp, ld_count, newInd));
 
       // Set control-only inputs to each memory op
       // Ensure that op starts only after prior blocks have completed
@@ -1588,14 +1745,8 @@ HandshakeLowering::connectToMemory(ConversionPatternRewriter &rewriter,
 
   if (lsq)
     addLazyForks(r, rewriter);
-  else
-    addMemOpForks(r, rewriter);
 
-  removeAllocOps(r, rewriter);
-
-  // Loads and stores have some sinks which are no longer needed now that
-  // they connect to MemoryOp
-  removeRedundantSinks(r, rewriter);
+  removeUnusedAllocOps(r, rewriter);
   return success();
 }
 
@@ -1608,34 +1759,6 @@ static Operation *findStartOp(Region &region) {
 
   llvm::report_fatal_error("No handshake::StartOp in first block");
 }
-
-struct HandshakeCanonicalizePattern : public ConversionPattern {
-  using ConversionPattern::ConversionPattern;
-  LogicalResult match(Operation *op) const override {
-    // Ignore forks, ops without results, and branches (ops with succ blocks)
-    op->emitWarning("checking...");
-    return success();
-    if (op->getNumSuccessors() == 0 && op->getNumResults() > 0 &&
-        !isa<ForkOp>(op))
-      return success();
-    else
-      return failure();
-  }
-
-  void rewrite(Operation *op, ArrayRef<Value> /*operands*/,
-               ConversionPatternRewriter &rewriter) const override {
-    op->emitWarning("skipping...");
-    if (op->getNumSuccessors() == 0 && op->getNumResults() > 0 &&
-        !isa<ForkOp>(op)) {
-      op->emitWarning("skipping...");
-    }
-    for (auto result : op->getResults()) {
-      // If there is a result and it is used more than once
-      if (!result.use_empty() && !result.hasOneUse())
-        insertFork(result, false, rewriter);
-    }
-  }
-};
 
 LogicalResult
 HandshakeLowering::replaceCallOps(ConversionPatternRewriter &rewriter) {
@@ -1680,7 +1803,7 @@ static LogicalResult lowerFuncOp(func::FuncOp funcOp, MLIRContext *ctx,
   SmallVector<NamedAttribute, 4> attributes;
   for (const auto &attr : funcOp->getAttrs()) {
     if (attr.getName() == SymbolTable::getSymbolAttrName() ||
-        attr.getName() == function_interface_impl::getTypeAttrName())
+        attr.getName() == funcOp.getFunctionTypeAttrName())
       continue;
     attributes.push_back(attr);
   }
@@ -1737,6 +1860,19 @@ struct ConvertSelectOps : public OpConversionPattern<mlir::arith::SelectOp> {
     return success();
   };
 };
+} // namespace
+
+LogicalResult handshake::postDataflowConvert(Operation *op) {
+  MLIRContext *context = op->getContext();
+  ConversionTarget target(*context);
+  target.addLegalDialect<handshake::HandshakeDialect>();
+  target.addIllegalOp<mlir::arith::SelectOp>();
+  RewritePatternSet patterns(context);
+  patterns.insert<ConvertSelectOps>(context);
+  return applyPartialConversion(op, target, std::move(patterns));
+}
+
+namespace {
 
 struct HandshakeRemoveBlockPass
     : HandshakeRemoveBlockBase<HandshakeRemoveBlockPass> {
@@ -1745,6 +1881,10 @@ struct HandshakeRemoveBlockPass
 
 struct StandardToHandshakePass
     : public StandardToHandshakeBase<StandardToHandshakePass> {
+  StandardToHandshakePass(bool sourceConstants, bool disableTaskPipelining) {
+    this->sourceConstants = sourceConstants;
+    this->disableTaskPipelining = disableTaskPipelining;
+  }
   void runOnOperation() override {
     ModuleOp m = getOperation();
 
@@ -1764,22 +1904,15 @@ struct StandardToHandshakePass
         return signalPassFailure();
     }
   }
-
-  LogicalResult postDataflowConvert(handshake::FuncOp op) {
-    ConversionTarget target(getContext());
-    target.addLegalDialect<handshake::HandshakeDialect>();
-    target.addIllegalOp<mlir::arith::SelectOp>();
-    RewritePatternSet patterns(&getContext());
-    patterns.insert<ConvertSelectOps>(&getContext());
-    return applyPartialConversion(op, target, std::move(patterns));
-  }
 };
 
 } // namespace
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-circt::createStandardToHandshakePass() {
-  return std::make_unique<StandardToHandshakePass>();
+circt::createStandardToHandshakePass(bool sourceConstants,
+                                     bool disableTaskPipelining) {
+  return std::make_unique<StandardToHandshakePass>(sourceConstants,
+                                                   disableTaskPipelining);
 }
 
 std::unique_ptr<mlir::OperationPass<handshake::FuncOp>>

@@ -12,10 +12,13 @@ add_circt_dialect_library(CIRCTPipelineOps
   ${PROJECT_BINARY_DIR}/include
 
   LINK_LIBS PUBLIC
-  MLIRArithmeticDialect
+  CIRCTESI
+  MLIRArithDialect
   MLIRFuncDialect
   MLIRIR
 
   DEPENDS
   MLIRPipelineIncGen
 )
+
+add_subdirectory(Transforms)

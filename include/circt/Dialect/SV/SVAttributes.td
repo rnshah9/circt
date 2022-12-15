@@ -77,5 +77,18 @@ def SVAttributesAttr : AttrDef<SVDialect, "SVAttributes"> {
   let parameters = (ins "mlir::ArrayAttr":$attributes,
                       DefaultValuedParameter<"mlir::BoolAttr",
                       "mlir::BoolAttr::get($_ctxt, false)">:$emitAsComments);
+  let builders = [
+    AttrBuilder<(ins "llvm::ArrayRef<llvm::StringRef>":$strings,
+                     CArg<"bool", "false">: $emitAsComments), [{
+      SmallVector<Attribute> attrs;
+      for (auto str : strings)
+        attrs.push_back(sv::SVAttributeAttr::get(
+            $_ctxt, ::mlir::StringAttr::get($_ctxt, str), ::mlir::StringAttr()));
+      return $_get($_ctxt, ::mlir::ArrayAttr::get($_ctxt, attrs),
+                   ::mlir::BoolAttr::get($_ctxt, emitAsComments));
+    }]>,
+    AttrBuilder<(ins
+      "llvm::ArrayRef<std::pair<llvm::StringRef, llvm::StringRef>>":$keyValuePairs,
+       CArg<"bool", "false">: $emitAsComments)>];
   let hasCustomAssemblyFormat = true;
 }

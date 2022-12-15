@@ -39,6 +39,8 @@ def LowerFIRRTLAnnotations : Pass<"firrtl-lower-annotations", "firrtl::CircuitOp
        "Total number of annotations processed">,
     Statistic<"numUnhandled", "num-unhandled-annos",
       "Number of unhandled annotations">,
+    Statistic<"numReusedHierPathOps", "num-reused-hierpath",
+      "Number of reused HierPathOp's">,
   ];
 }
 
@@ -376,9 +378,8 @@ def BlackBoxReader : Pass<"firrtl-blackbox-reader", "CircuitOp"> {
 }
 
 def PrefixModules : Pass<"firrtl-prefix-modules", "firrtl::CircuitOp"> {
-  let summary = "Prefixes names of modules and mems in a hiearchy";
+  let summary = "Prefixes names of modules and mems in a hierarchy";
   let description = [{
-
     This pass looks for modules annotated with the
     `NestedPrefixModulesAnnotation` and prefixes the names of all modules
     instantiated underneath it.  If `inclusive` is true, it includes the target
@@ -533,7 +534,7 @@ def ExtractInstances : Pass<"firrtl-extract-instances", "firrtl::CircuitOp"> {
 }
 
 def MemToRegOfVec : Pass<"firrtl-mem-to-reg-of-vec", "firrtl::CircuitOp"> {
-  let summary = "Convert the memory to a Register vector";
+  let summary = "Convert combinational memories to a vector of registers";
   let description = [{
     This pass generates the logic to implement a memory using Registers.
   }];
@@ -567,8 +568,8 @@ def DropName : Pass<"firrtl-drop-names", "firrtl::FModuleOp"> {
   }];
   let constructor = "circt::firrtl::createDropNamesPass()";
   let options = [
-    Option<"preserveMode", "preserve-values", "PreserveValues::PreserveMode", 
-           "PreserveValues::None", 
+    Option<"preserveMode", "preserve-values", "PreserveValues::PreserveMode",
+           "PreserveValues::None",
            "specify the values which can be optimized away", [{
             ::llvm::cl::values(
               clEnumValN(PreserveValues::None, "none",
@@ -582,6 +583,71 @@ def DropName : Pass<"firrtl-drop-names", "firrtl::FModuleOp"> {
   let statistics = [
     Statistic<"numNamesConverted", "num-names-converted",
       "Number of interesting names made droppable">,
+  ];
+}
+
+def RandomizeRegisterInit :
+    Pass<"firrtl-randomize-register-init", "firrtl::FModuleOp"> {
+  let summary = "Randomize register initialization.";
+  let description = [{
+    This pass eagerly creates large vectors of randomized bits for initializing
+    registers, and marks each register with attributes indicating which bits to
+    read. If the registers survive until LowerToHW, their initialization logic
+    will pick up the correct bits.
+
+    This ensures a stable initialization, so registers should always see the
+    same initial value for the same seed, regardless of optimization levels.
+  }];
+  let constructor = "circt::firrtl::createRandomizeRegisterInitPass()";
+}
+
+def LowerXMR : Pass<"firrtl-lower-xmr", "firrtl::CircuitOp"> {
+  let summary = "Lower ref ports to XMR";
+  let description = [{
+    This pass lowers RefType ops and ports to verbatim encoded XMRs.
+  }];
+  let constructor = "circt::firrtl::createLowerXMRPass()";
+  let dependentDialects = ["sv::SVDialect"];
+}
+
+def LowerIntrinsics : Pass<"firrtl-lower-intrinsics", "firrtl::CircuitOp"> {
+  let summary = "Lower intrinsics";
+  let description = [{
+    This pass lowers intrinsics encoded as extmodule with annotation and 
+    intmodule to their implementation or op.
+  }];
+  let constructor = "circt::firrtl::createLowerIntrinsicsPass()";
+}
+
+def ResolveTraces : Pass<"firrtl-resolve-traces", "firrtl::CircuitOp"> {
+  let summary = "Write out TraceAnnotations to an output annotation file";
+  let description = [{
+    This pass implements Chisel's Trace API.  It collects all TraceAnnotations
+    that exist in the circuit, updates them with information about the final
+    target in a design, and writes these to an output annotation file.  This
+    exists for Chisel users to build tooling around them that needs to query the
+    final output name/path of some component in a Chisel circuit.
+
+    Note: this pass and API are expected to be eventually replaced via APIs and
+    language bindings that enable users to directly query the MLIR.
+  }];
+  let constructor = "circt::firrtl::createResolveTracesPass()";
+  let options = [Option<"outputAnnotationFilename", "file", "std::string", "",
+      "Output file for the JSON-serialized Trace Annotations">];
+  let dependentDialects = ["sv::SVDialect"];
+}
+
+def InnerSymbolDCE : Pass<"firrtl-inner-symbol-dce", "mlir::ModuleOp"> {
+  let summary = "Eliminate dead inner symbols";
+  let description = [{
+    This pass deletes all inner symbols which have no uses. This is necessary to
+    unblock optimizations and removal of the operations which have these unused
+    inner symbols.
+  }];
+  let constructor = "circt::firrtl::createInnerSymbolDCEPass()";
+  let statistics = [
+    Statistic<"numSymbolsFound", "num-sym-found", "Number of symbols found">,
+    Statistic<"numSymbolsRemoved", "num-sym-removed", "Number of symbols removed">
   ];
 }
 

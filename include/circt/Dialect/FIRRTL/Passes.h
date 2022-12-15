@@ -54,6 +54,8 @@ std::unique_ptr<mlir::Pass> createLowerBundleVectorTypesPass();
 
 std::unique_ptr<mlir::Pass> createLowerCHIRRTLPass();
 
+std::unique_ptr<mlir::Pass> createLowerIntrinsicsPass();
+
 std::unique_ptr<mlir::Pass> createIMConstPropPass();
 
 std::unique_ptr<mlir::Pass>
@@ -65,8 +67,8 @@ std::unique_ptr<mlir::Pass> createInferReadWritePass();
 
 std::unique_ptr<mlir::Pass>
 createCreateSiFiveMetadataPass(bool replSeqMem = false,
-                               StringRef replSeqMemCircuit = "",
-                               StringRef replSeqMemFile = "");
+                               mlir::StringRef replSeqMemCircuit = "",
+                               mlir::StringRef replSeqMemFile = "");
 
 std::unique_ptr<mlir::Pass> createWireDFTPass();
 
@@ -74,7 +76,8 @@ std::unique_ptr<mlir::Pass> createAddSeqMemPortsPass();
 
 std::unique_ptr<mlir::Pass> createDedupPass();
 
-std::unique_ptr<mlir::Pass> createEmitOMIRPass(StringRef outputFilename = "");
+std::unique_ptr<mlir::Pass>
+createEmitOMIRPass(mlir::StringRef outputFilename = "");
 
 std::unique_ptr<mlir::Pass> createExpandWhensPass();
 
@@ -96,14 +99,14 @@ std::unique_ptr<mlir::Pass> createPrintInstanceGraphPass();
 std::unique_ptr<mlir::Pass> createPrintNLATablePass();
 
 std::unique_ptr<mlir::Pass>
-createBlackBoxReaderPass(llvm::Optional<StringRef> inputPrefix = {});
+createBlackBoxReaderPass(llvm::Optional<mlir::StringRef> inputPrefix = {});
 
 std::unique_ptr<mlir::Pass> createGrandCentralPass();
 
 std::unique_ptr<mlir::Pass> createGrandCentralTapsPass();
 
 std::unique_ptr<mlir::Pass>
-createGrandCentralSignalMappingsPass(StringRef outputFilename = "");
+createGrandCentralSignalMappingsPass(mlir::StringRef outputFilename = "");
 
 std::unique_ptr<mlir::Pass> createCheckCombCyclesPass();
 
@@ -135,6 +138,15 @@ createDropNamesPass(PreserveValues::PreserveMode mode = PreserveValues::None);
 std::unique_ptr<mlir::Pass> createExtractInstancesPass();
 
 std::unique_ptr<mlir::Pass> createIMDeadCodeElimPass();
+
+std::unique_ptr<mlir::Pass> createRandomizeRegisterInitPass();
+
+std::unique_ptr<mlir::Pass> createLowerXMRPass();
+
+std::unique_ptr<mlir::Pass>
+createResolveTracesPass(StringRef outputAnnotationFilename = "");
+
+std::unique_ptr<mlir::Pass> createInnerSymbolDCEPass();
 
 /// Generate the code for registering passes.
 #define GEN_PASS_REGISTRATION

@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 def ChannelBufferOp : ESI_Abstract_Op<"buffer", [
-    NoSideEffect,
+    Pure,
     DeclareOpInterfaceMethods<ChannelOpInterface>
   ]> {
   let summary = "Control options for an ESI channel.";
@@ -43,14 +43,14 @@ def ChannelBufferOp : ESI_Abstract_Op<"buffer", [
   }];
 
   let arguments = (ins I1:$clk, I1:$rst, ChannelType:$input,
-    OptionalAttr<Confined<I64Attr, [IntMinValue<1>]>>:$stages,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<1>]>>:$stages,
     OptionalAttr<StrAttr>:$name);
   let results = (outs ChannelType:$output);
   let hasCustomAssemblyFormat = 1;
 }
 
 def PipelineStageOp : ESI_Physical_Op<"stage", [
-    NoSideEffect,
+    Pure,
     DeclareOpInterfaceMethods<ChannelOpInterface>
   ]> {
   let summary = "An elastic buffer stage.";
@@ -84,12 +84,11 @@ def CosimEndpointOp : ESI_Physical_Op<"cosim", []> {
     supported by the specific protocol.
   }];
 
-  let arguments = (ins I1:$clk, I1:$rst, ChannelType:$send,
-    I64Attr:$endpointID);
+  let arguments = (ins I1:$clk, I1:$rst, ChannelType:$send, StrAttr:$name);
   let results = (outs ChannelType:$recv);
 
   let assemblyFormat = [{
-    $clk `,` $rst `,` $send `,` $endpointID attr-dict
+    $clk `,` $rst `,` $send `,` $name attr-dict
       `:` qualified(type($send)) `->` qualified(type($recv))
   }];
 }
@@ -98,7 +97,7 @@ def RtlBitArrayType : Type<CPred<"$_self.isa<::circt::hw::ArrayType>()"
  " && $_self.cast<::circt::hw::ArrayType>().getElementType() =="
  "   ::mlir::IntegerType::get($_self.getContext(), 1)">, "an HW bit array">;
 
-def CapnpDecodeOp : ESI_Physical_Op<"decode.capnp", [NoSideEffect]> {
+def CapnpDecodeOp : ESI_Physical_Op<"decode.capnp", [Pure]> {
   let summary = "Translate bits in Cap'nProto messages to HW typed data";
 
   let arguments = (ins I1:$clk, I1:$valid, RtlBitArrayType:$capnpBits);
@@ -110,7 +109,7 @@ def CapnpDecodeOp : ESI_Physical_Op<"decode.capnp", [NoSideEffect]> {
   }];
 }
 
-def CapnpEncodeOp : ESI_Physical_Op<"encode.capnp", [NoSideEffect]> {
+def CapnpEncodeOp : ESI_Physical_Op<"encode.capnp", [Pure]> {
   let summary = "Translate HW typed data to Cap'nProto";
 
   let arguments = (ins I1:$clk, I1:$valid, AnyType:$dataToEncode);
@@ -122,31 +121,11 @@ def CapnpEncodeOp : ESI_Physical_Op<"encode.capnp", [NoSideEffect]> {
   }];
 }
 
-def NullSourceOp : ESI_Physical_Op<"null", [NoSideEffect]> {
+def NullSourceOp : ESI_Physical_Op<"null", [Pure]> {
   let summary = "An op which never produces messages.";
 
   let arguments = (ins);
   let results = (outs ChannelType:$out);
 
   let assemblyFormat = [{ attr-dict `:` qualified(type($out)) }];
-}
-
-def NoneSourceOp : ESI_Physical_Op<"none", [NoSideEffect]> {
-  let summary = [{"
-    An op which produces a 'none'-typed value, used in conjunction.
-    with data-less channels.
-  "}];
-
-  let arguments = (ins);
-  let results = (outs NoneType:$out);
-
-  let assemblyFormat = [{ attr-dict `:` qualified(type($out)) }];
-
-  let builders = [
-    OpBuilder<(ins), [{
-      $_state.addTypes($_builder.getNoneType());
-    }]>
-  ];
-
-
 }

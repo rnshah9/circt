@@ -1,5 +1,14 @@
 // RUN: circt-opt %s --convert-llhd-to-llvm | FileCheck %s
 
+// CHECK-LABEL: llvm.mlir.global internal @_array_global() {addr_space = 0 : i32} : !llvm.array<2 x i1> {
+// CHECK: [[VAL_0:%.+]] = llvm.mlir.undef : !llvm.array<2 x i1>
+// CHECK: [[VAL_1:%.+]] = llvm.mlir.constant(false) : i1
+// CHECK: [[VAL_2:%.+]] = llvm.insertvalue [[VAL_1]], [[VAL_0]][0] : !llvm.array<2 x i1>
+// CHECK: [[VAL_3:%.+]] = llvm.mlir.constant(false) : i1
+// CHECK: [[VAL_4:%.+]] = llvm.insertvalue [[VAL_3]], [[VAL_2]][1] : !llvm.array<2 x i1>
+// CHECK: llvm.return [[VAL_4]] : !llvm.array<2 x i1>
+// CHECK: }
+
 // CHECK-LABEL: llvm.func @llhd_init
 // CHECK: llvm.mlir.constant(false) : i1
 llhd.entity @root() -> () {
@@ -10,9 +19,8 @@ llhd.entity @root() -> () {
 }
 
 // CHECK: [[ZERO:%.+]] = llvm.mlir.constant(false) : i1
-// CHECK: [[A1:%.+]] = llvm.mlir.undef : !llvm.array<2 x i1>
-// CHECK: [[A2:%.+]] = llvm.insertvalue [[ZERO]], [[A1]][0 : i32] : !llvm.array<2 x i1>
-// CHECK: [[A3:%.+]] = llvm.insertvalue [[ZERO]], [[A2]][1 : i32] : !llvm.array<2 x i1>
+// CHECK: [[A2:%.+]] = llvm.mlir.addressof @_array_global : !llvm.ptr<array<2 x i1>>
+// CHECK: [[A3:%.+]] = llvm.load [[A2]] : !llvm.ptr<array<2 x i1>>
 // CHECK: llvm.store [[A3]], {{%.+}} : !llvm.ptr<array<2 x i1>>
 llhd.entity @initArraySig () -> () {
   %init = hw.constant 0 : i1
@@ -25,8 +33,8 @@ llhd.entity @initArraySig () -> () {
 // CHECK: [[FALSE:%.+]] = llvm.mlir.constant(false) : i1
 // CHECK: [[THREE:%.+]] = llvm.mlir.constant(3 : i5) : i5
 // CHECK: [[S1:%.+]] = llvm.mlir.undef : !llvm.struct<(i5, i1)>
-// CHECK: [[S2:%.+]] = llvm.insertvalue [[THREE]], [[S1]][0 : i32] : !llvm.struct<(i5, i1)>
-// CHECK: [[S3:%.+]] = llvm.insertvalue [[FALSE]], [[S2]][1 : i32] : !llvm.struct<(i5, i1)>
+// CHECK: [[S2:%.+]] = llvm.insertvalue [[THREE]], [[S1]][0] : !llvm.struct<(i5, i1)>
+// CHECK: [[S3:%.+]] = llvm.insertvalue [[FALSE]], [[S2]][1] : !llvm.struct<(i5, i1)>
 // CHECK: llvm.store [[S3]], {{%.+}} : !llvm.ptr<struct<(i5, i1)>>
 llhd.entity @initStructSig () -> () {
   %init = hw.constant 0 : i1
@@ -37,14 +45,14 @@ llhd.entity @initStructSig () -> () {
 
 // CHECK: [[B1:%.+]] = llvm.mlir.undef : !llvm.array<2 x i1>
 // CHECK: [[FALSE1:%.+]] = llvm.mlir.constant(false) : i1
-// CHECK: [[B2:%.+]] = llvm.insertvalue [[FALSE1]], [[B1]][0 : i32] : !llvm.array<2 x i1>
-// CHECK: [[B3:%.+]] = llvm.insertvalue [[FALSE1]], [[B2]][1 : i32] : !llvm.array<2 x i1>
+// CHECK: [[B2:%.+]] = llvm.insertvalue [[FALSE1]], [[B1]][0] : !llvm.array<2 x i1>
+// CHECK: [[B3:%.+]] = llvm.insertvalue [[FALSE1]], [[B2]][1] : !llvm.array<2 x i1>
 // CHECK: llvm.store [[B3]], {{%.+}} : !llvm.ptr<array<2 x i1>>
 llhd.entity @initPartiallyLowered () -> () {
   %0 = llvm.mlir.constant(false) : i1
   %1 = llvm.mlir.undef : !llvm.array<2 x i1>
-  %2 = llvm.insertvalue %0, %1[0 : i32] : !llvm.array<2 x i1>
-  %3 = llvm.insertvalue %0, %2[1 : i32] : !llvm.array<2 x i1>
+  %2 = llvm.insertvalue %0, %1[0] : !llvm.array<2 x i1>
+  %3 = llvm.insertvalue %0, %2[1] : !llvm.array<2 x i1>
   %4 = builtin.unrealized_conversion_cast %3 : !llvm.array<2 x i1> to !hw.array<2xi1>
   %5 = llhd.sig "sig" %4 : !hw.array<2xi1>
 }

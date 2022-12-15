@@ -42,6 +42,10 @@ constexpr const char *decodeTableAnnotation =
     "chisel3.util.experimental.decode.DecodeTableAnnotation";
 constexpr const char *flattenAnnoClass = "firrtl.transforms.FlattenAnnotation";
 constexpr const char *inlineAnnoClass = "firrtl.passes.InlineAnnotation";
+constexpr const char *traceNameAnnoClass =
+    "chisel3.experimental.Trace$TraceNameAnnotation";
+constexpr const char *traceAnnoClass =
+    "chisel3.experimental.Trace$TraceAnnotation";
 
 constexpr const char *omirAnnoClass =
     "freechips.rocketchip.objectmodel.OMIRAnnotation";
@@ -95,8 +99,6 @@ constexpr const char *viewAnnoClass =
     "sifive.enterprise.grandcentral.ViewAnnotation";
 constexpr const char *companionAnnoClass =
     "sifive.enterprise.grandcentral.ViewAnnotation.companion"; // not in SFC
-constexpr const char *parentAnnoClass =
-    "sifive.enterprise.grandcentral.ViewAnnotation.parent"; // not in SFC
 constexpr const char *prefixInterfacesAnnoClass =
     "sifive.enterprise.grandcentral.PrefixInterfacesAnnotation";
 constexpr const char *augmentedGroundTypeClass =

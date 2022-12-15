@@ -19,12 +19,15 @@ set(CIRCT_TEST_DEPENDS
   FileCheck count not
   split-file
   circt-capi-ir-test
+  circt-as
+  circt-dis
   circt-opt
   circt-translate
   circt-reduce
   esi-tester
   handshake-runner
   firtool
+  hlstool
   )
 
 if (CIRCT_GTEST_AVAILABLE)
@@ -42,6 +45,6 @@ add_lit_testsuite(check-circt "Running the CIRCT regression tests"
   )
 set_target_properties(check-circt PROPERTIES FOLDER "Tests")
 
-add_lit_testsuites(CIRCT ${CMAKE_CURRENT_SOURCE_DIR}
-  DEPENDS ${CIRCT_TEST_DEPS}
-)
+add_lit_testsuites(CIRCT ${CMAKE_CURRENT_BINARY_DIR}
+  DEPENDS ${CIRCT_TEST_DEPENDS}
+  )

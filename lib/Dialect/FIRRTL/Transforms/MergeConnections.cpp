@@ -79,8 +79,9 @@ bool MergeConnection::peelConnect(StrictConnectOp connect) {
   // partial connect. Also ignore non-passive connections or non-integer
   // connections.
   LLVM_DEBUG(llvm::dbgs() << "Visiting " << connect << "\n");
-  auto destTy = connect.getDest().getType().cast<FIRRTLType>();
-  if (!destTy.isPassive() || !firrtl::getBitWidth(destTy).has_value())
+  auto destTy = connect.getDest().getType().dyn_cast<FIRRTLBaseType>();
+  if (!destTy || !destTy.isPassive() ||
+      !firrtl::getBitWidth(destTy).has_value())
     return false;
 
   auto destFieldRef = getFieldRefFromValue(connect.getDest());
@@ -201,34 +202,21 @@ bool MergeConnection::peelConnect(StrictConnectOp connect) {
     if (!enableAggressiveMerging && !areOperandsAllConstants)
       return Value();
 
+    SmallVector<Location> locs;
     // Otherwise, we concat all values and cast them into the aggregate type.
-    Value accumulate;
-    for (const auto &e : llvm::enumerate(operands)) {
+    for (auto idx : llvm::seq(0u, static_cast<unsigned>(operands.size()))) {
+      locs.push_back(subConnections[idx].getLoc());
       // Erase connections except for subConnections[index] since it must be
       // erased at the top-level loop.
-      if (e.index() != index)
-        subConnections[e.index()].erase();
-      auto value = e.value();
-      auto bitwidth =
-          firrtl::getBitWidth(value.getType().template cast<FIRRTLType>());
-      assert(bitwidth &&
-             "it should be checked at the beginning of `peelConnect`");
-      value = builder->createOrFold<BitCastOp>(
-          value.getLoc(), UIntType::get(value.getContext(), *bitwidth), value);
-
-      if (parentType.isa<FVectorType>())
-        accumulate = (accumulate ? builder->createOrFold<CatPrimOp>(
-                                       accumulate.getLoc(), value, accumulate)
-                                 : value);
-      else {
-        // Bundle subfields are filled from MSB to LSB.
-        accumulate = (accumulate ? builder->createOrFold<CatPrimOp>(
-                                       accumulate.getLoc(), accumulate, value)
-                                 : value);
-      }
+      if (idx != index)
+        subConnections[idx].erase();
     }
-    return builder->createOrFold<BitCastOp>(accumulate.getLoc(), parentType,
-                                            accumulate);
+
+    return parentType.isa<FVectorType>()
+               ? builder->createOrFold<VectorCreateOp>(
+                     builder->getFusedLoc(locs), parentType, operands)
+               : builder->createOrFold<BundleCreateOp>(
+                     builder->getFusedLoc(locs), parentType, operands);
   };
 
   Value merged;

@@ -1,4 +1,4 @@
-// RUN: circt-opt --pass-pipeline='firrtl.circuit(firrtl-lower-annotations)' --split-input-file %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-annotations))' --split-input-file %s | FileCheck %s
 
 // circt.test copies the annotation to the target
 // circt.testNT puts the targetless annotation on the circuit
@@ -70,9 +70,7 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
 //
 // CHECK-LABEL: firrtl.circuit "Foo"
 // CHECK-NOT:     rawAnnotations
-// CHECK-NEXT:    firrtl.hierpath @[[nla_c:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
-// CHECK-NEXT:    firrtl.hierpath @[[nla_b:[^ ]+]] [@Foo::@[[bar_sym]],       @Bar]
-// CHECK-NEXT:    firrtl.hierpath @[[nla_a:[^ ]+]] [@Foo::@[[bar_sym]],       @Bar]
+// CHECK-NEXT:    hw.hierpath private @[[nla:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
 firrtl.circuit "Foo" attributes {rawAnnotations = [
   {
     class = "circt.test",
@@ -92,9 +90,9 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
 ]} {
   // CHECK-NEXT: firrtl.module @Bar()
   // CHECK-SAME:   annotations =
-  // CHECK-SAME:     {circt.nonlocal = @[[nla_a]], class = "circt.test", data = "a"}
-  // CHECK-SAME:     {circt.nonlocal = @[[nla_b]], class = "circt.test", data = "b"}
-  // CHECK-SAME:     {circt.nonlocal = @[[nla_c]], class = "circt.test", data = "c"}
+  // CHECK-SAME:     {circt.nonlocal = @[[nla]], class = "circt.test", data = "a"}
+  // CHECK-SAME:     {circt.nonlocal = @[[nla]], class = "circt.test", data = "b"}
+  // CHECK-SAME:     {circt.nonlocal = @[[nla]], class = "circt.test", data = "c"}
   firrtl.module @Bar() {}
   // CHECK: firrtl.module @Foo
   firrtl.module @Foo() {
@@ -113,11 +111,7 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
 //
 // CHECK-LABEL: firrtl.circuit "Foo"
 // CHECK-NOT:     rawAnnotations
-// CHECK-NEXT:    firrtl.hierpath @[[nla_4:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
-// CHECK-NEXT:    firrtl.hierpath @[[nla_3:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
-// CHECK-NEXT:    firrtl.hierpath @[[nla_2:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
-// CHECK-NEXT:    firrtl.hierpath @[[nla_1:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
-// CHECK-NEXT:    firrtl.hierpath @[[nla_0:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
+// CHECK-NEXT:    hw.hierpath private @[[nla:[^ ]+]] [@Foo::@[[bar_sym:[^ ]+]], @Bar]
 firrtl.circuit "Foo" attributes {rawAnnotations = [
   {
     class = "circt.test",
@@ -147,12 +141,12 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
 ]} {
   // CHECK-NEXT: firrtl.module @Bar
   // CHECK-SAME:   in %a
-  // CHECK-SAME:     {circt.nonlocal = @[[nla_0]], class = "circt.test", data = 0 : i64}
+  // CHECK-SAME:     {circt.nonlocal = @[[nla]], class = "circt.test", data = 0 : i64}
   // CHECK-SAME:   out %b
-  // CHECK-SAME:     {circt.fieldID = 1 : i32, circt.nonlocal = @[[nla_1]], class = "circt.test", data = 1 : i64}
-  // CHECK-SAME:     {circt.fieldID = 2 : i32, circt.nonlocal = @[[nla_2]], class = "circt.test", data = 2 : i64}
+  // CHECK-SAME:     {circt.fieldID = 1 : i32, circt.nonlocal = @[[nla]], class = "circt.test", data = 1 : i64}
+  // CHECK-SAME:     {circt.fieldID = 2 : i32, circt.nonlocal = @[[nla]], class = "circt.test", data = 2 : i64}
   // CHECK-SAME:   out %c
-  // CHECK-SAME:     {circt.nonlocal = @[[nla_4]], class = "circt.test", data = 4 : i64}
+  // CHECK-SAME:     {circt.nonlocal = @[[nla]], class = "circt.test", data = 4 : i64}
   firrtl.module @Bar(
     in %a: !firrtl.uint<1>,
     out %b: !firrtl.bundle<baz: uint<1>, qux: uint<1>>,
@@ -160,7 +154,7 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
   ) {
     // CHECK-NEXT: %d = firrtl.wire
     // CHECK-NOT:    sym
-    // CHECK-SAME:   {circt.fieldID = 2 : i32, circt.nonlocal = @[[nla_3]], class = "circt.test", data = 3 : i64}
+    // CHECK-SAME:   {circt.fieldID = 2 : i32, circt.nonlocal = @[[nla]], class = "circt.test", data = 3 : i64}
     %d = firrtl.wire : !firrtl.bundle<baz: uint<1>, qux: uint<1>>
   }
   // CHECK: firrtl.module @Foo
@@ -521,7 +515,7 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
 }
 
 // CHECK-LABEL:  firrtl.circuit "Foo"
-// CHECK:          firrtl.hierpath @[[nla:[^ ]+]] [@Foo::@Foo, @Example]
+// CHECK:          hw.hierpath private @[[nla:[^ ]+]] [@Foo::@Foo, @Example]
 // CHECK:          firrtl.module @Example() attributes {
 // CHECK-SAME:       annotations = [{circt.nonlocal = @[[nla]], class = "circt.test"}]
 // CHECK:          firrtl.module @Foo()
@@ -543,10 +537,9 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
   }
 }
 // CHECK-LABEL: firrtl.circuit "Foo"
-// CHECK:         firrtl.hierpath @[[nla_b:[^ ]+]] [@Foo::@bar, @Bar::@baz, @Baz]
-// CHECK:         firrtl.hierpath @[[nla_a:[^ ]+]] [@Foo::@bar, @Bar::@baz, @Baz]
+// CHECK:         hw.hierpath private @[[nla:[^ ]+]] [@Foo::@bar, @Bar::@baz, @Baz]
 // CHECK:         firrtl.module @Baz
-// CHECK-SAME:      annotations = [{circt.nonlocal = @[[nla_a]], class = "circt.test", data = "a"}, {circt.nonlocal = @[[nla_b]], class = "circt.test", data = "b"}]
+// CHECK-SAME:      annotations = [{circt.nonlocal = @[[nla]], class = "circt.test", data = "a"}, {circt.nonlocal = @[[nla]], class = "circt.test", data = "b"}]
 // CHECK:         firrtl.module @Bar()
 // CHECK:           firrtl.instance baz sym @baz @Baz()
 // CHECK:           firrtl.module @Foo()
@@ -575,7 +568,7 @@ firrtl.circuit "memportAnno"  attributes {rawAnnotations = [
 }
 
 // CHECK-LABEL: firrtl.circuit "memportAnno"  {
-// CHECK:        firrtl.hierpath @nla [@memportAnno::@foo, @Foo]
+// CHECK:        hw.hierpath private @nla [@memportAnno::@foo, @Foo]
 // CHECK:        %memory_w = firrtl.mem Undefined {depth = 16 : i64, name = "memory", portAnnotations
 // CHECK-SAME:   [{circt.nonlocal = @nla, class = "circt.test"}]
 
@@ -602,7 +595,7 @@ firrtl.circuit "instportAnno" attributes {rawAnnotations = [
 }
 
 // CHECK-LABEL: firrtl.circuit "instportAnno"
-// CHECK:        firrtl.hierpath @[[HIER:[^ ]+]] [@instportAnno::@bar, @Bar::@baz, @Baz]
+// CHECK:        hw.hierpath private @[[HIER:[^ ]+]] [@instportAnno::@bar, @Bar::@baz, @Baz]
 // CHECK:        firrtl.module @Baz
 // CHECK-SAME:     {circt.nonlocal = @[[HIER]], class = "circt.test"}
 
@@ -626,12 +619,10 @@ firrtl.circuit "Aggregates" attributes {rawAnnotations = [
 // A non-local annotation should work.
 
 // CHECK-LABEL: firrtl.circuit "FooNL"
-// CHECK: firrtl.hierpath @nla_1 [@FooNL::@baz, @BazNL::@bar, @BarNL]
-// CHECK: firrtl.hierpath @nla_0 [@FooNL::@baz, @BazNL::@bar, @BarNL]
-// CHECK: firrtl.hierpath @nla [@FooNL::@baz, @BazNL::@bar, @BarNL]
+// CHECK: hw.hierpath private @nla [@FooNL::@baz, @BazNL::@bar, @BarNL]
 // CHECK: firrtl.module @BarNL
-// CHECK: %w = firrtl.wire sym @w {annotations = [{circt.nonlocal = @nla_0, class = "circt.test", nl = "nl"}]}
-// CHECK: %w2 = firrtl.wire sym @w2 {annotations = [{circt.fieldID = 5 : i32, circt.nonlocal = @nla_1, class = "circt.test", nl = "nl2"}]} : !firrtl.bundle<a: uint, b: vector<uint, 4>>
+// CHECK: %w = firrtl.wire sym @w {annotations = [{circt.nonlocal = @nla, class = "circt.test", nl = "nl"}]}
+// CHECK: %w2 = firrtl.wire sym @w2 {annotations = [{circt.fieldID = 5 : i32, circt.nonlocal = @nla, class = "circt.test", nl = "nl2"}]} : !firrtl.bundle<a: uint, b: vector<uint, 4>>
 // CHECK: firrtl.instance bar sym @bar @BarNL()
 // CHECK: firrtl.instance baz sym @baz @BazNL()
 // CHECK: firrtl.module @FooL
@@ -663,7 +654,7 @@ firrtl.circuit "FooNL"  attributes {rawAnnotations = [
 // Non-local annotations on memory ports should work.
 
 // CHECK-LABEL: firrtl.circuit "MemPortsNL"
-// CHECK: firrtl.hierpath @nla [@MemPortsNL::@child, @Child]
+// CHECK: hw.hierpath private @nla [@MemPortsNL::@child, @Child]
 // CHECK: firrtl.module @Child()
 // CHECK:   %bar_r = firrtl.mem
 // CHECK-NOT: sym
@@ -711,7 +702,7 @@ firrtl.circuit "Test" attributes {rawAnnotations = [
 firrtl.circuit "Test" attributes {rawAnnotations = [
   {class = "circt.test", target = "~Test|Test>exttest"}
   ]} {
-  // CHECK: firrtl.hierpath @nla [@Test::@exttest, @ExtTest]
+  // CHECK: hw.hierpath private @nla [@Test::@exttest, @ExtTest]
   // CHECK: firrtl.extmodule @ExtTest() attributes {annotations = [{circt.nonlocal = @nla, class = "circt.test"}]}
   firrtl.extmodule @ExtTest()
 
@@ -727,7 +718,7 @@ firrtl.circuit "Test" attributes {rawAnnotations = [
 firrtl.circuit "Test" attributes {rawAnnotations = [
   {class = "circt.test", target = "~Test|Test>exttest.in"}
   ]} {
-  // CHECK: firrtl.hierpath @nla [@Test::@exttest, @ExtTest]
+  // CHECK: hw.hierpath private @nla [@Test::@exttest, @ExtTest]
   // CHECK: firrtl.extmodule @ExtTest(in in: !firrtl.uint<1> [{circt.nonlocal = @nla, class = "circt.test"}])
   firrtl.extmodule @ExtTest(in in: !firrtl.uint<1>)
 
@@ -753,7 +744,7 @@ firrtl.circuit "Foo"  attributes {
     {class = "firrtl.transforms.DontTouchAnnotation", target = "~Foo|Foo>_T_8"},
     {class = "firrtl.transforms.DontTouchAnnotation", target = "~Foo|Foo>_T_9.a"},
     {class = "firrtl.transforms.DontTouchAnnotation", target = "~Foo|Foo/bar:Bar>_T.a"}]} {
-  // CHECK:      firrtl.hierpath @nla [@Foo::@bar, @Bar]
+  // CHECK:      hw.hierpath private @nla [@Foo::@bar, @Bar]
   // CHECK-NEXT: firrtl.module @Foo
   firrtl.module @Foo(in %reset: !firrtl.uint<1>, in %clock: !firrtl.clock) {
     // CHECK-NEXT: %_T_0 = firrtl.wire {annotations = [{class = "firrtl.transforms.DontTouchAnnotation"}]}
@@ -846,40 +837,54 @@ firrtl.circuit "GCTInterface"  attributes {annotations = [{unrelatedAnnotation}]
 // CHECK-SAME: annotations
 // CHECK-SAME: {class = "sifive.enterprise.grandcentral.ViewAnnotation.companion",
 // CHECK-SAME:  id = [[ID_ViewName]] : i64,
-// CHECK-SAME:  type = "companion"}
+// CHECK-SAME:  name = "view"}
+//
+// CHECK:      %[[wire_1_ref:[a-zA-Z0-9_]+]] = firrtl.ref.resolve {{.+}}
+// CHECK:      firrtl.node %[[wire_1_ref]]
+// CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 1 : i64}
+// CHECK:      %[[wire_2_ref:[a-zA-Z0-9_]+]] = firrtl.ref.resolve {{.+}}
+// CHECK:      firrtl.node %[[wire_2_ref]]
+// CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 2 : i64}
+// CHECK:      %[[wire_3_ref:[a-zA-Z0-9_]+]] = firrtl.ref.resolve {{.+}}
+// CHECK:      firrtl.node %[[wire_3_ref]]
+// CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 3 : i64}
+// CHECK:      %[[wire_4_ref:[a-zA-Z0-9_]+]] = firrtl.ref.resolve {{.+}}
+// CHECK:      firrtl.node %[[wire_4_ref]]
+// CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 4 : i64}
+// CHECK:      %[[wire_5_ref:[a-zA-Z0-9_]+]] = firrtl.ref.resolve {{.+}}
+// CHECK:      firrtl.node %[[wire_5_ref]]
+// CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 5 : i64}
 
-// The parent should be annotated. Additionally, this example has all the
-// members of the interface inside the parent.  Both port "a" and register
-// "r" should be annotated.
+// The RefSend must be generated.
 // CHECK: firrtl.module @GCTInterface
-// CHECK-SAME: %a: !firrtl.uint<1> [
-// CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType",
-// CHECK-SAME:    d = [[ID_port]] : i64}
-// CHECK-SAME: annotations = [
-// CHECK-SAME:   {class = "sifive.enterprise.grandcentral.ViewAnnotation.parent",
-// CHECK-SAME:    id = [[ID_ViewName]] : i64,
-// CHECK-SAME:    name = "view",
-// CHECK-SAME:    type = "parent"}]
-// CHECK: firrtl.reg
-// CHECK-NOT:  sym
-// CHECK-SAME: annotations
-// CHECK-SAME:   {circt.fieldID = 2 : i32,
-// CHECK-SAME:    class = "sifive.enterprise.grandcentral.AugmentedGroundType",
-// CHECK-SAME:    id = [[ID_0]] : i64}
-// CHECK-SAME:   {circt.fieldID = 3 : i32,
-// CHECK-SAME:    class = "sifive.enterprise.grandcentral.AugmentedGroundType",
-// CHECK-SAME:    id = [[ID_1]] : i64}
-// CHECK-SAME:   {circt.fieldID = 6 : i32,
-// CHECK-SAME:    class = "sifive.enterprise.grandcentral.AugmentedGroundType",
-// CHECK-SAME:    id = [[ID_2_1]] : i64}
-// CHECK-SAME:   {circt.fieldID = 5 : i32,
-// CHECK-SAME:    class = "sifive.enterprise.grandcentral.AugmentedGroundType",
-// CHECK-SAME:    id = [[ID_2_0]] : i64}
+// CHECK-SAME: %a: !firrtl.uint<1>
+// CHECK:      %r = firrtl.reg  %clock  : !firrtl.bundle<_0: bundle<_0: uint<1>, _1: uint<1>>, _2: vector<uint<1>, 2>>
+// CHECK:      %[[view_companion_view__2refPort:.+]], %[[view_companion_view__2refPort_1:.+]], %[[view_companion_view__1refPort:.+]], %[[view_companion_view__0refPort:.+]], %[[view_companion_view_portrefPort:.+]] = firrtl.instance view_companion  @view_companion(in {{.*}}: !firrtl.ref<uint<1>>, in {{.*}}: !firrtl.ref<uint<1>>, in {{.*}}: !firrtl.ref<uint<1>>, in {{.*}}: !firrtl.ref<uint<1>>, in {{.*}}: !firrtl.ref<uint<1>>)
+// CHECK:      %0 = firrtl.subfield %r[_2] : !firrtl.bundle<_0: bundle<_0: uint<1>, _1: uint<1>>, _2: vector<uint<1>, 2>>
+// CHECK:      %1 = firrtl.subindex %0[0] : !firrtl.vector<uint<1>, 2>
+// CHECK:      %2 = firrtl.subfield %r[_2] : !firrtl.bundle<_0: bundle<_0: uint<1>, _1: uint<1>>, _2: vector<uint<1>, 2>>
+// CHECK:      %3 = firrtl.subindex %2[1] : !firrtl.vector<uint<1>, 2>
+// CHECK:      %4 = firrtl.subfield %r[_0] : !firrtl.bundle<_0: bundle<_0: uint<1>, _1: uint<1>>, _2: vector<uint<1>, 2>>
+// CHECK:      %5 = firrtl.subfield %4[_1] : !firrtl.bundle<_0: uint<1>, _1: uint<1>>
+// CHECK:      %6 = firrtl.subfield %r[_0] : !firrtl.bundle<_0: bundle<_0: uint<1>, _1: uint<1>>, _2: vector<uint<1>, 2>>
+// CHECK:      %7 = firrtl.subfield %6[_0] : !firrtl.bundle<_0: uint<1>, _1: uint<1>>
+// CHECK:      %8 = firrtl.ref.send %1 : !firrtl.uint<1>
+// CHECK:      firrtl.connect %view_companion__1_0, %8 : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
+// CHECK:      %9 = firrtl.ref.send %3 : !firrtl.uint<1>
+// CHECK:      firrtl.connect %view_companion__2_0, %9 : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
+// CHECK:      %10 = firrtl.ref.send %5 : !firrtl.uint<1>
+// CHECK:      firrtl.connect %view_companion__0_def_3_0, %10 : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
+// CHECK:      %11 = firrtl.ref.send %7 : !firrtl.uint<1>
+// CHECK:      firrtl.connect %view_companion__0_def_4_0, %11 : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
+// CHECK:      %12 = firrtl.ref.send %a : !firrtl.uint<1>
+// CHECK:      firrtl.connect %view_companion_ViewName_5_0, %12 : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
 
 // -----
 
 firrtl.circuit "Foo"  attributes {rawAnnotations = [{class = "sifive.enterprise.grandcentral.ViewAnnotation", companion = "~Foo|Bar_companion", name = "Bar", parent = "~Foo|Foo", view = {class = "sifive.enterprise.grandcentral.AugmentedBundleType", defName = "View", elements = [{description = "a string", name = "string", tpe = {class = "sifive.enterprise.grandcentral.AugmentedStringType", value = "hello"}}, {description = "a boolean", name = "boolean", tpe = {class = "sifive.enterprise.grandcentral.AugmentedBooleanType", value = false}}, {description = "an integer", name = "integer", tpe = {class = "sifive.enterprise.grandcentral.AugmentedIntegerType", value = 42 : i64}}, {description = "a double", name = "double", tpe = {class = "sifive.enterprise.grandcentral.AugmentedDoubleType", value = 3.140000e+00 : f64}}]}}]} {
-  firrtl.extmodule private @Bar_companion()
+  firrtl.module private @Bar_companion() {
+    firrtl.skip
+  }
   firrtl.module @Foo() {
      firrtl.instance Bar_companion @Bar_companion()
    }
@@ -989,7 +994,7 @@ firrtl.circuit "GCTDataTap" attributes {rawAnnotations = [{
 }
 
 // CHECK-LABEL: firrtl.circuit "GCTDataTap"
-// CHECK:      firrtl.hierpath [[NLA:@.+]] [@GCTDataTap::@im, @InnerMod]
+// CHECK:      hw.hierpath private [[NLA:@.+]] [@GCTDataTap::@im, @InnerMod]
 
 // CHECK-LABEL: firrtl.extmodule private @DataTap
 
@@ -1224,3 +1229,477 @@ firrtl.circuit "Sub"  attributes {
 // CHECK-SAME:        {circt.fieldID = 2 : i32, class = "firrtl.transforms.DontTouchAnnotation"}
 // CHECK-SAME:        {circt.fieldID = 1 : i32, class = "sifive.enterprise.grandcentral.SignalDriverAnnotation.target", dir = "sink", id = [[id]] : i64, peer = "~Top|Foo>dataIn.a.b.c", side = "local", targetId = {{[0-9]+}} : i64}
 // CHECK-SAME:        {circt.fieldID = 1 : i32, class = "firrtl.transforms.DontTouchAnnotation"}
+
+// -----
+
+// CHECK-LABEL: firrtl.circuit "GrandCentralViewsBundle"
+firrtl.circuit "GrandCentralViewsBundle"  attributes {
+  rawAnnotations = [
+    {
+      class = "sifive.enterprise.grandcentral.ViewAnnotation",
+      companion = "~GrandCentralViewsBundle|Companion",
+      name = "View",
+      parent = "~GrandCentralViewsBundle|GrandCentralViewsBundle",
+      view =
+        {
+          class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+          defName = "MyInterface",
+          elements = [
+            {
+              name = "b",
+              tpe = {
+                class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+                defName = "SubInterface",
+                elements = [
+                  {
+                    name = "a",
+                    tpe =
+                      {
+                        class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+                        ref =
+                          {
+                            circuit = "GrandCentralViewsBundle",
+                            component = [
+                              {
+                                class = "firrtl.annotations.TargetToken$Field",
+                                value = "a"
+                              }
+                            ],
+                            module = "GrandCentralViewsBundle",
+                            path = [
+                              {
+                                _1 =
+                                  {
+                                    class = "firrtl.annotations.TargetToken$Instance",
+                                    value = "bar"
+                                  },
+                                _2 =
+                                  {
+                                    class = "firrtl.annotations.TargetToken$OfModule",
+                                    value = "Bar"
+                                  }
+                              }
+                            ],
+                            ref = "a"
+                          },
+                        tpe =
+                          {
+                            class = "sifive.enterprise.grandcentral.GrandCentralView$UnknownGroundType$"
+                          }
+                      }
+                  },
+                  {
+                    name = "b",
+                    tpe =
+                      {
+                        class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+                        ref =
+                          {
+                            circuit = "GrandCentralViewsBundle",
+                            component = [
+                              {
+                                class = "firrtl.annotations.TargetToken$Field",
+                                value = "b"
+                              }
+                            ],
+                            module = "GrandCentralViewsBundle",
+                            path = [
+                              {
+                                _1 =
+                                  {
+                                    class = "firrtl.annotations.TargetToken$Instance",
+                                    value = "bar"
+                                  },
+                                _2 =
+                                  {
+                                    class = "firrtl.annotations.TargetToken$OfModule",
+                                    value = "Bar"
+                                  }
+                              }
+                            ],
+                            ref = "a"
+                          },
+                          tpe =
+                            {
+                              class = "sifive.enterprise.grandcentral.GrandCentralView$UnknownGroundType$"
+                            }
+                      }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+    }
+  ]
+} {
+  // CHECK:      firrtl.module @Companion
+  // CHECK-SAME:   in %[[refPort_0:[a-zA-Z0-9_]+]]: !firrtl.ref<uint<1>>
+  // CHECK-SAME:   in %[[refPort_1:[a-zA-Z0-9_]+]]: !firrtl.ref<uint<2>>
+  // CHECK-SAME:   {class = "sifive.enterprise.grandcentral.ViewAnnotation.companion", id = 0 : i64, name = "View"}
+  firrtl.module @Companion() {
+    // CHECK-NEXT: %[[refPort_0_resolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[refPort_0]]
+    // CHECK-NEXT: firrtl.node %[[refPort_0_resolve]]
+    // CHECK-SAME:   {annotations = [{class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 1 : i64}]}
+    // CHECK-SAME:   !firrtl.uint<1>
+    // CHECK-NEXT: %[[refPort_1_resolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[refPort_1]]
+    // CHECK-NEXT: firrtl.node %[[refPort_1_resolve]]
+    // CHECK-SAME:   {annotations = [{class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 2 : i64}]}
+    // CHECK-SAME:   !firrtl.uint<2>
+  }
+  // CHECK:      firrtl.module @Bar
+  // CHECK-SAME:   out %[[refPort_0:[a-zA-Z0-9_]+]]: !firrtl.ref<uint<1>>
+  // CHECK-SAME:   out %[[refPort_1:[a-zA-Z0-9_]+]]: !firrtl.ref<uint<2>>
+  firrtl.module @Bar() {
+    %a = firrtl.wire interesting_name  : !firrtl.bundle<a: uint<1>, b: uint<2>>
+    // CHECK:      %[[a_0:[a-zA-Z0-9_]+]] = firrtl.subfield %a[a]
+    // CHECK-NEXT: %[[a_1:[a-zA-Z0-9_]+]] = firrtl.subfield %a[b]
+    // CHECK-NEXT: %[[a_0_ref:[a-zA-Z0-9_]+]] = firrtl.ref.send %[[a_0]]
+    // CHECK-NEXT: firrtl.connect %[[refPort_0]], %[[a_0_ref]]
+    // CHECK-NEXT: %[[a_1_ref:[a-zA-Z0-9_]+]] = firrtl.ref.send %[[a_1]]
+    // CHECK-NEXT: firrtl.connect %[[refPort_1]], %[[a_1_ref]]
+  }
+  // CHECK:      firrtl.module @GrandCentralViewsBundle()
+  firrtl.module @GrandCentralViewsBundle() {
+    // CHECK-NEXT: %[[bar_refPort_0:[a-zA-Z0-9_]+]], %[[bar_refPort_1:[a-zA-Z0-9_]+]] = firrtl.instance bar
+    firrtl.instance bar @Bar()
+    // CHECK-NEXT: %[[companion_refPort_0:[a-zA-Z0-9_]+]], %[[companion_refPort_1:[a-zA-Z0-9_]+]] = firrtl.instance companion
+    firrtl.instance companion @Companion()
+    // CHECK-NEXT: firrtl.connect %[[companion_refPort_0]], %[[bar_refPort_0]]
+    // CHECK-NEXT: firrtl.connect %[[companion_refPort_1]], %[[bar_refPort_1]]
+  }
+}
+
+// -----
+
+
+firrtl.circuit "Top"  attributes {rawAnnotations = [{
+  class = "sifive.enterprise.grandcentral.DataTapsAnnotation",
+  keys = [
+    {
+       class = "sifive.enterprise.grandcentral.ReferenceDataTapKey",
+       source = "~Top|Top/foo:Foo/b:Bar>inv", sink = "~Top|Top>tap"
+    }
+  ]}]} {
+  // CHECK-LABEL: firrtl.circuit "Top"  {
+  // CHECK-NOT:   "sifive.enterprise.grandcentral.DataTapsAnnotation"
+  // CHECK:  firrtl.module private @Bar(out %_gen_tap: !firrtl.ref<uint<1>>)
+  firrtl.module private @Bar() {
+    %inv = firrtl.wire interesting_name  : !firrtl.uint<1>
+    // CHECK:  %0 = firrtl.ref.send %inv : !firrtl.uint<1>
+    // CHECK:  firrtl.connect %_gen_tap, %0 : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
+  }
+  // CHECK-LABEL: firrtl.module private @Foo
+  firrtl.module private @Foo() {
+    firrtl.instance b interesting_name  @Bar()
+    // CHECK:  %b__gen_tap = firrtl.instance b interesting_name  @Bar(out _gen_tap: !firrtl.ref<uint<1>>)
+    // CHECK:  firrtl.connect %_gen_tap, %b__gen_tap : !firrtl.ref<uint<1>>, !firrtl.ref<uint<1>>
+  }
+  // CHECK: firrtl.module @Top()
+  firrtl.module @Top() {
+    firrtl.instance foo interesting_name  @Foo()
+    %tap = firrtl.wire interesting_name  : !firrtl.uint<1>
+    // CHECK:  %foo__gen_tap = firrtl.instance foo interesting_name  @Foo(out _gen_tap: !firrtl.ref<uint<1>>)
+    // CHECK:  %0 = firrtl.ref.resolve %foo__gen_tap : !firrtl.ref<uint<1>>
+    // CHECK:  %tap = firrtl.node %0 : !firrtl.uint<1>
+  }
+}
+
+// -----
+
+firrtl.circuit "Top"  attributes {rawAnnotations = [
+  {
+    class = "sifive.enterprise.grandcentral.DataTapsAnnotation",
+    keys = [
+      {
+        class = "sifive.enterprise.grandcentral.DataTapModuleSignalKey",
+        internalPath = "random.something",
+        module = "~Top|Bar",
+        sink = "~Top|Top>tap"
+      },
+      {
+        class = "sifive.enterprise.grandcentral.DataTapModuleSignalKey",
+        internalPath = "random.something.external",
+        module = "~Top|ExtBar",
+        sink = "~Top|Top>tap2"
+      }
+    ]}]} {
+  firrtl.extmodule private @ExtBar()
+  // CHECK: firrtl.extmodule private @ExtBar(out _gen_ref: !firrtl.ref<uint<1>>)
+  // CHECK-SAME: internalPaths = ["random.something.external"]
+  // CHECK:  firrtl.module private @Bar(out %[[_gen_ref2:.+]]: !firrtl.ref<uint<1>>)
+  // CHECK:  %[[random:.+]] = firrtl.verbatim.expr "random.something" : () -> !firrtl.uint<1>
+  // CHECK:  %0 = firrtl.ref.send %[[random]] : !firrtl.uint<1>
+  // CHECK:  firrtl.strictconnect %[[_gen_ref2]], %0 : !firrtl.ref<uint<1>>
+  firrtl.module private @Bar() {
+  }
+
+  // CHECK-LABEL:  firrtl.module private @Foo(
+  // CHECK-SAME: out %_gen_tap: !firrtl.ref<uint<1>>, out %_gen_tap2: !firrtl.ref<uint<1>>
+  firrtl.module private @Foo() {
+    firrtl.instance b interesting_name  @Bar()
+    // CHECK:  %[[gen_refPort:.+]] = firrtl.instance b interesting_name @Bar
+    // CHECK-SAME: (out [[_gen_ref2]]: !firrtl.ref<uint<1>>)
+    firrtl.instance b2 interesting_name  @ExtBar()
+    // CHECK: %b2__gen_ref = firrtl.instance b2 interesting_name  @ExtBar(out _gen_ref: !firrtl.ref<uint<1>>)
+  }
+  // CHECK-LABEL firrtl.module @Top()
+  firrtl.module @Top() {
+    firrtl.instance foo interesting_name  @Foo()
+    %tap = firrtl.wire interesting_name  : !firrtl.uint<1>
+    %tap2 = firrtl.wire interesting_name  : !firrtl.uint<1>
+    // CHECK:  %[[foo__gen_tap:.+]], %[[foo__gen_tap2:.+]] = firrtl.instance foo interesting_name  @Foo
+    // CHECK-SAME: (out _gen_tap: !firrtl.ref<uint<1>>, out _gen_tap2: !firrtl.ref<uint<1>>)
+    // CHECK:  %[[v0:.+]] = firrtl.ref.resolve %[[foo__gen_tap]] : !firrtl.ref<uint<1>>
+    // CHECK:  %tap = firrtl.node %[[v0]] : !firrtl.uint<1>
+  }
+}
+
+// -----
+// Test with Parent module not being the LCA.
+
+// CHECK-LABEL: firrtl.circuit "GrandCentralParentIsNotLCA"
+firrtl.circuit "GrandCentralParentIsNotLCA"  attributes {
+  rawAnnotations = [
+    {
+      class = "sifive.enterprise.grandcentral.ViewAnnotation",
+      companion = "~GrandCentralParentIsNotLCA|Companion",
+      name = "View",
+      parent = "~GrandCentralParentIsNotLCA|GrandCentralParentIsNotLCA",
+      view =
+        {
+          class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+          defName = "MyInterface",
+          elements = [
+            {
+              name = "b",
+              tpe = {
+                class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+                ref =
+                  {
+                    circuit = "GrandCentralParentIsNotLCA",
+                    component = [],
+                    module = "GrandCentralParentIsNotLCA",
+                    path = [
+                      {
+                         _1 =
+                           {
+                             class = "firrtl.annotations.TargetToken$Instance",
+                             value = "companion"
+                           },
+                         _2 =
+                           {
+                             class = "firrtl.annotations.TargetToken$OfModule",
+                             value = "Companion"
+                           }
+                      },
+                      {
+                         _1 =
+                           {
+                             class = "firrtl.annotations.TargetToken$Instance",
+                             value = "bar"
+                           },
+                         _2 =
+                           {
+                             class = "firrtl.annotations.TargetToken$OfModule",
+                             value = "Bar"
+                           }
+                      }
+                    ],
+                    ref = "a"
+                  },
+                  tpe = "sifive.enterprise.grandcentral.GrandCentralView$UnknownGroundType$"
+                }
+            }
+          ]
+        }
+    }
+  ]
+} {
+  // CHECK:        firrtl.module @Bar
+  // CHECK-SAME:     out %[[a_refPort:[a-zA-Z0-9_]+]]: !firrtl.ref<uint<1>>
+  firrtl.module @Bar() {
+    %a = firrtl.wire : !firrtl.uint<1>
+    // CHECK:        %[[a_ref:[a-zA-Z0-9_]+]] = firrtl.ref.send %a
+    // CHECK-NEXT:   firrtl.connect %[[a_refPort]], %[[a_ref]]
+  }
+  // CHECK:        firrtl.module @Companion()
+  firrtl.module @Companion() {
+    firrtl.instance bar @Bar()
+    // CHECK-NEXT:   %[[bar_a_refPort:[a-zA-Z0-9_]+]] = firrtl.instance bar
+    // CHECK-NEXT:   %[[b_refResolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[bar_a_refPort]]
+    // CHECK-NEXT:   firrtl.node %[[b_refResolve]]
+    // CHECK-SAME:     {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = 1 : i64}
+    // CHECK-SAME:     : !firrtl.uint<1>
+  }
+  firrtl.module @GrandCentralParentIsNotLCA() {
+    firrtl.instance companion @Companion()
+  }
+}
+
+// -----
+
+// Check that Grand Central View Annotations are applied properly when they are
+// targeting things inside the companion.  Specifically, this should work for
+// both ports and components, e.g., registers.  This does not emit any RefSendOps
+// or RefResolveOps and instead just does a direct connection.
+
+// CHECK-LABEL: "GrandCentralViewInsideCompanion"
+// CHECK-SAME:    id = [[aId:[0-9]+]] : i64, name = "a"
+// CHECK-SAME:    id = [[bId:[0-9]+]] : i64, name = "b"
+firrtl.circuit "GrandCentralViewInsideCompanion" attributes {
+  rawAnnotations = [
+    {
+      class = "sifive.enterprise.grandcentral.ViewAnnotation",
+      name = "View",
+      companion = "~GrandCentralViewInsideCompanion|Companion",
+      parent = "~GrandCentralViewInsideCompanion|GrandCentralViewInsideCompanion",
+      view = {
+        class = "sifive.enterprise.grandcentral.AugmentedBundleType",
+        defName = "MyInterface",
+        elements = [
+          {
+            name = "a",
+            tpe = {
+              class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+              ref = {
+                circuit = "GrandCentralViewInsideCompanion",
+                module = "GrandCentralViewInsideCompanion",
+                path = [
+                  {
+                    _1 = {
+                      class = "firrtl.annotations.TargetToken$Instance",
+                      value = "companion"
+                    },
+                    _2 = {
+                      class = "firrtl.annotations.TargetToken$OfModule",
+                      value = "Companion"
+                    }
+                  }
+                ],
+                ref = "a",
+                component = []
+              },
+              tpe = {
+                class = "sifive.enterprise.grandcentral.GrandCentralView$UnknownGroundType$"
+              }
+            }
+          },
+          {
+            name = "b",
+            tpe = {
+              class = "sifive.enterprise.grandcentral.AugmentedGroundType",
+              ref = {
+                circuit = "GrandCentralViewInsideCompanion",
+                module = "GrandCentralViewInsideCompanion",
+                path = [
+                  {
+                    _1 = {
+                      class = "firrtl.annotations.TargetToken$Instance",
+                      value = "companion"
+                    },
+                    _2 = {
+                      class = "firrtl.annotations.TargetToken$OfModule",
+                      value = "Companion"
+                    }
+                  }
+                ],
+                ref = "b",
+                component = []
+              },
+              tpe = {
+                class = "sifive.enterprise.grandcentral.GrandCentralView$UnknownGroundType$"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+} {
+  // CHECK:      firrtl.module @Companion
+  firrtl.module @Companion(out %b: !firrtl.uint<2>) {
+    %clock = firrtl.specialconstant 0 : !firrtl.clock
+    %a = firrtl.reg %clock : !firrtl.uint<1>
+    // CHECK:      firrtl.node %a
+    // CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = [[aId]] : i64}
+    // CHECK-SAME:   : !firrtl.uint<1>
+    // CHECK-NEXT: firrtl.node %b
+    // CHECK-SAME:   {class = "sifive.enterprise.grandcentral.AugmentedGroundType", id = [[bId]] : i64}
+    // CHECK-SAME:   : !firrtl.uint<2>
+  }
+  firrtl.module @GrandCentralViewInsideCompanion() {
+    %companion_b = firrtl.instance companion @Companion(out b: !firrtl.uint<2>)
+  }
+}
+
+// -----
+
+// Check that TraceNameAnnotation (which has don't touch semantics) is expanded
+// into a TraceAnnotation (which does not have don't touch semantics) and a
+// DontTouchAnnotation whenever this targets something that can be a legal
+// target of a DontTouchAnnotation.
+
+// CHECK-LABEL: firrtl.circuit "TraceNameAnnotation"
+firrtl.circuit "TraceNameAnnotation" attributes {rawAnnotations = [
+    {
+      class = "chisel3.experimental.Trace$TraceNameAnnotation",
+      chiselTarget = "~TraceNameAnnotation|TraceNameAnnotation",
+      target = "~TraceNameAnnotation|TraceNameAnnotation"
+    },
+    {
+      class = "chisel3.experimental.Trace$TraceNameAnnotation",
+      chiselTarget = "~TraceNameAnnotation|Foo",
+      target = "~TraceNameAnnotation|Foo"
+    },
+    {
+      class = "chisel3.experimental.Trace$TraceNameAnnotation",
+      chiselTarget = "~TraceNameAnnotation|TraceNameAnnotation/foo:Foo",
+      target = "~TraceNameAnnotation|TraceNameAnnotation/foo:Foo"
+    },
+    {
+      class = "chisel3.experimental.Trace$TraceNameAnnotation",
+      chiselTarget = "~TraceNameAnnotation|TraceNameAnnotation>w",
+      target = "~TraceNameAnnotation|TraceNameAnnotation>w"
+    }
+  ]} {
+  // CHECK:      firrtl.extmodule @Foo()
+  // CHECK-SAME:   {chiselTarget = "~TraceNameAnnotation|Foo"
+  // CHECK-SAME:    class = "chisel3.experimental.Trace$TraceAnnotation"}
+  // CHECK-SAME:   {chiselTarget = "~TraceNameAnnotation|TraceNameAnnotation/foo:Foo"
+  // CHECK-SAME:    circt.nonlocal =
+  // CHECK-SAME:    class = "chisel3.experimental.Trace$TraceAnnotation"}
+  firrtl.extmodule @Foo()
+  // CHECK:      firrtl.module @TraceNameAnnotation()
+  // CHECK-SAME:   {chiselTarget = "~TraceNameAnnotation|TraceNameAnnotation"
+  // CHECK-SAME:    class = "chisel3.experimental.Trace$TraceAnnotation"}
+  firrtl.module @TraceNameAnnotation() {
+    firrtl.instance foo @Foo()
+    // CHECK:      %w = firrtl.wire
+    // CHECK-SAME:   {chiselTarget = "~TraceNameAnnotation|TraceNameAnnotation>w"
+    // CHECK-SAME:    class = "chisel3.experimental.Trace$TraceAnnotation"}
+    // CHECK-SAME:   {class = "firrtl.transforms.DontTouchAnnotation"}
+    %w = firrtl.wire : !firrtl.uint<1>
+  }
+}
+
+// -----
+
+// Test that the valid types are connected, when the source has un-inferred width but sink has width.
+firrtl.circuit "Top"  attributes {rawAnnotations = [{
+  class = "sifive.enterprise.grandcentral.DataTapsAnnotation",
+  keys = [{
+    class = "sifive.enterprise.grandcentral.ReferenceDataTapKey",
+    sink = "~Top|Top>tap", source = "~Top|Foo>sum"
+    }]}]} {
+  firrtl.module private @Foo() {
+    %sum = firrtl.wire : !firrtl.uint
+  }
+  // CHECK-LABEL: firrtl.module @Top
+  firrtl.module @Top() {
+    firrtl.instance foo interesting_name  @Foo()
+    %tap = firrtl.wire interesting_name  : !firrtl.uint<8>
+    // CHECK:   %[[v0:.+]] = firrtl.ref.resolve %foo__gen_tap : !firrtl.ref<uint>
+    // CHECK:   %tap = firrtl.node %[[v0]] : !firrtl.uint
+  }
+}

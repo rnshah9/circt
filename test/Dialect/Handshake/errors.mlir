@@ -30,18 +30,6 @@ handshake.func @foo(%ctrl : none) -> none{
 }
 
 handshake.func @invalid_instance_op(%arg0 : i32, %ctrl : none) -> none {
-  // expected-error @+1 {{'handshake.instance' op last operand must be a control (none-typed) operand.}}
-  instance @foo(%ctrl, %arg0) : (none, i32) -> ()
-  return %ctrl : none
-}
-
-// -----
-
-handshake.func @foo(%ctrl : none) -> none{
-  return %ctrl : none
-}
-
-handshake.func @invalid_instance_op(%arg0 : i32, %ctrl : none) -> none {
   // expected-error @+1 {{'handshake.instance' op incorrect number of operands for the referenced handshake function}}
   instance @foo(%arg0, %ctrl) : (i32, none) -> ()
   return %ctrl : none
@@ -82,18 +70,6 @@ handshake.func @foo(%ctrl : none) -> (i32, none) {
 handshake.func @invalid_instance_op(%arg0 : i32, %ctrl : none) -> none {
   // expected-error @+1 {{'handshake.instance' op result type mismatch: expected result type 'i32', but provided 'i64' for result number 0}}
   %0, %outCtrl = instance @foo(%ctrl) : (none) -> (i64, none)
-  return %ctrl : none
-}
-
-// -----
-
-handshake.func @foo(%ctrl : none) -> none{
-  return %ctrl : none
-}
-
-handshake.func @invalid_instance_op(%ctrl : none) -> none {
-  // expected-error @+1 {{'handshake.instance' op must provide at least a control operand.}}
-  instance @foo() : () -> ()
   return %ctrl : none
 }
 
@@ -164,7 +140,7 @@ handshake.func @invalid_type_resnames(%a : i32, %b : none) -> none attributes {r
 // -----
 
 handshake.func @invalid_constant_value(%ctrl : none) -> none {
-  // expected-error @+1 {{'handshake.constant' op constant value type differs from operation result type.}}
+  // expected-error @+1 {{'handshake.constant' op constant value type 'i31' differs from operation result type 'i32'}}
   %0 = constant %ctrl {value = 1 : i31} : i32
   return %ctrl : none
 }
@@ -250,3 +226,20 @@ handshake.func @invalid_memref_block_arg(%arg0 : memref<2xi64>, %ctrl : none) ->
   // expected-error @-1 {{'handshake.func' op expected that block argument #0 is used by an 'extmemory' operation}}
   return %ctrl : none
 }
+
+// -----
+
+handshake.func @invalid_sost_op_zero_size(%ctrl : none) -> (none, none) {
+  // expected-error @+1 {{'handshake.merge' op must have at least one data operand}}
+  %0 = merge : none
+  return %0, %ctrl : none, none
+}
+
+// -----
+
+handshake.func @invalid_sost_op_wrong_operands(%arg0 : i64, %arg1 : i32, %ctrl : none) -> (i64, none) { // expected-note {{prior use here}}
+  // expected-error @+1 {{use of value '%arg1' expects different type than prior uses: 'i64' vs 'i32'}}
+  %0, %1 = control_merge %arg0, %arg1 : i64
+  return %0, %ctrl : i64, none
+}
+

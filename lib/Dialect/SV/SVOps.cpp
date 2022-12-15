@@ -24,14 +24,29 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <optional>
+
 using namespace circt;
 using namespace sv;
+using mlir::TypedAttr;
+
+/// Return true if the specified expression is 2-state.  This is determined by
+/// looking at the defining op.  This can look as far through the dataflow as it
+/// wants, but for now, it is just looking at the single value.
+bool sv::is2StateExpression(Value v) {
+  if (auto *op = v.getDefiningOp()) {
+    if (auto attr = op->getAttrOfType<UnitAttr>("twoState"))
+      return (bool)attr;
+  }
+  // Plain constants are obviously safe
+  return v.getDefiningOp<hw::ConstantOp>();
+}
 
 /// Return true if the specified operation is an expression.
 bool sv::isExpression(Operation *op) {
   return isa<VerbatimExprOp, VerbatimExprSEOp, GetModportOp,
-             ReadInterfaceSignalOp, ConstantXOp, ConstantZOp, MacroRefExprOp>(
-      op);
+             ReadInterfaceSignalOp, ConstantXOp, ConstantZOp, MacroRefExprOp,
+             MacroRefExprSEOp>(op);
 }
 
 LogicalResult sv::verifyInProceduralRegion(Operation *op) {
@@ -176,6 +191,11 @@ void MacroRefExprOp::getAsmResultNames(
   setNameFn(getResult(), getIdent().getName());
 }
 
+void MacroRefExprSEOp::getAsmResultNames(
+    function_ref<void(Value, StringRef)> setNameFn) {
+  setNameFn(getResult(), getIdent().getName());
+}
+
 //===----------------------------------------------------------------------===//
 // ConstantXOp / ConstantZOp
 //===----------------------------------------------------------------------===//
@@ -308,14 +328,15 @@ void LogicOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 void IfDefOp::build(OpBuilder &builder, OperationState &result, StringRef cond,
                     std::function<void()> thenCtor,
                     std::function<void()> elseCtor) {
-  build(builder, result, builder.getStringAttr(cond), thenCtor, elseCtor);
+  build(builder, result, builder.getStringAttr(cond), std::move(thenCtor),
+        std::move(elseCtor));
 }
 
 void IfDefOp::build(OpBuilder &builder, OperationState &result, StringAttr cond,
                     std::function<void()> thenCtor,
                     std::function<void()> elseCtor) {
   build(builder, result, MacroIdentAttr::get(builder.getContext(), cond),
-        thenCtor, elseCtor);
+        std::move(thenCtor), std::move(elseCtor));
 }
 
 void IfDefOp::build(OpBuilder &builder, OperationState &result,
@@ -361,16 +382,35 @@ LogicalResult IfDefOp::canonicalize(IfDefOp op, PatternRewriter &rewriter) {
 void IfDefProceduralOp::build(OpBuilder &builder, OperationState &result,
                               StringRef cond, std::function<void()> thenCtor,
                               std::function<void()> elseCtor) {
-  IfDefOp::build(builder, result, cond, std::move(thenCtor),
-                 std::move(elseCtor));
+  build(builder, result, builder.getStringAttr(cond), std::move(thenCtor),
+        std::move(elseCtor));
+}
+
+void IfDefProceduralOp::build(OpBuilder &builder, OperationState &result,
+                              StringAttr cond, std::function<void()> thenCtor,
+                              std::function<void()> elseCtor) {
+  build(builder, result, MacroIdentAttr::get(builder.getContext(), cond),
+        std::move(thenCtor), std::move(elseCtor));
 }
 
 void IfDefProceduralOp::build(OpBuilder &builder, OperationState &result,
                               MacroIdentAttr cond,
                               std::function<void()> thenCtor,
                               std::function<void()> elseCtor) {
-  IfDefOp::build(builder, result, cond, std::move(thenCtor),
-                 std::move(elseCtor));
+  OpBuilder::InsertionGuard guard(builder);
+
+  result.addAttribute("cond", cond);
+  builder.createBlock(result.addRegion());
+
+  // Fill in the body of the #ifdef.
+  if (thenCtor)
+    thenCtor();
+
+  Region *elseRegion = result.addRegion();
+  if (elseCtor) {
+    builder.createBlock(elseRegion);
+    elseCtor();
+  }
 }
 
 LogicalResult IfDefProceduralOp::canonicalize(IfDefProceduralOp op,
@@ -390,7 +430,7 @@ void IfOp::build(OpBuilder &builder, OperationState &result, Value cond,
   result.addOperands(cond);
   builder.createBlock(result.addRegion());
 
-  // Fill in the body of the #ifdef.
+  // Fill in the body of the if.
   if (thenCtor)
     thenCtor();
 
@@ -428,6 +468,13 @@ LogicalResult IfOp::canonicalize(IfOp op, PatternRewriter &rewriter) {
     return success();
   }
 
+  // Erase empty if-else block.
+  if (!op.getThenBlock()->empty() && op.hasElse() &&
+      op.getElseBlock()->empty()) {
+    rewriter.eraseBlock(op.getElseBlock());
+    return success();
+  }
+
   // Erase empty if's.
 
   // If there is stuff in the then block, leave this operation alone.
@@ -441,17 +488,21 @@ LogicalResult IfOp::canonicalize(IfOp op, PatternRewriter &rewriter) {
   }
 
   // Otherwise, invert the condition and move the 'else' block to the 'then'
-  // region.
-  auto cond = comb::createOrFoldNot(op.getLoc(), op.getCond(), rewriter);
-  op.setOperand(cond);
+  // region if the condition is a 2-state operation.  This changes x prop
+  // behavior so it needs to be guarded.
+  if (is2StateExpression(op.getCond())) {
+    auto cond = comb::createOrFoldNot(op.getLoc(), op.getCond(), rewriter);
+    op.setOperand(cond);
 
-  auto *thenBlock = op.getThenBlock(), *elseBlock = op.getElseBlock();
+    auto *thenBlock = op.getThenBlock(), *elseBlock = op.getElseBlock();
 
-  // Move the body of the then block over to the else.
-  thenBlock->getOperations().splice(thenBlock->end(),
-                                    elseBlock->getOperations());
-  rewriter.eraseBlock(elseBlock);
-  return success();
+    // Move the body of the then block over to the else.
+    thenBlock->getOperations().splice(thenBlock->end(),
+                                      elseBlock->getOperations());
+    rewriter.eraseBlock(elseBlock);
+    return success();
+  }
+  return failure();
 }
 
 //===----------------------------------------------------------------------===//
@@ -464,7 +515,7 @@ AlwaysOp::Condition AlwaysOp::getCondition(size_t idx) {
 }
 
 void AlwaysOp::build(OpBuilder &builder, OperationState &result,
-                     ArrayRef<EventControl> events, ArrayRef<Value> clocks,
+                     ArrayRef<sv::EventControl> events, ArrayRef<Value> clocks,
                      std::function<void()> bodyCtor) {
   assert(events.size() == clocks.size() &&
          "mismatch between event and clock list");
@@ -503,7 +554,7 @@ static ParseResult parseEventList(
   StringRef keyword;
   if (!p.parseOptionalKeyword(&keyword)) {
     while (1) {
-      auto kind = symbolizeEventControl(keyword);
+      auto kind = sv::symbolizeEventControl(keyword);
       if (!kind.has_value())
         return p.emitError(loc, "expected 'posedge', 'negedge', or 'edge'");
       auto eventEnum = static_cast<int32_t>(*kind);
@@ -755,7 +806,8 @@ ParseResult CaseOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
 
   // Check the integer type.
-  hw::EnumType enumType = condType.dyn_cast<hw::EnumType>();
+  Type canonicalCondType = hw::getCanonicalType(condType);
+  hw::EnumType enumType = canonicalCondType.dyn_cast<hw::EnumType>();
   unsigned condWidth = 0;
   if (!enumType) {
     if (!result.operands[0].getType().isSignlessInteger())
@@ -785,7 +837,7 @@ ParseResult CaseOp::parse(OpAsmParser &parser, OperationState &result) {
                << enumType;
       casePatterns.push_back(
           hw::EnumFieldAttr::get(parser.getEncodedSourceLoc(loc),
-                                 builder.getStringAttr(caseVal), enumType));
+                                 builder.getStringAttr(caseVal), condType));
     } else {
       // Parse the pattern.  It always starts with b, so it is an MLIR
       // keyword.
@@ -1005,6 +1057,133 @@ LogicalResult PAssignOp::verify() {
   return success();
 }
 
+namespace {
+// This represents a slice of an array.
+struct ArraySlice {
+  Value array;
+  Value start;
+  size_t size; // Represent a range array[start, start + size).
+
+  // Get a struct from the value. Return std::nullopt if the value doesn't
+  // represent an array slice.
+  static std::optional<ArraySlice> getArraySlice(Value v) {
+    auto *op = v.getDefiningOp();
+    if (!op)
+      return std::nullopt;
+    return TypeSwitch<Operation *, std::optional<ArraySlice>>(op)
+        .Case<hw::ArrayGetOp, ArrayIndexInOutOp>(
+            [](auto arrayIndex) -> std::optional<ArraySlice> {
+              hw::ConstantOp constant =
+                  arrayIndex.getIndex()
+                      .template getDefiningOp<hw::ConstantOp>();
+              if (!constant)
+                return std::nullopt;
+              return ArraySlice{/*array=*/arrayIndex.getInput(),
+                                /*start=*/constant,
+                                /*end=*/1};
+            })
+        .Case<hw::ArraySliceOp>([](hw::ArraySliceOp slice)
+                                    -> std::optional<ArraySlice> {
+          auto constant = slice.getLowIndex().getDefiningOp<hw::ConstantOp>();
+          if (!constant)
+            return std::nullopt;
+          return ArraySlice{
+              /*array=*/slice.getInput(), /*start=*/constant,
+              /*end=*/hw::type_cast<hw::ArrayType>(slice.getType()).getSize()};
+        })
+        .Case<sv::IndexedPartSelectInOutOp>(
+            [](sv::IndexedPartSelectInOutOp index)
+                -> std::optional<ArraySlice> {
+              auto constant = index.getBase().getDefiningOp<hw::ConstantOp>();
+              if (!constant || index.getDecrement())
+                return std::nullopt;
+              return ArraySlice{/*array=*/index.getInput(),
+                                /*start=*/constant,
+                                /*end=*/index.getWidth()};
+            })
+        .Default([](auto) { return std::nullopt; });
+  }
+
+  // Create a pair of ArraySlice from source and destination of assignments.
+  static std::optional<std::pair<ArraySlice, ArraySlice>>
+  getAssignedRange(Operation *op) {
+    assert((isa<PAssignOp, BPAssignOp>(op) && "assignments are expected"));
+    auto srcRange = ArraySlice::getArraySlice(op->getOperand(1));
+    if (!srcRange)
+      return std::nullopt;
+    auto destRange = ArraySlice::getArraySlice(op->getOperand(0));
+    if (!destRange)
+      return std::nullopt;
+
+    return std::make_pair(*destRange, *srcRange);
+  }
+};
+} // namespace
+
+// This canonicalization merges neiboring assignments of array elements into
+// array slice assignments. e.g.
+// a[0] <= b[1]
+// a[1] <= b[2]
+// ->
+// a[1:0] <= b[2:1]
+template <typename AssignTy>
+static LogicalResult mergeNeiboringAssignments(AssignTy op,
+                                               PatternRewriter &rewriter) {
+  // Get assigned ranges of each assignment.
+  auto assignedRangeOpt = ArraySlice::getAssignedRange(op);
+  if (!assignedRangeOpt)
+    return failure();
+
+  auto [dest, src] = *assignedRangeOpt;
+  AssignTy nextAssign = dyn_cast_or_null<AssignTy>(op->getNextNode());
+  bool changed = false;
+  SmallVector<Location> loc{op.getLoc()};
+  // Check that a next operation is a same kind of the assignment.
+  while (nextAssign) {
+    auto nextAssignedRange = ArraySlice::getAssignedRange(nextAssign);
+    if (!nextAssignedRange)
+      break;
+    auto [nextDest, nextSrc] = *nextAssignedRange;
+    // Check that these assignments are mergaable.
+    if (dest.array != nextDest.array || src.array != nextSrc.array ||
+        !hw::isOffset(dest.start, nextDest.start, dest.size) ||
+        !hw::isOffset(src.start, nextSrc.start, src.size))
+      break;
+
+    dest.size += nextDest.size;
+    src.size += nextSrc.size;
+    changed = true;
+    loc.push_back(nextAssign.getLoc());
+    rewriter.eraseOp(nextAssign);
+    nextAssign = dyn_cast_or_null<AssignTy>(op->getNextNode());
+  }
+
+  if (!changed)
+    return failure();
+
+  // From here, construct assignments of array slices.
+  auto resultType = hw::ArrayType::get(
+      hw::type_cast<hw::ArrayType>(src.array.getType()).getElementType(),
+      src.size);
+  auto newDest = rewriter.create<sv::IndexedPartSelectInOutOp>(
+      op.getLoc(), dest.array, dest.start, dest.size);
+  auto newSrc = rewriter.create<hw::ArraySliceOp>(op.getLoc(), resultType,
+                                                  src.array, src.start);
+  auto newLoc = rewriter.getFusedLoc(loc);
+  auto newOp = rewriter.replaceOpWithNewOp<AssignTy>(op, newDest, newSrc);
+  newOp->setLoc(newLoc);
+  return success();
+}
+
+LogicalResult PAssignOp::canonicalize(PAssignOp op, PatternRewriter &rewriter) {
+  return mergeNeiboringAssignments(op, rewriter);
+}
+
+LogicalResult BPAssignOp::canonicalize(BPAssignOp op,
+                                       PatternRewriter &rewriter) {
+  return mergeNeiboringAssignments(op, rewriter);
+}
+
 //===----------------------------------------------------------------------===//
 // TypeDecl operations
 //===----------------------------------------------------------------------===//
@@ -1099,8 +1278,17 @@ void InterfaceModportOp::build(OpBuilder &builder, OperationState &state,
   build(builder, state, name, ArrayAttr::get(ctxt, directions));
 }
 
+/// Suggest a name for each result value based on the saved result names
+/// attribute.
+void InterfaceInstanceOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  setNameFn(getResult(), getName());
+}
+
 /// Ensure that the symbol being instantiated exists and is an InterfaceOp.
 LogicalResult InterfaceInstanceOp::verify() {
+  if (getName().empty())
+    return emitOpError("requires non-empty name");
+
   auto *symtable = SymbolTable::getNearestSymbolTable(*this);
   if (!symtable)
     return emitError("sv.interface.instance must exist within a region "
@@ -1293,8 +1481,10 @@ LogicalResult WireOp::canonicalize(WireOp wire, PatternRewriter &rewriter) {
 
   Value connected;
   if (!write) {
-    // If no write and only reads, then replace with XOp.
-    connected = rewriter.create<ConstantXOp>(
+    // If no write and only reads, then replace with ZOp.
+    // SV 6.6: "If no driver is connected to a net, its
+    // value shall be high-impedance (z) unless the net is a trireg"
+    connected = rewriter.create<ConstantZOp>(
         wire.getLoc(),
         wire.getResult().getType().cast<InOutType>().getElementType());
   } else if (isa<hw::HWModuleOp>(write->getParentOp()))
@@ -1303,6 +1493,13 @@ LogicalResult WireOp::canonicalize(WireOp wire, PatternRewriter &rewriter) {
     // If the write is happening at the module level then we don't have any
     // use-before-def checking to do, so we only handle that for now.
     return failure();
+
+  // If the wire has a name attribute, propagate the name to the expression.
+  if (auto *connectedOp = connected.getDefiningOp())
+    if (!wire.getName().empty())
+      rewriter.updateRootInPlace(connectedOp, [&] {
+        connectedOp->setAttr("sv.namehint", wire.getNameAttr());
+      });
 
   // Ok, we can do this.  Replace all the reads with the connected value.
   for (auto read : reads)
@@ -1341,12 +1538,15 @@ void ArrayIndexInOutOp::build(OpBuilder &builder, OperationState &result,
 // IndexedPartSelectInOutOp
 //===----------------------------------------------------------------------===//
 
-void IndexedPartSelectInOutOp::build(OpBuilder &builder, OperationState &result,
-                                     Value input, Value base, int32_t width,
-                                     bool decrement) {
-  auto resultType =
-      hw::InOutType::get(IntegerType::get(builder.getContext(), width));
-  build(builder, result, resultType, input, base, width, decrement);
+// A helper function to infer a return type of IndexedPartSelectInOutOp.
+static Type getElementTypeOfWidth(Type type, int32_t width) {
+  auto elemTy = type.cast<hw::InOutType>().getElementType();
+  if (elemTy.isa<IntegerType>())
+    return hw::InOutType::get(IntegerType::get(type.getContext(), width));
+  if (elemTy.isa<hw::ArrayType>())
+    return hw::InOutType::get(hw::ArrayType::get(
+        elemTy.cast<hw::ArrayType>().getElementType(), width));
+  return {};
 }
 
 LogicalResult IndexedPartSelectInOutOp::inferReturnTypes(
@@ -1357,29 +1557,33 @@ LogicalResult IndexedPartSelectInOutOp::inferReturnTypes(
   if (!width)
     return failure();
 
-  results.push_back(hw::InOutType::get(
-      IntegerType::get(context, width.cast<IntegerAttr>().getInt())));
+  auto typ = getElementTypeOfWidth(
+      operands[0].getType(),
+      width.cast<IntegerAttr>().getValue().getZExtValue());
+  if (!typ)
+    return failure();
+  results.push_back(typ);
   return success();
 }
 
 LogicalResult IndexedPartSelectInOutOp::verify() {
   unsigned inputWidth = 0, resultWidth = 0;
   auto opWidth = getWidth();
-
-  if (auto i = getInput()
-                   .getType()
-                   .cast<InOutType>()
-                   .getElementType()
-                   .dyn_cast<IntegerType>())
+  auto inputElemTy = getInput().getType().cast<InOutType>().getElementType();
+  auto resultElemTy = getType().cast<InOutType>().getElementType();
+  if (auto i = inputElemTy.dyn_cast<IntegerType>())
     inputWidth = i.getWidth();
+  else if (auto i = hw::type_cast<hw::ArrayType>(inputElemTy))
+    inputWidth = i.getSize();
   else
-    return emitError("input element type must be Integer");
+    return emitError("input element type must be Integer or Array");
 
-  if (auto resType =
-          getType().cast<InOutType>().getElementType().dyn_cast<IntegerType>())
+  if (auto resType = resultElemTy.dyn_cast<IntegerType>())
     resultWidth = resType.getWidth();
+  else if (auto resType = hw::type_cast<hw::ArrayType>(resultElemTy))
+    resultWidth = resType.getSize();
   else
-    return emitError("result element type must be Integer");
+    return emitError("result element type must be Integer or Array");
 
   if (opWidth > inputWidth)
     return emitError("slice width should not be greater than input width");
@@ -1397,13 +1601,6 @@ OpFoldResult IndexedPartSelectInOutOp::fold(ArrayRef<Attribute> constants) {
 //===----------------------------------------------------------------------===//
 // IndexedPartSelectOp
 //===----------------------------------------------------------------------===//
-
-void IndexedPartSelectOp::build(OpBuilder &builder, OperationState &result,
-                                Value input, Value base, int32_t width,
-                                bool decrement) {
-  auto resultType = (IntegerType::get(builder.getContext(), width));
-  build(builder, result, resultType, input, base, width, decrement);
-}
 
 LogicalResult IndexedPartSelectOp::inferReturnTypes(
     MLIRContext *context, Optional<Location> loc, ValueRange operands,
@@ -1607,7 +1804,7 @@ ParseResult parseXMRPath(::mlir::OpAsmParser &parser, ArrayAttr &pathAttr,
   });
   if (succeeded(ret)) {
     pathAttr = parser.getBuilder().getArrayAttr(
-        ArrayRef(strings.begin(), strings.end() - 1));
+        ArrayRef<Attribute>(strings).drop_back());
     terminalAttr = (*strings.rbegin()).cast<StringAttr>();
   }
   return ret;

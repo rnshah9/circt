@@ -19,16 +19,21 @@ include "mlir/Pass/PassBase.td"
 def ESIConnectServices : Pass<"esi-connect-services", "mlir::ModuleOp"> {
   let summary = "Connect up ESI service requests to service providers";
   let constructor = "circt::esi::createESIConnectServicesPass()";
-  let dependentDialects = ["circt::hw::HWDialect"];
+  let dependentDialects = [
+    "circt::hw::HWDialect", "circt::sv::SVDialect", "circt::seq::SeqDialect",
+    "circt::comb::CombDialect"];
 }
 
-def ESICreateCapnpSchema: Pass<"esi-create-capnp-schema", "mlir::ModuleOp"> {
-  let summary = "Create a Cap'nProto schema";
-  let constructor = "circt::esi::createESICreateCapnpSchemaPass()";
+def ESIEmitCollateral: Pass<"esi-emit-collateral", "mlir::ModuleOp"> {
+  let summary = "Emit all the neccessary collateral";
+  let constructor = "circt::esi::createESIEmitCollateralPass()";
   let dependentDialects = ["circt::sv::SVDialect"];
   let options = [
     Option<"schemaFile", "schema-file", "std::string",
-           "", "File to output capnp schema into">
+           "", "File to output capnp schema into">,
+    ListOption<"tops", "tops", "std::string",
+               "List of top modules to export Tcl for",
+               "llvm::cl::ZeroOrMore,">
   ];
 }
 

@@ -146,7 +146,7 @@ Optional<unsigned> UnpackedType::getBitSize() const {
           [](auto type) { return type.getInner().getBitSize(); })
       .Case<UnpackedStructType>(
           [](auto type) { return type.getStruct().bitSize; })
-      .Default([](auto) { return llvm::None; });
+      .Default([](auto) { return std::nullopt; });
 }
 
 /// Map an `IntType` to the corresponding SBVT. Never returns a null type.
@@ -770,7 +770,7 @@ Optional<Range> PackedDim::getRange() const {
 }
 
 Optional<unsigned> PackedDim::getSize() const {
-  return getRange().map([](auto r) { return r.size; });
+  return getRange().transform([](auto r) { return r.size; });
 }
 
 const detail::DimStorage *PackedDim::getImpl() const {
@@ -1045,7 +1045,7 @@ Struct::Struct(StructKind kind, ArrayRef<StructMember> members, StringAttr name,
     if (auto memberSize = member.type.getBitSize()) {
       *bitSize += *memberSize;
     } else {
-      bitSize = llvm::None;
+      bitSize = std::nullopt;
       break;
     }
   }
@@ -1245,13 +1245,13 @@ static OptionalParseResult customTypeParser(DialectAsmParser &parser,
       return failure();
     StringAttr name;
     auto result = parser.parseOptionalAttribute(name);
-    if (result.hasValue())
+    if (result.has_value())
       if (*result || parser.parseComma())
         return failure();
     LocationAttr loc;
     PackedType base;
     result = parser.parseOptionalAttribute(loc);
-    if (result.hasValue()) {
+    if (result.has_value()) {
       if (*result)
         return failure();
     } else {
@@ -1368,7 +1368,7 @@ static OptionalParseResult customTypeParser(DialectAsmParser &parser,
 
     StringAttr name;
     auto result = parser.parseOptionalAttribute(name);
-    if (result.hasValue())
+    if (result.has_value())
       if (*result || parser.parseComma())
         return failure();
 
@@ -1550,12 +1550,12 @@ static ParseResult parseMooreType(DialectAsmParser &parser, Subset subset,
   llvm::SMLoc loc = parser.getCurrentLocation();
   StringRef mnemonic;
   OptionalParseResult result = generatedTypeParser(parser, &mnemonic, type);
-  if (result.hasValue())
-    return result.getValue();
+  if (result.has_value())
+    return result.value();
 
   result = customTypeParser(parser, mnemonic, subset, loc, type);
-  if (result.hasValue())
-    return result.getValue();
+  if (result.has_value())
+    return result.value();
 
   parser.emitError(loc) << "unknown type `" << mnemonic
                         << "` in dialect `moore`";

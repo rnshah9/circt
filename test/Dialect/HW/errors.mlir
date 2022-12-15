@@ -130,13 +130,6 @@ hw.module @union(%b: i42) {
 
 // -----
 
-hw.module @invalid_add(%a: i0) {  // i0 ports are ok.
-  // expected-error @+1 {{'comb.add' op operand #0 must be an integer bitvector of one or more bits, but got 'i0'}}
-  %b = comb.add %a, %a: i0
-}
-
-// -----
-
 // expected-note @+1 {{module declared here}}
 hw.module @empty() -> () {
   hw.output
@@ -230,7 +223,7 @@ hw.module @Use(%a: i8) -> (xx: i8) {
 hw.module.extern @p<p1: i42 = 17, p2: i1>(%arg0: i8) -> (out: i8)
 
 hw.module @Use(%a: i8) -> (xx: i8) {
-  // expected-error @+1 {{op parameter "p2" should have type i1 but has type i2}}
+  // expected-error @+1 {{op parameter "p2" should have type 'i1' but has type 'i2'}}
   %r0 = hw.instance "inst1" @p<p1: i42 = 4, p2: i2 = 0>(arg0: %a: i8) -> (out: i8)
   hw.output %r0: i8
 }
@@ -284,9 +277,18 @@ hw.module @Use<xx: i41>() {
 
 // -----
 
-// expected-error @+1 {{parameter #hw.param.decl<"xx": i41> has the same name as a previous parameter}}
-hw.module @Use<xx: i41, xx: i41>() {
-}
+// expected-error @+1 {{parameter #hw.param.decl<"xx": i41> : i41 has the same name as a previous parameter}}
+hw.module @Use<xx: i41, xx: i41>() {}
+
+// -----
+
+// expected-error @+1 {{parameter #hw.param.decl<"xx": i41 = 1> : i41 has the same name as a previous parameter}}
+hw.module @Use<xx: i41, xx: i41 = 1>() {}
+
+// -----
+
+// expected-error @+1 {{parameter #hw.param.decl<"xx": none> has the same name as a previous parameter}}
+hw.module @Use<xx: none, xx: none>() {}
 
 // -----
 
@@ -323,6 +325,36 @@ module {
   }
 // expected-note @+1 {{module declared here}}
   hw.module.extern @parameters<p1: i42>(%arg0: !hw.int<#hw.param.decl.ref<"p1">>) -> (out: !hw.int<#hw.param.decl.ref<"p1">>)
+}
+
+// -----
+
+// expected-note @+1 {{module declared here}}
+hw.module.extern @submodule () -> (out0: i32)
+
+hw.module @wrongResultLabel() {
+  // expected-error @+1 {{result label #0 must be "out0", but got "o"}}
+  %inst0.out0 = hw.instance "inst0" @submodule () -> (o: i32)
+}
+
+// -----
+
+// expected-note @+1 {{module declared here}}
+hw.module.extern @submodule () -> (out0: i32)
+
+hw.module @wrongNumberOfResultNames() {
+  // expected-error @+1 {{has a wrong number of results port labels; expected 1 but got 0}}
+  "hw.instance"() {instanceName="inst0", moduleName=@submodule, argNames=[], resultNames=[], parameters=[]} : () -> i32
+}
+
+// -----
+
+// expected-note @+1 {{module declared here}}
+hw.module.extern @submodule (%arg0: i32) -> ()
+
+hw.module @wrongNumberOfInputNames(%arg0: i32) {
+  // expected-error @+1 {{has a wrong number of input port names; expected 1 but got 0}}
+  "hw.instance"(%arg0) {instanceName="inst0", moduleName=@submodule, argNames=[], resultNames=[], parameters=[]} : (i32) -> ()
 }
 
 // -----

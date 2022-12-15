@@ -9,9 +9,12 @@
 #ifndef CONVERSION_EXPORTVERILOG_EXPORTVERILOGINTERNAL_H
 #define CONVERSION_EXPORTVERILOG_EXPORTVERILOGINTERNAL_H
 
+#include "circt/Dialect/Comb/CombVisitors.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWSymCache.h"
+#include "circt/Dialect/HW/HWVisitors.h"
 #include "circt/Dialect/SV/SVOps.h"
+#include "circt/Dialect/SV/SVVisitors.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include <atomic>
@@ -51,6 +54,11 @@ struct GlobalNameTable {
     return (it != renamedParams.end() ? it->second : paramName).getValue();
   }
 
+  StringAttr getEnumPrefix(Type type) const {
+    auto it = enumPrefixes.find(type);
+    return it != enumPrefixes.end() ? it->second : StringAttr();
+  }
+
 private:
   friend class GlobalNameResolver;
   GlobalNameTable() {}
@@ -66,6 +74,10 @@ private:
   /// This contains entries for any parameters that got renamed.  The key is a
   /// moduleop/paramName tuple, the value is the name to use.
   DenseMap<std::pair<Operation *, Attribute>, StringAttr> renamedParams;
+
+  // This contains prefixes for any typedecl'd enum types. Keys are type-aliases
+  // of enum types.
+  DenseMap<Type, StringAttr> enumPrefixes;
 };
 
 //===----------------------------------------------------------------------===//
@@ -83,14 +95,14 @@ struct NameCollisionResolver {
   }
 
   /// Insert a string as an already-used name.
-  void insertUsedName(StringRef name) { usedNames.insert(name); }
+  void insertUsedName(StringRef name) {
+    nextGeneratedNameIDs.insert({name, 0});
+  }
 
 private:
-  /// Set of used names, to ensure uniqueness.
-  llvm::StringSet<> usedNames;
-
-  /// Numeric suffix used as uniquification agent when resolving conflicts.
-  size_t nextGeneratedNameID = 0;
+  /// A map from used names to numeric suffix used as uniquification agent when
+  /// resolving conflicts.
+  llvm::StringMap<size_t> nextGeneratedNameIDs;
 
   NameCollisionResolver(const NameCollisionResolver &) = delete;
   void operator=(const NameCollisionResolver &) = delete;
@@ -101,9 +113,16 @@ private:
 //===----------------------------------------------------------------------===//
 
 struct FieldNameResolver {
-  FieldNameResolver() = default;
+  FieldNameResolver(const GlobalNameTable &globalNames)
+      : globalNames(globalNames){};
 
   StringAttr getRenamedFieldName(StringAttr fieldName);
+
+  /// Returns the field name for an enum field of a given enum field attr. In
+  /// case a prefix can be inferred for the provided enum type (the enum type is
+  /// a type alias), the prefix will be applied. If not, the raw field name
+  /// is returned.
+  std::string getEnumFieldName(hw::EnumFieldAttr attr);
 
 private:
   void setRenamedFieldName(StringAttr fieldName, StringAttr newFieldName);
@@ -113,12 +132,12 @@ private:
   /// verilog keywords.
   DenseMap<StringAttr, StringAttr> renamedFieldNames;
 
-  /// This contains field names *after* the type legalization to avoid conflicts
-  /// of renamed field names.
-  llvm::StringSet<> usedFieldNames;
+  /// A map from used names to numeric suffix used as uniquification agent when
+  /// resolving conflicts.
+  llvm::StringMap<size_t> nextGeneratedNameIDs;
 
-  /// Numeric suffix used as uniquification agent when resolving conflicts.
-  size_t nextGeneratedNameID = 0;
+  // Handle to the global name table.
+  const GlobalNameTable &globalNames;
 };
 
 //===----------------------------------------------------------------------===//
@@ -273,7 +292,7 @@ static inline bool isExpressionAlwaysInline(Operation *op) {
 
   // XMRs can't be spilled if they are on the lhs.  Conservatively never spill
   // them.
-  if (isa<sv::XMROp>(op))
+  if (isa<sv::XMROp, sv::XMRRefOp>(op))
     return true;
 
   if (isa<sv::SampledOp>(op))
@@ -293,13 +312,20 @@ static inline bool isConstantExpression(Operation *op) {
 /// MemoryEffects should be checked if a client cares.
 bool isVerilogExpression(Operation *op);
 
+/// Return true if this is a zero bit type, e.g. a zero bit integer or array
+/// thereof.
+bool isZeroBitType(Type type);
+
 /// Return true if this expression should be emitted inline into any statement
 /// that uses it.
-bool isExpressionEmittedInline(Operation *op);
+bool isExpressionEmittedInline(Operation *op, const LoweringOptions &options);
 
 /// For each module we emit, do a prepass over the structure, pre-lowering and
 /// otherwise rewriting operations we don't want to emit.
 void prepareHWModule(Block &block, const LoweringOptions &options);
+void prepareHWModule(hw::HWModuleOp module, const LoweringOptions &options);
+
+void pruneZeroValuedLogic(hw::HWModuleOp module);
 
 /// Rewrite module names and interfaces to not conflict with each other or with
 /// Verilog keywords.

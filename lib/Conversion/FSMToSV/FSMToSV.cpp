@@ -14,6 +14,7 @@
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <memory>
@@ -57,6 +58,28 @@ static ClkRstIdxs getMachinePortInfo(SmallVectorImpl<hw::PortInfo> &ports,
   return specialPorts;
 }
 
+// Clones constants implicitly captured by the region, into the region.
+static void cloneConstantsIntoRegion(Region &region, OpBuilder &builder) {
+  // Values implicitly captured by the region.
+  llvm::SetVector<Value> captures;
+  getUsedValuesDefinedAbove(region, region, captures);
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(&region.front());
+
+  // Clone ConstantLike operations into the region.
+  for (auto &capture : captures) {
+    Operation *op = capture.getDefiningOp();
+    if (!op || !op->hasTrait<OpTrait::ConstantLike>())
+      continue;
+
+    Operation *cloned = builder.clone(*op);
+    for (auto [orig, replacement] :
+         llvm::zip(op->getResults(), cloned->getResults()))
+      replaceAllUsesInRegionWith(orig, replacement, region);
+  }
+}
+
 namespace {
 
 class StateEncoding {
@@ -65,7 +88,8 @@ class StateEncoding {
   // values, and used as selection signals for muxes.
 
 public:
-  StateEncoding(OpBuilder &b, MachineOp machine, hw::HWModuleOp hwModule);
+  StateEncoding(OpBuilder &b, hw::TypeScopeOp typeScope, MachineOp machine,
+                hw::HWModuleOp hwModule);
 
   // Get the encoded value for a state.
   Value encode(StateOp state);
@@ -96,6 +120,9 @@ protected:
   // A mapping between an encoded value and the source value in the IR.
   SmallDenseMap<Value, Value> valueToSrcValue;
 
+  // A typescope to emit the FSM enum type within.
+  hw::TypeScopeOp typeScope;
+
   // The enum type for the states.
   Type stateType;
 
@@ -104,9 +131,9 @@ protected:
   hw::HWModuleOp hwModule;
 };
 
-StateEncoding::StateEncoding(OpBuilder &b, MachineOp machine,
-                             hw::HWModuleOp hwModule)
-    : b(b), machine(machine), hwModule(hwModule) {
+StateEncoding::StateEncoding(OpBuilder &b, hw::TypeScopeOp typeScope,
+                             MachineOp machine, hw::HWModuleOp hwModule)
+    : typeScope(typeScope), b(b), machine(machine), hwModule(hwModule) {
   Location loc = machine.getLoc();
   llvm::SmallVector<Attribute> stateNames;
 
@@ -118,11 +145,6 @@ StateEncoding::StateEncoding(OpBuilder &b, MachineOp machine,
       hw::EnumType::get(b.getContext(), b.getArrayAttr(stateNames));
 
   OpBuilder::InsertionGuard guard(b);
-  b.setInsertionPoint(hwModule);
-  auto typeScope = b.create<hw::TypeScopeOp>(
-      loc, b.getStringAttr(hwModule.getName() + "_enum_typedecls"));
-  typeScope.getBodyRegion().push_back(new Block());
-
   b.setInsertionPointToStart(&typeScope.getBodyRegion().front());
   auto typedeclEnumType = b.create<hw::TypedeclOp>(
       loc, b.getStringAttr(hwModule.getName() + "_state_t"),
@@ -175,7 +197,7 @@ void StateEncoding::setEncoding(StateOp state, Value v, bool wire) {
   if (wire) {
     auto loc = machine.getLoc();
     auto stateType = getStateType();
-    auto stateEncodingWire = b.create<sv::WireOp>(
+    auto stateEncodingWire = b.create<sv::RegOp>(
         loc, stateType, b.getStringAttr("to_" + state.getName()),
         /*inner_sym=*/state.getNameAttr());
     b.create<sv::AssignOp>(loc, stateEncodingWire, v);
@@ -189,8 +211,9 @@ void StateEncoding::setEncoding(StateOp state, Value v, bool wire) {
 
 class MachineOpConverter {
 public:
-  MachineOpConverter(OpBuilder &builder, MachineOp machineOp)
-      : machineOp(machineOp), b(builder) {}
+  MachineOpConverter(OpBuilder &builder, hw::TypeScopeOp typeScope,
+                     MachineOp machineOp)
+      : machineOp(machineOp), typeScope(typeScope), b(builder) {}
 
   // Converts the machine op to a hardware module.
   // 1. Creates a HWModuleOp for the machine op, with the same I/O as the FSM +
@@ -294,6 +317,9 @@ private:
   // A handle to the state register of the machine.
   seq::CompRegOp stateReg;
 
+  // A typescope to emit the FSM enum type within.
+  hw::TypeScopeOp typeScope;
+
   OpBuilder &b;
 };
 
@@ -373,10 +399,14 @@ LogicalResult MachineOpConverter::dispatch() {
   if (machineOp.getNumStates() < 2)
     return machineOp.emitOpError() << "expected at least 2 states.";
 
+  // Clone all referenced constants into the machine body - constants may have
+  // been moved to the machine parent due to the lack of IsolationFromAbove.
+  cloneConstantsIntoRegion(machineOp.getBody(), b);
+
   // 1) Get the port info of the machine and create a new HW module for it.
   SmallVector<hw::PortInfo, 16> ports;
   auto clkRstIdxs = getMachinePortInfo(ports, machineOp, b);
-  hwModuleOp = b.create<hw::HWModuleOp>(loc, machineOp.sym_nameAttr(), ports);
+  hwModuleOp = b.create<hw::HWModuleOp>(loc, machineOp.getSymNameAttr(), ports);
   b.setInsertionPointToStart(&hwModuleOp.front());
 
   // Replace all uses of the machine arguments with the arguments of the
@@ -392,7 +422,8 @@ LogicalResult MachineOpConverter::dispatch() {
   auto reset = hwModuleOp.front().getArgument(clkRstIdxs.resetIdx);
 
   // 2) Build state and variable registers.
-  encoding = std::make_unique<StateEncoding>(b, machineOp, hwModuleOp);
+  encoding =
+      std::make_unique<StateEncoding>(b, typeScope, machineOp, hwModuleOp);
   auto stateType = encoding->getStateType();
 
   auto nextStateWire =
@@ -404,18 +435,18 @@ LogicalResult MachineOpConverter::dispatch() {
 
   llvm::DenseMap<VariableOp, sv::RegOp> variableNextStateWires;
   for (auto variableOp : machineOp.front().getOps<fsm::VariableOp>()) {
-    auto initValueAttr = variableOp.initValueAttr().dyn_cast<IntegerAttr>();
+    auto initValueAttr = variableOp.getInitValueAttr().dyn_cast<IntegerAttr>();
     if (!initValueAttr)
       return variableOp.emitOpError() << "expected an integer attribute "
                                          "for the initial value.";
     Type varType = variableOp.getType();
     auto varLoc = variableOp.getLoc();
     auto varNextState = b.create<sv::RegOp>(
-        varLoc, varType, b.getStringAttr(variableOp.name() + "_next"));
+        varLoc, varType, b.getStringAttr(variableOp.getName() + "_next"));
     auto varResetVal = b.create<hw::ConstantOp>(varLoc, initValueAttr);
     auto variableReg = b.create<seq::CompRegOp>(
         varLoc, varType, b.create<sv::ReadInOutOp>(varLoc, varNextState), clock,
-        b.getStringAttr(variableOp.name() + "_reg"), reset, varResetVal,
+        b.getStringAttr(variableOp.getName() + "_reg"), reset, varResetVal,
         nullptr);
     variableToRegister[variableOp] = variableReg;
     variableNextStateWires[variableOp] = varNextState;
@@ -552,26 +583,26 @@ MachineOpConverter::convertTransitions( // NOLINT(misc-no-recursion)
   } else {
     // Recursive case - transition to a named state.
     auto transition = cast<fsm::TransitionOp>(transitions.front());
-    nextState = encoding->encode(transition.getNextState());
+    nextState = encoding->encode(transition.getNextStateOp());
 
     // Action conversion
     if (transition.hasAction()) {
       // Move any ops from the action region to the general scope, excluding
       // variable update ops.
       auto actionMoveOpsRes =
-          moveOps(&transition.action().front(),
+          moveOps(&transition.getAction().front(),
                   [](Operation *op) { return isa<fsm::UpdateOp>(op); });
       if (failed(actionMoveOpsRes))
         return failure();
 
       // Gather variable updates during the action.
       DenseMap<fsm::VariableOp, Value> variableUpdates;
-      for (auto updateOp : transition.action().getOps<fsm::UpdateOp>()) {
-        VariableOp variableOp = updateOp.getVariable();
-        variableUpdates[variableOp] = updateOp.value();
+      for (auto updateOp : transition.getAction().getOps<fsm::UpdateOp>()) {
+        VariableOp variableOp = updateOp.getVariableOp();
+        variableUpdates[variableOp] = updateOp.getValue();
       }
 
-      stateToVariableUpdates[currentState][transition.getNextState()] =
+      stateToVariableUpdates[currentState][transition.getNextStateOp()] =
           variableUpdates;
     }
 
@@ -579,17 +610,17 @@ MachineOpConverter::convertTransitions( // NOLINT(misc-no-recursion)
     if (transition.hasGuard()) {
       // Not always taken; recurse and mux between the targeted next state and
       // the recursion result, selecting based on the provided guard.
-      auto guardOpRes = moveOps(&transition.guard().front());
+      auto guardOpRes = moveOps(&transition.getGuard().front());
       if (failed(guardOpRes))
         return failure();
 
-      auto guard = cast<ReturnOp>(*guardOpRes).getOperand(0);
+      auto guard = cast<ReturnOp>(*guardOpRes).getOperand();
       auto otherNextState =
           convertTransitions(currentState, transitions.drop_front());
       if (failed(otherNextState))
         return failure();
       comb::MuxOp nextStateMux = b.create<comb::MuxOp>(
-          transition.getLoc(), guard, nextState, *otherNextState);
+          transition.getLoc(), guard, nextState, *otherNextState, false);
       nextState = nextStateMux;
     }
   }
@@ -604,15 +635,17 @@ MachineOpConverter::convertState(StateOp state) {
 
   // 3.1) Convert the output region by moving the operations into the module
   // scope and gathering the operands of the output op.
-  auto outputOpRes = moveOps(&state.output().front());
-  if (failed(outputOpRes))
-    return failure();
+  if (!state.getOutput().empty()) {
+    auto outputOpRes = moveOps(&state.getOutput().front());
+    if (failed(outputOpRes))
+      return failure();
 
-  OutputOp outputOp = cast<fsm::OutputOp>(*outputOpRes);
-  res.outputs = outputOp.getOperands(); // 3.2
+    OutputOp outputOp = cast<fsm::OutputOp>(*outputOpRes);
+    res.outputs = outputOp.getOperands(); // 3.2
+  }
 
   auto transitions = llvm::SmallVector<TransitionOp>(
-      state.transitions().getOps<TransitionOp>());
+      state.getTransitions().getOps<TransitionOp>());
   // 3.3, 3.4) Convert the transitions and record the next-state value
   // derived from the transitions being selected in a priority-encoded manner.
   auto nextStateRes = convertTransitions(state, transitions);
@@ -631,9 +664,23 @@ void FSMToSVPass::runOnOperation() {
   auto b = OpBuilder(module);
   SmallVector<Operation *, 16> opToErase;
 
+  // Create a typescope shared by all of the FSMs. This typescope will be
+  // emitted in a single separate file to avoid polluting each output file with
+  // typedefs.
+  StringAttr typeScopeFilename = b.getStringAttr("fsm_enum_typedefs.sv");
+  b.setInsertionPointToStart(module.getBody());
+  auto typeScope = b.create<hw::TypeScopeOp>(
+      module.getLoc(), b.getStringAttr("fsm_enum_typedecls"));
+  typeScope.getBodyRegion().push_back(new Block());
+  typeScope->setAttr(
+      "output_file",
+      hw::OutputFileAttr::get(typeScopeFilename,
+                              /*excludeFromFileList*/ b.getBoolAttr(false),
+                              /*includeReplicatedOps*/ b.getBoolAttr(false)));
+
   // Traverse all machines and convert.
   for (auto machine : llvm::make_early_inc_range(module.getOps<MachineOp>())) {
-    MachineOpConverter converter(b, machine);
+    MachineOpConverter converter(b, typeScope, machine);
 
     if (failed(converter.dispatch())) {
       signalPassFailure();
@@ -645,7 +692,8 @@ void FSMToSVPass::runOnOperation() {
   llvm::SmallVector<HWInstanceOp> instances;
   module.walk([&](HWInstanceOp instance) { instances.push_back(instance); });
   for (auto instance : instances) {
-    auto fsmHWModule = module.lookupSymbol<hw::HWModuleOp>(instance.machine());
+    auto fsmHWModule =
+        module.lookupSymbol<hw::HWModuleOp>(instance.getMachine());
     assert(fsmHWModule &&
            "FSM machine should have been converted to a hw.module");
 
@@ -658,6 +706,17 @@ void FSMToSVPass::runOnOperation() {
         operands, nullptr);
     instance.replaceAllUsesWith(hwInstance);
     instance.erase();
+  }
+
+  if (typeScope.getBodyBlock()->empty()) {
+    // If the typescope is empty (no FSMs were converted), erase it.
+    typeScope.erase();
+  } else {
+    // Else, add an include file to the top-level (will include typescope
+    // in all files).
+    b.setInsertionPointToStart(module.getBody());
+    b.create<sv::VerbatimOp>(
+        module.getLoc(), "`include \"" + typeScopeFilename.getValue() + "\"");
   }
 }
 

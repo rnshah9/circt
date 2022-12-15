@@ -1,4 +1,9 @@
-; RUN: firtool %s --format=fir --ir-sv | FileCheck %s
+; RUN: firtool %s --format=fir --ir-sv | FileCheck %s --check-prefixes=CHECK,COMMON
+; RUN: firtool %s --format=fir --ir-sv -strip-mux-pragmas | FileCheck %s --check-prefix COMMON --implicit-check-not sv.attributes
+; RUN: firtool %s --format=fir --ir-sv -disable-mem-randomization | FileCheck %s --check-prefix COMMON --implicit-check-not RANDOMIZE_MEM
+; RUN: firtool %s --format=fir --ir-sv -disable-reg-randomization | FileCheck %s --check-prefix COMMON --implicit-check-not RANDOMIZE_REG
+; RUN: firtool %s --format=fir --ir-sv -disable-mem-randomization --disable-reg-randomization | FileCheck %s --check-prefix COMMON --implicit-check-not RANDOMIZE_MEM --implicit-check-not RANDOMIZE_REG
+; RUN: firtool %s --format=fir --ir-sv -disable-all-randomization | FileCheck %s --check-prefix COMMON --implicit-check-not RANDOMIZE_MEM --implicit-check-not RANDOMIZE_REG
 
 circuit Qux: %[[{
     "class": "sifive.enterprise.firrtl.MarkDUTAnnotation",
@@ -60,7 +65,10 @@ circuit Qux: %[[{
 
 
 
-;CHECK-LABEL: hw.module @Qux
+; This test is quite fragile, both as written, and in that it depends on
+; multiple passes.  It should be replaced with a narrower test.
+
+;COMMON-LABEL: hw.module @Qux
 ;CHECK:    %[[memory_0:.+]] = sv.reg
 ;CHECK:    %[[memory_1:.+]] = sv.reg
 ;CHECK:    %[[memory_2:.+]] = sv.reg
@@ -68,21 +76,58 @@ circuit Qux: %[[{
 ;CHECK:    %[[addr:.+]] = sv.reg
 ;CHECK:    %[[v4:.+]] = sv.read_inout %[[addr]]
 ;CHECK:    %[[v5:.+]] = hw.array_create
+;CHECK:    %[[array_get:.+]] = hw.array_get %[[v5]][%[[v4]]]
 ;CHECK:    %[[multbit_mux_wire:.+]] = sv.wire  : !hw.inout<i8>
-;CHECK:    %[[array_get:.+]] = hw.array_get %[[v5]][%[[v4]]] : !hw.array<4xi8>
-;CHECK{LITERAL}:    sv.verbatim "assign {{0}} = {{1}} /* cadence map_to_mux */; /* synopsys infer_mux_override */"
-;CHECK-SAME:        (%[[multbit_mux_wire]], %[[array_get]])
-;CHECK:    %[[v6:.+]] = sv.read_inout %[[multbit_mux_wire]] : !hw.inout<i8>
-;CHECK:    %[[multbit_mux_wire:.+]] = sv.wire  : !hw.inout<i8>
+;CHECK:    sv.assign %[[multbit_mux_wire]], %[[array_get]]
+;CHECK:    %[[v6:.+]] = sv.read_inout %[[multbit_mux_wire]]
 ;CHECK:    %[[array_get:.+]] = hw.array_get %[[v5]][%rwAddr]
-;CHECK{LITERAL}:    sv.verbatim "assign {{0}} = {{1}} /* cadence map_to_mux */; /* synopsys infer_mux_override */"
-;CHECK-SAME:        (%[[multbit_mux_wire]], %[[array_get]])
-;CHECK:    %[[v7:.+]] = sv.read_inout %[[multbit_mux_wire]] : !hw.inout<i8>
+;CHECK:    %[[multbit_mux_wire:.+]] = sv.wire  : !hw.inout<i8>
+;CHECK:    %[[v7:.+]] = sv.read_inout %[[multbit_mux_wire]]
+;CHECK:    %12 = comb.icmp eq %rwAddr, %c0_i2 : i2
+;CHECK:    %13 = comb.and %rwEn, %rwMode, %rwMask, %12 : i1
+;CHECK:    %14 = comb.icmp bin eq %rwAddr, %c1_i2 : i2
+;CHECK:    %15 = comb.and %rwEn, %rwMode, %rwMask, %14 : i1
+;CHECK:    %16 = comb.icmp bin eq %rwAddr, %c-2_i2 : i2
+;CHECK:    %17 = comb.and %rwEn, %rwMode, %rwMask, %16 : i1
+;CHECK:    %18 = comb.icmp bin eq %rwAddr, %c-1_i2 : i2
+;CHECK:    %19 = comb.and %rwEn, %rwMode, %rwMask, %18 : i1
+;CHECK:    %20 = comb.icmp eq %wAddr, %c0_i2 : i2
+;CHECK:    %21 = comb.and %wEn, %wMask, %20 : i1
+;CHECK:    %22 = comb.icmp bin eq %wAddr, %c1_i2 : i2
+;CHECK:    %23 = comb.and %wEn, %wMask, %22 : i1
+;CHECK:    %24 = comb.icmp bin eq %wAddr, %c-2_i2 : i2
+;CHECK:    %25 = comb.and %wEn, %wMask, %24 : i1
+;CHECK:    %26 = comb.icmp bin eq %wAddr, %c-1_i2 : i2
+;CHECK:    %27 = comb.and %wEn, %wMask, %26 : i1
 ;CHECK:    sv.always posedge %clock {
-;CHECK-NEXT:      sv.passign %[[memory_0]]
-;CHECK-NEXT:      sv.passign %[[memory_1]]
-;CHECK-NEXT:      sv.passign %[[memory_2]]
-;CHECK-NEXT:      sv.passign %[[memory_3]]
-;CHECK-NEXT:      sv.passign %[[addr]], %rAddr : i2
-;CHECK-NEXT:    }
+;CHECK:      sv.if %21 {
+;CHECK:        sv.passign %memory_0, %wData : i8
+;CHECK:      } else {
+;CHECK:        sv.if %13 {
+;CHECK:          sv.passign %memory_0, %rwDataIn : i8
+;CHECK:        }
+;CHECK:      }
+;CHECK:      sv.if %23 {
+;CHECK:        sv.passign %memory_1, %wData : i8
+;CHECK:      } else {
+;CHECK:        sv.if %15 {
+;CHECK:          sv.passign %memory_1, %rwDataIn : i8
+;CHECK:        }
+;CHECK:      }
+;CHECK:      sv.if %25 {
+;CHECK:        sv.passign %memory_2, %wData : i8
+;CHECK:      } else {
+;CHECK:        sv.if %17 {
+;CHECK:          sv.passign %memory_2, %rwDataIn : i8
+;CHECK:        }
+;CHECK:      }
+;CHECK:      sv.if %27 {
+;CHECK:        sv.passign %memory_3, %wData : i8
+;CHECK:      } else {
+;CHECK:        sv.if %19 {
+;CHECK:          sv.passign %memory_3, %rwDataIn : i8
+;CHECK:        }
+;CHECK:      }
+;CHECK:      sv.passign %addr, %rAddr : i2
+;CHECK:    }
 ;CHECK:    hw.output %[[v6]], %[[v7]]

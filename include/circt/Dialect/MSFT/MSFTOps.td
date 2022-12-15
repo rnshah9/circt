@@ -37,10 +37,10 @@ def InstanceOp : MSFTOp<"instance", [
     /// Instance name is the same as the symbol name. This may change in the
     /// future.
     StringRef instanceName() {
-      return sym_name();
+      return getSymName();
     }
     StringAttr instanceNameAttr() {
-      return sym_nameAttr();
+      return getSymNameAttr();
     }
     /// Check that the operands and results match the module specified.
     LogicalResult verifySignatureMatch(const circt::hw::ModulePortInfo&);
@@ -63,12 +63,64 @@ def OneOrNoBlocksRegion : Region<
 
 def AppIDArrayAttr : TypedArrayAttrBase<AppIDAttr, "Array of AppIDs">;
 
-def MSFTModuleOp : MSFTOp<"module",
-      [IsolatedFromAbove, FunctionOpInterface, Symbol, RegionKindInterface,
-       HasParent<"mlir::ModuleOp">,
+class MSFTModuleOpBase<string mnemonic, list<Trait> traits = []> :
+    MSFTOp<mnemonic, traits # [
+      IsolatedFromAbove, Symbol, FunctionOpInterface, OpAsmOpInterface,
+      HasParent<"mlir::ModuleOp">, DeclareOpInterfaceMethods<HWModuleLike>
+    ]> {
+  /// Additional class declarations inside the module op.
+  code extraModuleClassDeclaration = ?;
+
+  let extraClassDeclaration = extraModuleClassDeclaration # [{
+    // Decode information about the input and output ports on this module.
+    ::circt::hw::ModulePortInfo getPorts();
+
+    // Get the module's symbolic name as StringAttr.
+    StringAttr getNameAttr() {
+      return (*this)->getAttrOfType<StringAttr>(
+        ::mlir::SymbolTable::getSymbolAttrName());
+    }
+
+    // Get the module's symbolic name.
+    StringRef getName() {
+      return getNameAttr().getValue();
+    }
+
+    /// Returns the argument types of this function.
+    ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+
+    /// Returns the result types of this function.
+    ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
+
+    /// Verify the type attribute of this function. Returns failure and emits
+    /// an error if the attribute is invalid.
+    LogicalResult verifyType() {
+      auto type = getFunctionTypeAttr().getValue();
+      if (!type.isa<FunctionType>())
+        return emitOpError(
+            "requires '" + getFunctionTypeAttrName().getValue() +
+            "' attribute of function type");
+      return success();
+    }
+
+    void getAsmBlockArgumentNames(Region &region,
+                                      OpAsmSetValueNameFn setNameFn) {
+      if (region.empty())
+        return;
+      Block *block = getBodyBlock();
+      ArrayAttr argNames = getArgNamesAttr();
+      for (size_t i = 0, e = block->getNumArguments(); i != e; ++i) {
+        auto name = argNames[i].cast<StringAttr>().getValue();
+        if (!name.empty())
+          setNameFn(block->getArgument(i), name);
+      }
+    }
+  }];
+}
+
+def MSFTModuleOp : MSFTModuleOpBase<"module",
+      [RegionKindInterface, HasParent<"mlir::ModuleOp">,
        SingleBlockImplicitTerminator<"OutputOp">,
-       OpAsmOpInterface,
-       DeclareOpInterfaceMethods<HWModuleLike>,
        DeclareOpInterfaceMethods<HWMutableModuleLike>]>{
   let summary = "MSFT HW Module";
   let description = [{
@@ -78,6 +130,9 @@ def MSFTModuleOp : MSFTOp<"module",
       - Provides methods for mutation.
   }];
   let arguments = (ins
+      TypeAttrOf<FunctionType>:$function_type,
+      OptionalAttr<DictArrayAttr>:$arg_attrs,
+      OptionalAttr<DictArrayAttr>:$res_attrs,
       StrArrayAttr:$argNames, StrArrayAttr:$resultNames,
       DictionaryAttr:$parameters,
       OptionalAttr<StrAttr>:$fileName,
@@ -91,17 +146,14 @@ def MSFTModuleOp : MSFTOp<"module",
                    "ArrayRef<NamedAttribute>":$params)>
   ];
 
-  let extraClassDeclaration = [{
+  let extraModuleClassDeclaration = [{
     using mlir::detail::FunctionOpInterfaceTrait<MSFTModuleOp>::front;
-    using mlir::detail::FunctionOpInterfaceTrait<MSFTModuleOp>::getBody;
+    using mlir::detail::FunctionOpInterfaceTrait<MSFTModuleOp>::getFunctionBody;
 
     // Implement RegionKindInterface.
     static RegionKind getRegionKind(unsigned index) {
       return RegionKind::Graph;
     }
-
-    // Decode information about the input and output ports on this module.
-    ::circt::hw::ModulePortInfo getPorts();
 
     // Insert and remove ports.
     void modifyPorts(
@@ -120,41 +172,21 @@ def MSFTModuleOp : MSFTOp<"module",
     SmallVector<unsigned>
     removePorts(llvm::BitVector inputs, llvm::BitVector outputs);
 
-    // Get the module's symbolic name as StringAttr.
-    StringAttr getNameAttr() {
-      return (*this)->getAttrOfType<StringAttr>(
-        ::mlir::SymbolTable::getSymbolAttrName());
+    Block *getBodyBlock() { return &getFunctionBody().front(); }
+  }];
+
+  let extraClassDefinition = [{
+    size_t $cppClass::getNumPorts() {
+      auto ports = getPorts();
+      return ports.inputs.size() + ports.outputs.size();
     }
 
-    // Get the module's symbolic name.
-    StringRef getName() {
-      return getNameAttr().getValue();
-    }
-
-    Block *getBodyBlock() { return &body().front(); }
-    void getAsmBlockArgumentNames(mlir::Region &region,
-                                  mlir::OpAsmSetValueNameFn setNameFn);
-
-    /// Returns the type of this function.
-    FunctionType getFunctionType() {
-      return getFunctionTypeAttr().getValue().cast<FunctionType>();
-    }
-
-    /// Returns the argument types of this function.
-    ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
-
-    /// Returns the result types of this function.
-    ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
-
-    /// Verify the type attribute of this function. Returns failure and emits
-    /// an error if the attribute is invalid.
-    LogicalResult verifyType() {
-      auto type = getFunctionTypeAttr().getValue();
-      if (!type.isa<FunctionType>())
-        return emitOpError(
-            "requires '" + mlir::function_interface_impl::getTypeAttrName() +
-            "' attribute of function type");
-      return success();
+    circt::hw::InnerSymAttr $cppClass::getPortSymbolAttr(size_t portIndex) {
+      for (NamedAttribute argAttr :
+           mlir::function_interface_impl::getArgAttrs(*this, portIndex))
+        if (auto sym = argAttr.getValue().dyn_cast<circt::hw::InnerSymAttr>())
+          return sym;
+      return circt::hw::InnerSymAttr();
     }
   }];
 
@@ -162,14 +194,17 @@ def MSFTModuleOp : MSFTOp<"module",
 }
 
 def MSFTModuleExternOp : MSFTOp<"module.extern",
-      [Symbol, HasParent<"mlir::ModuleOp">]> {
+      [Symbol, FunctionOpInterface, HasParent<"mlir::ModuleOp">]> {
   let summary = "MSFT external Module";
   let description = [{
     Identical to `hw.module.extern`, and trivially lowers to that. This op
     exists so that we can use `msft.instance` to refer to both `msft.module` and
     `msft.module.extern`, rather than mixing `hw.instance` with `msft.instance`.
   }];
-  let arguments = (ins StrArrayAttr:$argNames, StrArrayAttr:$resultNames,
+  let arguments = (ins TypeAttrOf<FunctionType>:$function_type,
+                       OptionalAttr<DictArrayAttr>:$arg_attrs,
+                       OptionalAttr<DictArrayAttr>:$res_attrs,
+                       StrArrayAttr:$argNames, StrArrayAttr:$resultNames,
                        ParamDeclArrayAttr:$parameters,
                        OptionalAttr<StrAttr>:$verilogName);
   let regions = (region SizedRegion<0>:$body);
@@ -188,6 +223,12 @@ def MSFTModuleExternOp : MSFTOp<"module.extern",
   let extraClassDeclaration = [{
     /// Decode information about the input and output ports on this module.
     hw::ModulePortInfo getPorts();
+
+    /// Returns the argument types of this function.
+    ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
+
+    /// Returns the result types of this function.
+    ArrayRef<Type> getResultTypes() { return getFunctionType().getResults(); }
   }];
 }
 
@@ -207,8 +248,8 @@ def DesignPartitionOp : MSFTOp<"partition",
   let assemblyFormat = "$sym_name `,` $verilogName attr-dict";
 }
 
-def OutputOp : MSFTOp<"output", [Terminator, HasParent<"MSFTModuleOp">,
-                                NoSideEffect, ReturnLike]> {
+def OutputOp : MSFTOp<"output", [Terminator, ParentOneOf<["MSFTModuleOp", "LinearOp"]>,
+                                Pure, ReturnLike]> {
   let summary = "termination operation";
 
   let arguments = (ins Variadic<AnyType>:$operands);

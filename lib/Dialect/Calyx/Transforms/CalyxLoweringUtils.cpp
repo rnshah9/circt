@@ -148,11 +148,11 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
                                       Value inputValue) {
   mlir::IRRewriter::InsertionGuard guard(builder);
   auto loc = inputValue.getLoc();
-  builder.setInsertionPointToEnd(groupOp.getBody());
-  builder.create<calyx::AssignOp>(loc, reg.in(), inputValue);
+  builder.setInsertionPointToEnd(groupOp.getBodyBlock());
+  builder.create<calyx::AssignOp>(loc, reg.getIn(), inputValue);
   builder.create<calyx::AssignOp>(
-      loc, reg.write_en(), createConstant(loc, builder, componentOp, 1, 1));
-  builder.create<calyx::GroupDoneOp>(loc, reg.done());
+      loc, reg.getWriteEn(), createConstant(loc, builder, componentOp, 1, 1));
+  builder.create<calyx::GroupDoneOp>(loc, reg.getDone());
 }
 
 //===----------------------------------------------------------------------===//
@@ -369,10 +369,11 @@ ModuleOpConversion::matchAndRewrite(mlir::ModuleOp moduleOp,
 
 FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern(
     MLIRContext *context, LogicalResult &resRef,
+    PatternApplicationState &patternState,
     DenseMap<mlir::func::FuncOp, calyx::ComponentOp> &map,
     calyx::CalyxLoweringState &state)
-    : PartialLoweringPattern(context, resRef), functionMapping(map),
-      calyxLoweringState(state) {}
+    : PartialLoweringPattern(context, resRef, patternState),
+      functionMapping(map), calyxLoweringState(state) {}
 
 LogicalResult
 FuncOpPartialLoweringPattern::partiallyLower(mlir::func::FuncOp funcOp,
@@ -456,7 +457,7 @@ LogicalResult
 MultipleGroupDonePattern::matchAndRewrite(calyx::GroupOp groupOp,
                                           PatternRewriter &rewriter) const {
   auto groupDoneOps = SmallVector<calyx::GroupDoneOp>(
-      groupOp.getBody()->getOps<calyx::GroupDoneOp>());
+      groupOp.getBodyBlock()->getOps<calyx::GroupDoneOp>());
 
   if (groupDoneOps.size() <= 1)
     return failure();
@@ -465,9 +466,9 @@ MultipleGroupDonePattern::matchAndRewrite(calyx::GroupOp groupOp,
   rewriter.setInsertionPointToEnd(groupDoneOps[0]->getBlock());
   SmallVector<Value> doneOpSrcs;
   llvm::transform(groupDoneOps, std::back_inserter(doneOpSrcs),
-                  [](calyx::GroupDoneOp op) { return op.src(); });
-  Value allDone =
-      rewriter.create<comb::AndOp>(groupDoneOps.front().getLoc(), doneOpSrcs);
+                  [](calyx::GroupDoneOp op) { return op.getSrc(); });
+  Value allDone = rewriter.create<comb::AndOp>(groupDoneOps.front().getLoc(),
+                                               doneOpSrcs, false);
 
   /// Create a group done op with the complex expression as a guard.
   rewriter.create<calyx::GroupDoneOp>(
@@ -488,7 +489,7 @@ EliminateUnusedCombGroups::matchAndRewrite(calyx::CombGroupOp combGroupOp,
                                            PatternRewriter &rewriter) const {
   auto control =
       combGroupOp->getParentOfType<calyx::ComponentOp>().getControlOp();
-  if (!SymbolTable::symbolKnownUseEmpty(combGroupOp.sym_nameAttr(), control))
+  if (!SymbolTable::symbolKnownUseEmpty(combGroupOp.getSymNameAttr(), control))
     return failure();
 
   rewriter.eraseOp(combGroupOp);
@@ -500,8 +501,9 @@ EliminateUnusedCombGroups::matchAndRewrite(calyx::CombGroupOp combGroupOp,
 //===----------------------------------------------------------------------===//
 
 InlineCombGroups::InlineCombGroups(MLIRContext *context, LogicalResult &resRef,
+                                   PatternApplicationState &patternState,
                                    calyx::CalyxLoweringState &cls)
-    : PartialLoweringPattern(context, resRef), cls(cls) {}
+    : PartialLoweringPattern(context, resRef, patternState), cls(cls) {}
 
 LogicalResult
 InlineCombGroups::partiallyLower(calyx::GroupInterface originGroup,
@@ -541,7 +543,7 @@ void InlineCombGroups::recurseInlineCombGroups(
       clonedAssignOp->moveBefore(originGroup.getBody(),
                                  originGroup.getBody()->end());
     }
-    Value src = assignOp.src();
+    Value src = assignOp.getSrc();
 
     // Things which stop recursive inlining (or in other words, what
     // breaks combinational paths).
@@ -581,11 +583,11 @@ RewriteMemoryAccesses::partiallyLower(calyx::AssignOp assignOp,
                                       PatternRewriter &rewriter) const {
   auto *state = cls.getState(assignOp->getParentOfType<calyx::ComponentOp>());
 
-  Value dest = assignOp.dest();
+  Value dest = assignOp.getDest();
   if (!state->isInputPortOfMemory(dest))
     return success();
 
-  Value src = assignOp.src();
+  Value src = assignOp.getSrc();
   unsigned srcBits = src.getType().getIntOrFloatBitWidth();
   unsigned dstBits = dest.getType().getIntOrFloatBitWidth();
   if (srcBits == dstBits)
@@ -634,7 +636,7 @@ BuildBasicBlockRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
       auto reg = createRegister(arg.value().getLoc(), rewriter, getComponent(),
                                 width, name);
       getState().addBlockArgReg(block, reg, arg.index());
-      arg.value().replaceAllUsesWith(reg.out());
+      arg.value().replaceAllUsesWith(reg.getOut());
     }
   });
   return success();
@@ -657,12 +659,13 @@ BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
         createRegister(funcOp.getLoc(), rewriter, getComponent(), width, name);
     getState().addReturnReg(reg, argType.index());
 
-    rewriter.setInsertionPointToStart(getComponent().getWiresOp().getBody());
+    rewriter.setInsertionPointToStart(
+        getComponent().getWiresOp().getBodyBlock());
     rewriter.create<calyx::AssignOp>(
         funcOp->getLoc(),
         calyx::getComponentOutput(
             getComponent(), getState().getFuncOpResultMapping(argType.index())),
-        reg.out());
+        reg.getOut());
   }
   return success();
 }

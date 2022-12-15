@@ -101,9 +101,31 @@ def XMROp : SVOp<"xmr", []> {
   let assemblyFormat = "(`isRooted` $isRooted^)? custom<XMRPath>($path, $terminal) attr-dict `:` qualified(type($result))";
 }
 
+def XMRRefOp : SVOp<"xmr.ref", []> {
+  let summary = "Encode a reference to something with a hw.globalRef.";
+  let description = [{
+    This represents a hierarchical path, but using something which the compiler
+    can understand.  In contrast to the XMROp (which models pure Verilog
+    hierarchical paths which may not map to anything knowable in the circuit),
+    this op uses a `hw.globalRef` to refer to something which exists in the
+    circuit.
+
+    Generally, this operation is always preferred for situations where
+    hierarchical paths cannot be known statically and may change.
+  }];
+  let arguments = (
+    ins NameRefAttr:$ref,
+        DefaultValuedAttr<StrAttr, "{}">:$stringLeaf
+  );
+  let results = (outs InOutType:$result);
+  let assemblyFormat = [{
+    $ref ( $stringLeaf^ )? attr-dict `:` qualified(type($result))
+  }];
+}
+
 def ReadInOutOp
  : SVOp<"read_inout",
-        [NoSideEffect, InOutElementConstraint<"result", "input">]> {
+        [Pure, InOutElementConstraint<"result", "input">]> {
   let summary = "Get the value of from something of inout type (e.g. a wire or"
                 " inout port) as the value itself.";
   let arguments = (ins InOutType:$input);
@@ -129,7 +151,7 @@ class InOutIndexConstraint<string value, string inoutValue>
 
 def ArrayIndexInOutOp
  : SVOp<"array_index_inout",
-        [NoSideEffect, InOutIndexConstraint<"result", "input">]> {
+        [Pure, InOutIndexConstraint<"result", "input">]> {
   let summary = "Index an inout memory to produce an inout element";
   let description = "See SV Spec 11.5.2.";
   let arguments = (ins InOutArrayType:$input, HWIntegerType:$index);
@@ -144,7 +166,7 @@ def ArrayIndexInOutOp
 }
 
 def IndexedPartSelectInOutOp : SVOp<"indexed_part_select_inout",
-                         [NoSideEffect, InferTypeOpInterface]> {
+                         [Pure, InferTypeOpInterface]> {
   let summary = "Address several contiguous bits of an inout type (e.g. a wire"
                 " or inout port). This is an indexed part-select operator."
                 "The base is an integer expression and the width is an "
@@ -156,11 +178,6 @@ def IndexedPartSelectInOutOp : SVOp<"indexed_part_select_inout",
   let arguments = (ins InOutType:$input, HWIntegerType:$base, I32Attr:$width,
                       UnitAttr:$decrement);
   let results = (outs InOutType:$result);
-
-  let builders = [
-    OpBuilder<(ins "Value":$input, "Value":$base, "int32_t":$width,
-                                 CArg<"bool", "false">:$decrement)>
-  ];
 
   let hasVerifier = 1;
 
@@ -184,7 +201,7 @@ def InOutStructType
          "an inout type with struct field", "::circt::hw::InOutType">;
 
 def StructFieldInOutOp : SVOp<"struct_field_inout",
-                              [NoSideEffect, InferTypeOpInterface]> {
+                              [Pure, InferTypeOpInterface]> {
   let summary = "Create an subfield inout memory to produce an inout element.";
   let description = "See SV Spec 7.2.";
 

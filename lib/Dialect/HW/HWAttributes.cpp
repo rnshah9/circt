@@ -21,6 +21,7 @@
 
 using namespace circt;
 using namespace circt::hw;
+using mlir::TypedAttr;
 
 // Internal method used for .mlir file parsing, defined below.
 static Attribute parseParamExprWithOpcode(StringRef opcode, DialectAsmParser &p,
@@ -44,7 +45,7 @@ Attribute HWDialect::parseAttribute(DialectAsmParser &p, Type type) const {
   StringRef attrName;
   Attribute attr;
   auto parseResult = generatedAttributeParser(p, &attrName, type, attr);
-  if (parseResult.hasValue())
+  if (parseResult.has_value())
     return attr;
 
   // Parse "#hw.param.expr.add" as ParamExprAttr.
@@ -70,18 +71,33 @@ void HWDialect::printAttribute(Attribute attr, DialectAsmPrinter &p) const {
 
 static std::string canonicalizeFilename(const Twine &directory,
                                         const Twine &filename) {
+
+  // Convert the filename to a native style path.
+  SmallString<128> nativeFilename;
+  llvm::sys::path::native(filename, nativeFilename);
+
+  // If the filename is an absolute path, ignore the directory.
+  // e.g. `directory/` + `/etc/filename` -> `/etc/filename`.
+  if (llvm::sys::path::is_absolute(nativeFilename))
+    return std::string(nativeFilename);
+
+  // Convert the directory to a native style path.
+  SmallString<128> nativeDirectory;
+  llvm::sys::path::native(directory, nativeDirectory);
+
+  // If the filename component is empty, then ensure that the path ends in a
+  // separator and return it.
+  // e.g. `directory` + `` -> `directory/`.
+  auto separator = llvm::sys::path::get_separator();
+  if (nativeFilename.empty() && !nativeDirectory.endswith(separator)) {
+    nativeDirectory += separator;
+    return std::string(nativeDirectory);
+  }
+
+  // Append the directory and filename together.
+  // e.g. `/tmp/` + `out/filename` -> `/tmp/out/filename`.
   SmallString<128> fullPath;
-
-  // If the filename is an absolute path, we don't need the directory.
-  if (llvm::sys::path::is_absolute(filename))
-    filename.toVector(fullPath);
-  else
-    llvm::sys::path::append(fullPath, directory, filename);
-
-  // If this is a directory target, we need to ensure it ends with a `/`
-  if (filename.isTriviallyEmpty() && !fullPath.endswith("/"))
-    fullPath += "/";
-
+  llvm::sys::path::append(fullPath, nativeDirectory, nativeFilename);
   return std::string(fullPath);
 }
 
@@ -111,7 +127,7 @@ OutputFileAttr OutputFileAttr::getAsDirectory(MLIRContext *context,
 }
 
 bool OutputFileAttr::isDirectory() {
-  return getFilename().getValue().endswith("/");
+  return getFilename().getValue().endswith(llvm::sys::path::get_separator());
 }
 
 /// Option         ::= 'excludeFromFileList' | 'includeReplicatedOp'
@@ -140,11 +156,9 @@ Attribute OutputFileAttr::parse(AsmParser &p, Type type) {
   if (p.parseGreater())
     return Attribute();
 
-  auto *context = p.getContext();
-
-  return OutputFileAttr::get(context, filename,
-                             BoolAttr::get(context, excludeFromFileList),
-                             BoolAttr::get(context, includeReplicatedOps));
+  return OutputFileAttr::getFromFilename(p.getContext(), filename.getValue(),
+                                         excludeFromFileList,
+                                         includeReplicatedOps);
 }
 
 void OutputFileAttr::print(AsmPrinter &p) const {
@@ -224,27 +238,133 @@ void InnerRefAttr::print(AsmPrinter &p) const {
   p << ">";
 }
 
-Attribute
-InnerRefAttr::replaceImmediateSubElements(ArrayRef<Attribute> replAttrs,
-                                          ArrayRef<Type> replTypes) const {
-  assert(replAttrs.size() == 2);
-  return get(getContext(), replAttrs[0].cast<FlatSymbolRefAttr>(),
-             replAttrs[1].cast<StringAttr>());
+//===----------------------------------------------------------------------===//
+// InnerSymAttr
+//===----------------------------------------------------------------------===//
+
+Attribute InnerSymPropertiesAttr::parse(AsmParser &parser, Type type) {
+  StringAttr name;
+  NamedAttrList dummyList;
+  int64_t fieldId = 0;
+  StringRef visibility;
+  if (parser.parseLess() || parser.parseSymbolName(name, "name", dummyList) ||
+      parser.parseComma() || parser.parseInteger(fieldId) ||
+      parser.parseComma() ||
+      parser.parseOptionalKeyword(&visibility,
+                                  {"public", "private", "nested"}) ||
+      parser.parseGreater())
+    return Attribute();
+  StringAttr visibilityAttr = parser.getBuilder().getStringAttr(visibility);
+
+  return InnerSymPropertiesAttr::get(parser.getContext(), name, fieldId,
+                                     visibilityAttr);
+}
+
+void InnerSymPropertiesAttr::print(AsmPrinter &odsPrinter) const {
+  odsPrinter << "<@" << getName().getValue() << "," << getFieldID() << ","
+             << getSymVisibility().getValue() << ">";
+}
+
+StringAttr InnerSymAttr::getSymIfExists(unsigned fieldId) const {
+  const auto *it =
+      llvm::find_if(getImpl()->props, [&](const InnerSymPropertiesAttr &p) {
+        return p.getFieldID() == fieldId;
+      });
+  if (it != getProps().end())
+    return it->getName();
+  return {};
+}
+
+LogicalResult InnerSymAttr::walkSymbols(
+    llvm::function_ref<LogicalResult(StringAttr)> callback) const {
+  for (auto p : getImpl()->props)
+    if (callback(p.getName()).failed())
+      return failure();
+  return success();
+}
+
+Attribute InnerSymAttr::parse(AsmParser &parser, Type type) {
+  StringAttr sym;
+  NamedAttrList dummyList;
+  SmallVector<InnerSymPropertiesAttr, 4> names;
+  if (!parser.parseOptionalSymbolName(sym, "dummy", dummyList))
+    names.push_back(InnerSymPropertiesAttr::get(sym));
+  else if (parser.parseCommaSeparatedList(
+               OpAsmParser::Delimiter::Square, [&]() -> ParseResult {
+                 InnerSymPropertiesAttr prop;
+                 if (parser.parseCustomAttributeWithFallback(
+                         prop, mlir::Type{}, "dummy", dummyList))
+                   return failure();
+
+                 names.push_back(prop);
+
+                 return success();
+               }))
+    return Attribute();
+
+  std::sort(names.begin(), names.end(),
+            [&](InnerSymPropertiesAttr a, InnerSymPropertiesAttr b) {
+              return a.getFieldID() < b.getFieldID();
+            });
+
+  return InnerSymAttr::get(parser.getContext(), names);
+}
+
+void InnerSymAttr::print(AsmPrinter &odsPrinter) const {
+
+  auto props = getProps();
+  if (props.size() == 1 &&
+      props[0].getSymVisibility().getValue().equals("public") &&
+      props[0].getFieldID() == 0) {
+    odsPrinter << "@" << props[0].getName().getValue();
+    return;
+  }
+  auto names = props.vec();
+
+  std::sort(names.begin(), names.end(),
+            [&](InnerSymPropertiesAttr a, InnerSymPropertiesAttr b) {
+              return a.getFieldID() < b.getFieldID();
+            });
+  odsPrinter << "[";
+  llvm::interleaveComma(names, odsPrinter, [&](InnerSymPropertiesAttr attr) {
+    attr.print(odsPrinter);
+  });
+  odsPrinter << "]";
 }
 
 //===----------------------------------------------------------------------===//
 // ParamDeclAttr
 //===----------------------------------------------------------------------===//
 
-Attribute ParamDeclAttr::parse(AsmParser &p, Type type) {
-  llvm::errs() << "Should never parse raw\n";
-  abort();
+Attribute ParamDeclAttr::parse(AsmParser &p, Type trailing) {
+  std::string name;
+  Type type;
+  Attribute value;
+  // < "FOO" : i32 > : i32
+  // < "FOO" : i32 = 0 > : i32
+  // < "FOO" : none >
+  if (p.parseLess() || p.parseString(&name) || p.parseColonType(type))
+    return Attribute();
+
+  if (succeeded(p.parseOptionalEqual())) {
+    if (p.parseAttribute(value, type))
+      return Attribute();
+  }
+
+  if (p.parseGreater())
+    return Attribute();
+
+  if (value)
+    return ParamDeclAttr::get(name, value);
+  return ParamDeclAttr::get(name, type);
 }
 
 void ParamDeclAttr::print(AsmPrinter &p) const {
   p << "<" << getName() << ": " << getType();
-  if (getValue())
-    p << " = " << getValue();
+  if (getValue()) {
+    p << " = ";
+    p.printAttributeWithoutType(getValue());
+  }
   p << ">";
 }
 
@@ -254,7 +374,8 @@ void ParamDeclAttr::print(AsmPrinter &p) const {
 
 Attribute ParamDeclRefAttr::parse(AsmParser &p, Type type) {
   StringAttr name;
-  if (p.parseLess() || p.parseAttribute(name) || p.parseGreater())
+  if (p.parseLess() || p.parseAttribute(name) || p.parseGreater() ||
+      (!type && (p.parseColon() || p.parseType(type))))
     return Attribute();
 
   return ParamDeclRefAttr::get(name, type);
@@ -270,7 +391,8 @@ void ParamDeclRefAttr::print(AsmPrinter &p) const {
 
 Attribute ParamVerbatimAttr::parse(AsmParser &p, Type type) {
   StringAttr text;
-  if (p.parseLess() || p.parseAttribute(text) || p.parseGreater())
+  if (p.parseLess() || p.parseAttribute(text) || p.parseGreater() ||
+      (!type && (p.parseColon() || p.parseType(type))))
     return Attribute();
 
   return ParamVerbatimAttr::get(p.getContext(), text, type);
@@ -286,8 +408,8 @@ void ParamVerbatimAttr::print(AsmPrinter &p) const {
 
 /// Given a binary function, if the two operands are known constant integers,
 /// use the specified fold function to compute the result.
-static Attribute foldBinaryOp(
-    ArrayRef<Attribute> operands,
+static TypedAttr foldBinaryOp(
+    ArrayRef<TypedAttr> operands,
     llvm::function_ref<APInt(const APInt &, const APInt &)> calculate) {
   assert(operands.size() == 2 && "binary operator always has two operands");
   if (auto lhs = operands[0].dyn_cast<IntegerAttr>())
@@ -299,8 +421,8 @@ static Attribute foldBinaryOp(
 
 /// Given a unary function, if the operand is a known constant integer,
 /// use the specified fold function to compute the result.
-static Attribute
-foldUnaryOp(ArrayRef<Attribute> operands,
+static TypedAttr
+foldUnaryOp(ArrayRef<TypedAttr> operands,
             llvm::function_ref<APInt(const APInt &)> calculate) {
   assert(operands.size() == 1 && "unary operator always has one operand");
   if (auto intAttr = operands[0].dyn_cast<IntegerAttr>())
@@ -368,7 +490,7 @@ static bool paramExprOperandSortPredicate(Attribute lhs, Attribute rhs) {
            stringifyPEO(rhsExpr.getOpcode());
 
   // If they are the same opcode, then sort by arity: more complex to the left.
-  ArrayRef<Attribute> lhsOperands = lhsExpr.getOperands(),
+  ArrayRef<TypedAttr> lhsOperands = lhsExpr.getOperands(),
                       rhsOperands = rhsExpr.getOperands();
   if (lhsOperands.size() != rhsOperands.size())
     return lhsOperands.size() > rhsOperands.size();
@@ -389,8 +511,8 @@ static bool paramExprOperandSortPredicate(Attribute lhs, Attribute rhs) {
 /// Given a fully associative variadic integer operation, constant fold any
 /// constant operands and move them to the right.  If the whole expression is
 /// constant, then return that, otherwise update the operands list.
-static Attribute simplifyAssocOp(
-    PEO opcode, SmallVector<Attribute, 4> &operands,
+static TypedAttr simplifyAssocOp(
+    PEO opcode, SmallVector<TypedAttr, 4> &operands,
     llvm::function_ref<APInt(const APInt &, const APInt &)> calculateFn,
     llvm::function_ref<bool(const APInt &)> identityConstantFn,
     llvm::function_ref<bool(const APInt &)> destructiveConstantFn = {}) {
@@ -447,20 +569,20 @@ static Attribute simplifyAssocOp(
 /// `(a*b*42)` then split it into the non-constant and the constant portions
 /// (e.g. `a*b` and `42`).  Otherwise return the operand as the first value and
 /// null as the second (standin for "multiplication by 1").
-static std::pair<Attribute, Attribute> decomposeAddend(Attribute operand) {
+static std::pair<TypedAttr, TypedAttr> decomposeAddend(TypedAttr operand) {
   if (auto mul = dyn_castPE(PEO::Mul, operand))
     if (auto cst = mul.getOperands().back().dyn_cast<IntegerAttr>()) {
       auto nonCst = ParamExprAttr::get(PEO::Mul, mul.getOperands().drop_back());
       return {nonCst, cst};
     }
-  return {operand, Attribute()};
+  return {operand, TypedAttr()};
 }
 
-static Attribute getOneOfType(Type type) {
+static TypedAttr getOneOfType(Type type) {
   return IntegerAttr::get(type, APInt(type.getIntOrFloatBitWidth(), 1));
 }
 
-static Attribute simplifyAdd(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyAdd(SmallVector<TypedAttr, 4> &operands) {
   if (auto result = simplifyAssocOp(
           PEO::Add, operands, [](auto a, auto b) { return a + b; },
           /*identityCst*/ [](auto cst) { return cst.isZero(); }))
@@ -468,8 +590,8 @@ static Attribute simplifyAdd(SmallVector<Attribute, 4> &operands) {
 
   // Canonicalize the add by splitting all addends into their variable and
   // constant factors.
-  SmallVector<std::pair<Attribute, Attribute>> decomposedOperands;
-  llvm::SmallDenseSet<Attribute> nonConstantParts;
+  SmallVector<std::pair<TypedAttr, TypedAttr>> decomposedOperands;
+  llvm::SmallDenseSet<TypedAttr> nonConstantParts;
   for (auto &op : operands) {
     decomposedOperands.push_back(decomposeAddend(op));
 
@@ -479,7 +601,7 @@ static Attribute simplifyAdd(SmallVector<Attribute, 4> &operands) {
     // `(a*3 + b)`.
     if (!nonConstantParts.insert(decomposedOperands.back().first).second) {
       // The thing we multiply will be the common expression.
-      Attribute mulOperand = decomposedOperands.back().first;
+      TypedAttr mulOperand = decomposedOperands.back().first;
 
       // Find the index of the first occurrence.
       size_t i = 0;
@@ -509,7 +631,7 @@ static Attribute simplifyAdd(SmallVector<Attribute, 4> &operands) {
   return {};
 }
 
-static Attribute simplifyMul(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyMul(SmallVector<TypedAttr, 4> &operands) {
   if (auto result = simplifyAssocOp(
           PEO::Mul, operands, [](auto a, auto b) { return a * b; },
           /*identityCst*/ [](auto cst) { return cst.isOne(); },
@@ -522,11 +644,11 @@ static Attribute simplifyMul(SmallVector<Attribute, 4> &operands) {
     if (auto subexpr = dyn_castPE(PEO::Add, operands[i])) {
       // Pull the `c*d` operands out - it is whatever operands remain after
       // removing the `(a+b)` term.
-      SmallVector<Attribute> mulOperands(operands.begin(), operands.end());
+      SmallVector<TypedAttr> mulOperands(operands.begin(), operands.end());
       mulOperands.erase(mulOperands.begin() + i);
 
       // Build each add operand.
-      SmallVector<Attribute> addOperands;
+      SmallVector<TypedAttr> addOperands;
       for (auto addOperand : subexpr.getOperands()) {
         mulOperands.push_back(addOperand);
         addOperands.push_back(ParamExprAttr::get(PEO::Mul, mulOperands));
@@ -539,27 +661,27 @@ static Attribute simplifyMul(SmallVector<Attribute, 4> &operands) {
 
   return {};
 }
-static Attribute simplifyAnd(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyAnd(SmallVector<TypedAttr, 4> &operands) {
   return simplifyAssocOp(
       PEO::And, operands, [](auto a, auto b) { return a & b; },
       /*identityCst*/ [](auto cst) { return cst.isAllOnes(); },
       /*destructiveCst*/ [](auto cst) { return cst.isZero(); });
 }
 
-static Attribute simplifyOr(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyOr(SmallVector<TypedAttr, 4> &operands) {
   return simplifyAssocOp(
       PEO::Or, operands, [](auto a, auto b) { return a | b; },
       /*identityCst*/ [](auto cst) { return cst.isZero(); },
       /*destructiveCst*/ [](auto cst) { return cst.isAllOnes(); });
 }
 
-static Attribute simplifyXor(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyXor(SmallVector<TypedAttr, 4> &operands) {
   return simplifyAssocOp(
       PEO::Xor, operands, [](auto a, auto b) { return a ^ b; },
       /*identityCst*/ [](auto cst) { return cst.isZero(); });
 }
 
-static Attribute simplifyShl(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyShl(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
 
   if (auto rhs = operands[1].dyn_cast<IntegerAttr>()) {
@@ -578,7 +700,7 @@ static Attribute simplifyShl(SmallVector<Attribute, 4> &operands) {
   return {};
 }
 
-static Attribute simplifyShrU(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyShrU(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x >> 0`.
   if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
@@ -588,7 +710,7 @@ static Attribute simplifyShrU(SmallVector<Attribute, 4> &operands) {
   return foldBinaryOp(operands, [](auto a, auto b) { return a.lshr(b); });
 }
 
-static Attribute simplifyShrS(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyShrS(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x >> 0`.
   if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
@@ -598,7 +720,7 @@ static Attribute simplifyShrS(SmallVector<Attribute, 4> &operands) {
   return foldBinaryOp(operands, [](auto a, auto b) { return a.ashr(b); });
 }
 
-static Attribute simplifyDivU(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyDivU(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x/1`.
   if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
@@ -608,7 +730,7 @@ static Attribute simplifyDivU(SmallVector<Attribute, 4> &operands) {
   return foldBinaryOp(operands, [](auto a, auto b) { return a.udiv(b); });
 }
 
-static Attribute simplifyDivS(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyDivS(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x/1`.
   if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
@@ -618,7 +740,7 @@ static Attribute simplifyDivS(SmallVector<Attribute, 4> &operands) {
   return foldBinaryOp(operands, [](auto a, auto b) { return a.sdiv(b); });
 }
 
-static Attribute simplifyModU(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyModU(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x%1`.
   if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
@@ -628,7 +750,7 @@ static Attribute simplifyModU(SmallVector<Attribute, 4> &operands) {
   return foldBinaryOp(operands, [](auto a, auto b) { return a.urem(b); });
 }
 
-static Attribute simplifyModS(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyModS(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   // Implement support for identities like `x%1`.
   if (auto rhs = operands[1].dyn_cast<IntegerAttr>())
@@ -638,7 +760,7 @@ static Attribute simplifyModS(SmallVector<Attribute, 4> &operands) {
   return foldBinaryOp(operands, [](auto a, auto b) { return a.srem(b); });
 }
 
-static Attribute simplifyCLog2(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyCLog2(SmallVector<TypedAttr, 4> &operands) {
   assert(isHWIntegerType(operands[0].getType()));
   return foldUnaryOp(operands, [](auto a) {
     // Following the Verilog spec, clog2(0) is 0
@@ -646,9 +768,9 @@ static Attribute simplifyCLog2(SmallVector<Attribute, 4> &operands) {
   });
 }
 
-static Attribute simplifyStrConcat(SmallVector<Attribute, 4> &operands) {
+static TypedAttr simplifyStrConcat(SmallVector<TypedAttr, 4> &operands) {
   // Combine all adjacent strings.
-  SmallVector<Attribute> newOperands;
+  SmallVector<TypedAttr> newOperands;
   SmallVector<StringAttr> stringsToCombine;
   auto combineAndPush = [&]() {
     if (stringsToCombine.empty())
@@ -662,7 +784,7 @@ static Attribute simplifyStrConcat(SmallVector<Attribute, 4> &operands) {
     stringsToCombine.clear();
   };
 
-  for (Attribute op : operands) {
+  for (TypedAttr op : operands) {
     if (auto strOp = op.dyn_cast<StringAttr>()) {
       // Queue up adjacent strings.
       stringsToCombine.push_back(strOp);
@@ -683,17 +805,17 @@ static Attribute simplifyStrConcat(SmallVector<Attribute, 4> &operands) {
 
 /// Build a parameter expression.  This automatically canonicalizes and
 /// folds, so it may not necessarily return a ParamExprAttr.
-Attribute ParamExprAttr::get(PEO opcode, ArrayRef<Attribute> operandsIn) {
+TypedAttr ParamExprAttr::get(PEO opcode, ArrayRef<TypedAttr> operandsIn) {
   assert(!operandsIn.empty() && "Cannot have expr with no operands");
   // All operands must have the same type, which is the type of the result.
   auto type = operandsIn.front().getType();
   assert(llvm::all_of(operandsIn.drop_front(),
                       [&](auto op) { return op.getType() == type; }));
 
-  SmallVector<Attribute, 4> operands(operandsIn.begin(), operandsIn.end());
+  SmallVector<TypedAttr, 4> operands(operandsIn.begin(), operandsIn.end());
 
   // Verify and canonicalize parameter expressions.
-  Attribute result;
+  TypedAttr result;
   switch (opcode) {
   case PEO::Add:
     result = simplifyAdd(operands);
@@ -757,7 +879,7 @@ Attribute ParamExprAttr::parse(AsmParser &p, Type type) {
 /// "#hw.param.expr.mul" form of the attribute.
 static Attribute parseParamExprWithOpcode(StringRef opcodeStr,
                                           DialectAsmParser &p, Type type) {
-  SmallVector<Attribute> operands;
+  SmallVector<TypedAttr> operands;
   if (p.parseCommaSeparatedList(
           mlir::AsmParser::Delimiter::LessGreater, [&]() -> ParseResult {
             operands.push_back({});
@@ -802,7 +924,7 @@ replaceDeclRefInExpr(Location loc,
   }
   if (auto paramExprAttr = paramAttr.dyn_cast<hw::ParamExprAttr>()) {
     // Recurse into all operands of the expression.
-    llvm::SmallVector<Attribute, 4> replacedOperands;
+    llvm::SmallVector<TypedAttr, 4> replacedOperands;
     for (auto operand : paramExprAttr.getOperands()) {
       auto res = replaceDeclRefInExpr(loc, parameters, operand);
       if (failed(res))

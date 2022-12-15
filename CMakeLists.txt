@@ -84,9 +84,9 @@ endif ()
   # Handle unittests when building out-of-tree against an installed version of
   # LLVM/MLIR (not a build tree). Adapted from `llvm/flang/CMakeLists.txt`.
   set(CIRCT_GTEST_AVAILABLE 0)
-  set(UNITTEST_DIR ${LLVM_BUILD_MAIN_SRC_DIR}/utils/unittest)
+  set(UNITTEST_DIR ${LLVM_THIRD_PARTY_DIR}/unittest)
   if (NOT EXISTS ${UNITTEST_DIR}/googletest/include/gtest/gtest.h)
-    set(UNITTEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm/llvm/utils/unittest)
+    set(UNITTEST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm/third-party/unittest)
   endif()
   if (EXISTS ${UNITTEST_DIR}/googletest/include/gtest/gtest.h)
     if (NOT TARGET llvm_gtest)
@@ -94,7 +94,6 @@ endif ()
       add_llvm_library(llvm_gtest
         ${UNITTEST_DIR}/googletest/src/gtest-all.cc
         ${UNITTEST_DIR}/googlemock/src/gmock-all.cc
-        LINK_LIBS pthread
         LINK_COMPONENTS Support # llvm::raw_ostream
         BUILDTREE_ONLY
       )
@@ -106,12 +105,16 @@ endif ()
         "${UNITTEST_DIR}/googletest"
         "${UNITTEST_DIR}/googlemock"
       )
+      target_link_libraries(llvm_gtest PUBLIC Threads::Threads)
       add_llvm_library(llvm_gtest_main
         ${UNITTEST_DIR}/UnitTestMain/TestMain.cpp
         LINK_LIBS llvm_gtest
         LINK_COMPONENTS Support # llvm::cl
         BUILDTREE_ONLY
       )
+      if (CXX_SUPPORTS_SUGGEST_OVERRIDE_FLAG)
+        target_compile_options(llvm_gtest_main INTERFACE "-Wno-suggest-override")
+      endif()
     endif()
     set(CIRCT_GTEST_AVAILABLE 1)
   else()
@@ -141,6 +144,8 @@ else()
   include_directories(SYSTEM ${MLIR_TABLEGEN_OUTPUT_DIR})
 
   set(BACKEND_PACKAGE_STRING "${PACKAGE_STRING}")
+
+  set(CIRCT_GTEST_AVAILABLE 1)
 endif()
 
 # Define the default arguments to use with 'lit', and an option for the user to
@@ -256,6 +261,50 @@ else()
       set(VIVADO_PATH "")
       message(STATUS "Did not find vivado.")
     endif()
+  endif()
+endif()
+
+#-------------------------------------------------------------------------------
+# Clang-Tidy Configuration (for integration tests to check SystemC linting)
+#-------------------------------------------------------------------------------
+
+# If clang-tidy hasn't been explicitly disabled, find it.
+option(CLANG_TIDY_DISABLE "Disable the clang-tidy lint tests.")
+if (CLANG_TIDY_DISABLE)
+  message(STATUS "Disabling clang-tidy lint tests.")
+else()
+  if (EXISTS ${CLANG_TIDY_PATH})
+    get_filename_component(CLANG_TIDY_PATH ${CLANG_TIDY_PATH} DIRECTORY)
+    message(STATUS "Setting clang-tidy path to ${CLANG_TIDY_PATH}.")
+  else()
+    # Search for the `clang-tidy` command.
+    find_program(CLANG_TIDY_PATH "clang-tidy")
+    if(EXISTS ${CLANG_TIDY_PATH})
+      # Then strip the filename.
+      get_filename_component(CLANG_TIDY_PATH ${CLANG_TIDY_PATH} DIRECTORY)
+      message(STATUS "Found clang-tidy at ${CLANG_TIDY_PATH}.")
+    else()
+      set(CLANG_TIDY_PATH "")
+      message(STATUS "Did NOT find clang-tidy.")
+    endif()
+  endif()
+endif()
+
+#-------------------------------------------------------------------------------
+# SystemC Configuration
+#-------------------------------------------------------------------------------
+
+# If SystemC hasn't been explicitly disabled, find it.
+option(SYSTEMC_DISABLE "Disable the systemc tests.")
+if (SYSTEMC_DISABLE)
+  message(STATUS "Disabling systemc tests.")
+else()
+  find_file(HAVE_SYSTEMC systemc PATH /usr/include /usr/local/include ${SYSTEMC_PATH})
+  if(HAVE_SYSTEMC)
+    message(STATUS "Found systemc headers.")
+  else()
+    set(HAVE_SYSTEMC "")
+    message(STATUS "Did NOT find systemc headers.")
   endif()
 endif()
 
@@ -378,6 +427,7 @@ else()
   endif()
 
   if(CapnProto_FOUND)
+    message(STATUS "Found Cap'nProto at ${CapnProto_DIR}.")
     set(CMAKE_INSTALL_RPATH ${capnp_LIBDIR})
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
   endif()
@@ -437,6 +487,12 @@ if(CIRCT_BINDINGS_PYTHON_ENABLED)
   mlir_configure_python_dev_packages()
 else()
   message(STATUS "CIRCT Python bindings are disabled.")
+  # Lookup python either way as some integration tests use python without the
+  # bindings
+  find_package(Python3)
+  if(Python3_FOUND)
+    message(STATUS "Found python at ${Python3_EXECUTABLE}")
+  endif()
 endif()
 
 #-------------------------------------------------------------------------------

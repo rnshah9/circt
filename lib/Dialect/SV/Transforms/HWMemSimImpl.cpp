@@ -47,6 +47,10 @@ namespace {
 
 class HWMemSimImpl {
   bool ignoreReadEnableMem;
+  bool stripMuxPragmas;
+  bool disableMemRandomization;
+  bool disableRegRandomization;
+  bool addVivadoRAMAddressConflictSynthesisBugWorkaround;
 
   SmallVector<sv::RegOp> registers;
 
@@ -56,8 +60,15 @@ class HWMemSimImpl {
   sv::AlwaysOp lastPipelineAlwaysOp;
 
 public:
-  HWMemSimImpl(bool ignoreReadEnableMem)
-      : ignoreReadEnableMem(ignoreReadEnableMem) {}
+  HWMemSimImpl(bool ignoreReadEnableMem, bool stripMuxPragmas,
+               bool disableMemRandomization, bool disableRegRandomization,
+               bool addVivadoRAMAddressConflictSynthesisBugWorkaround)
+      : ignoreReadEnableMem(ignoreReadEnableMem),
+        stripMuxPragmas(stripMuxPragmas),
+        disableMemRandomization(disableMemRandomization),
+        disableRegRandomization(disableRegRandomization),
+        addVivadoRAMAddressConflictSynthesisBugWorkaround(
+            addVivadoRAMAddressConflictSynthesisBugWorkaround) {}
 
   void generateMemory(HWModuleOp op, FirMemory mem);
 };
@@ -67,6 +78,11 @@ struct HWMemSimImplPass : public sv::HWMemSimImplBase<HWMemSimImplPass> {
 
   using sv::HWMemSimImplBase<HWMemSimImplPass>::ignoreReadEnableMem;
   using sv::HWMemSimImplBase<HWMemSimImplPass>::replSeqMem;
+  using sv::HWMemSimImplBase<HWMemSimImplPass>::stripMuxPragmas;
+  using sv::HWMemSimImplBase<HWMemSimImplPass>::disableMemRandomization;
+  using sv::HWMemSimImplBase<HWMemSimImplPass>::disableRegRandomization;
+  using sv::HWMemSimImplBase<
+      HWMemSimImplPass>::addVivadoRAMAddressConflictSynthesisBugWorkaround;
 };
 
 } // end anonymous namespace
@@ -107,6 +123,40 @@ static bool valueDefinedBeforeOp(Value value, Operation *op) {
     op = op->getParentOp();
   return valueBlock == op->getBlock() &&
          (!valueOp || valueOp->isBeforeInBlock(op));
+}
+
+//
+// Construct memory read annotated with mux pragmas in the following
+// form:
+// ```
+//   wire GEN;
+//   /* synopsys infer_mux_override */
+//   assign GEN = memory[addr] /* cadence map_to_mux */;
+// ```
+// If `stripMuxPragmas` is enabled, just return the read value without
+// annotations.
+static Value getMemoryRead(ImplicitLocOpBuilder &b, Value memory, Value addr,
+                           bool stripMuxPragmas) {
+  auto slot =
+      b.create<sv::ReadInOutOp>(b.create<sv::ArrayIndexInOutOp>(memory, addr));
+  // If we don't want to add mux pragmas, just return the read value.
+  if (stripMuxPragmas || memory.getType()
+                                 .cast<hw::InOutType>()
+                                 .getElementType()
+                                 .cast<hw::UnpackedArrayType>()
+                                 .getSize() <= 1)
+    return slot;
+  circt::sv::setSVAttributes(
+      slot, sv::SVAttributesAttr::get(b.getContext(), {"cadence map_to_mux"},
+                                      /*emitAsComments=*/true));
+  auto valWire = b.create<sv::WireOp>(slot.getType());
+  auto assignOp = b.create<sv::AssignOp>(valWire, slot);
+  sv::setSVAttributes(assignOp,
+                      sv::SVAttributesAttr::get(b.getContext(),
+                                                {"synopsys infer_mux_override"},
+                                                /*emitAsComments=*/true));
+
+  return b.create<sv::ReadInOutOp>(valWire);
 }
 
 Value HWMemSimImpl::addPipelineStages(ImplicitLocOpBuilder &b,
@@ -173,8 +223,19 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
   auto dataType = b.getIntegerType(mem.dataWidth);
 
   // Create registers for the memory.
-  Value reg = b.create<sv::RegOp>(UnpackedArrayType::get(dataType, mem.depth),
-                                  b.getStringAttr("Memory"));
+  sv::RegOp reg = b.create<sv::RegOp>(
+      UnpackedArrayType::get(dataType, mem.depth), b.getStringAttr("Memory"));
+
+  // If the read latency is zero, we regard the memory as write-first.
+  // We add a SV attribute to specify a ram style to use LUTs for Vivado to
+  // avoid a bug that miscompiles the write-first memory. See "RAM address
+  // conflict and Vivado synthesis bug" issue in the vivado forum for the more
+  // detail.
+  if (addVivadoRAMAddressConflictSynthesisBugWorkaround && mem.readLatency == 0)
+    circt::sv::setSVAttributes(
+        reg,
+        sv::SVAttributesAttr::get(
+            b.getContext(), {std::make_pair("ram_style", R"("distributed")")}));
 
   SmallVector<Value, 4> outputs;
 
@@ -198,11 +259,10 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
     }
 
     // Read Logic
-    Value rdata =
-        b.create<sv::ReadInOutOp>(b.create<sv::ArrayIndexInOutOp>(reg, addr));
+    Value rdata = getMemoryRead(b, reg, addr, stripMuxPragmas);
     if (!ignoreReadEnableMem) {
       Value x = b.create<sv::ConstantXOp>(rdata.getType());
-      rdata = b.create<comb::MuxOp>(en, rdata, x);
+      rdata = b.create<comb::MuxOp>(en, rdata, x, false);
     }
     outputs.push_back(rdata);
   }
@@ -268,19 +328,23 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
 
     // Read logic.
     Value rcond = b.createOrFold<comb::AndOp>(
-        read_en, b.createOrFold<comb::ICmpOp>(
-                     comb::ICmpPredicate::eq, read_wmode,
-                     b.createOrFold<ConstantOp>(read_wmode.getType(), 0)));
-    Value slotReg = b.create<sv::ArrayIndexInOutOp>(reg, read_addr);
-    Value slot = b.create<sv::ReadInOutOp>(slotReg);
-    Value x = b.create<sv::ConstantXOp>(slot.getType());
-    b.create<sv::AssignOp>(rWire, b.create<comb::MuxOp>(rcond, slot, x));
+        read_en,
+        b.createOrFold<comb::ICmpOp>(
+            comb::ICmpPredicate::eq, read_wmode,
+            b.createOrFold<ConstantOp>(read_wmode.getType(), 0), false),
+        false);
+
+    auto val = getMemoryRead(b, reg, read_addr, stripMuxPragmas);
+    Value x = b.create<sv::ConstantXOp>(val.getType());
+    b.create<sv::AssignOp>(rWire, b.create<comb::MuxOp>(rcond, val, x, false));
 
     // Write logic gaurded by the corresponding mask bit.
     for (auto wmask : llvm::enumerate(maskValues)) {
       b.create<sv::AlwaysOp>(sv::EventControl::AtPosEdge, clock, [&]() {
         auto wcond = b.createOrFold<comb::AndOp>(
-            write_en, b.createOrFold<comb::AndOp>(wmask.value(), write_wmode));
+            write_en,
+            b.createOrFold<comb::AndOp>(wmask.value(), write_wmode, false),
+            false);
         b.create<sv::IfOp>(wcond, [&]() {
           Value slotReg = b.create<sv::ArrayIndexInOutOp>(reg, write_addr);
           b.create<sv::PAssignOp>(
@@ -334,7 +398,7 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
       // data into it.
       for (auto wmask : llvm::enumerate(maskValues)) {
         // Guard by corresponding mask bit.
-        auto wcond = b.createOrFold<comb::AndOp>(en, wmask.value());
+        auto wcond = b.createOrFold<comb::AndOp>(en, wmask.value(), false);
         b.create<sv::IfOp>(wcond, [&]() {
           auto slot = b.create<sv::ArrayIndexInOutOp>(reg, addr);
           b.create<sv::PAssignOp>(
@@ -375,8 +439,14 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
     }
   }
 
+  auto *outputOp = op.getBodyBlock()->getTerminator();
+  outputOp->setOperands(outputs);
+
   // Add logic to initialize the memory and any internal registers to random
   // values.
+  if (disableMemRandomization && disableRegRandomization)
+    return;
+
   constexpr unsigned randomWidth = 32;
   sv::RegOp randomMemReg;
   b.create<sv::IfDefOp>("SYNTHESIS", std::function<void()>(), [&]() {
@@ -384,131 +454,138 @@ void HWMemSimImpl::generateMemory(HWModuleOp op, FirMemory mem) {
     StringRef initvar;
 
     // Declare variables for use by memory randomization logic.
-    b.create<sv::IfDefOp>("RANDOMIZE_MEM_INIT", [&]() {
-      initvar = moduleNamespace.newName("initvar");
-      b.create<sv::VerbatimOp>("integer " + Twine(initvar) + ";\n");
-      randomMemReg = b.create<sv::RegOp>(
-          b.getIntegerType(llvm::divideCeil(mem.dataWidth, randomWidth) *
-                           randomWidth),
-          b.getStringAttr("_RANDOM_MEM"),
-          b.getStringAttr(moduleNamespace.newName("_RANDOM_MEM")));
-    });
+    if (!disableMemRandomization) {
+      b.create<sv::IfDefOp>("RANDOMIZE_MEM_INIT", [&]() {
+        initvar = moduleNamespace.newName("initvar");
+        b.create<sv::VerbatimOp>("integer " + Twine(initvar) + ";\n");
+        randomMemReg = b.create<sv::RegOp>(
+            b.getIntegerType(llvm::divideCeil(mem.dataWidth, randomWidth) *
+                             randomWidth),
+            b.getStringAttr("_RANDOM_MEM"),
+            b.getStringAttr(moduleNamespace.newName("_RANDOM_MEM")));
+      });
+    }
 
     // Declare variables for use by register randomization logic.
     SmallVector<sv::RegOp> randRegs;
-    b.create<sv::IfDefOp>("RANDOMIZE_REG_INIT", [&]() {
-      signed totalWidth = 0;
-      for (sv::RegOp &reg : registers)
-        totalWidth += reg.getElementType().getIntOrFloatBitWidth();
-      while (totalWidth > 0) {
-        auto name = b.getStringAttr(moduleNamespace.newName(Twine("_RANDOM")));
-        randRegs.push_back(
-            b.create<sv::RegOp>(b.getIntegerType(randomWidth), name, name));
-        totalWidth -= randomWidth;
-      }
-    });
+    if (!disableRegRandomization) {
+      b.create<sv::IfDefOp>("RANDOMIZE_REG_INIT", [&]() {
+        signed totalWidth = 0;
+        for (sv::RegOp &reg : registers)
+          totalWidth += reg.getElementType().getIntOrFloatBitWidth();
+        while (totalWidth > 0) {
+          auto name =
+              b.getStringAttr(moduleNamespace.newName(Twine("_RANDOM")));
+          randRegs.push_back(
+              b.create<sv::RegOp>(b.getIntegerType(randomWidth), name, name));
+          totalWidth -= randomWidth;
+        }
+      });
+    }
 
     b.create<sv::InitialOp>([&]() {
       b.create<sv::VerbatimOp>("`INIT_RANDOM_PROLOG_");
 
       // Memory randomization logic.  The entire memory is randomized.
-      b.create<sv::IfDefProceduralOp>("RANDOMIZE_MEM_INIT", [&]() {
-        std::string verbatimForLoop;
-        llvm::raw_string_ostream s(verbatimForLoop);
-        s << "for (" << initvar << " = 0; " << initvar << " < " << mem.depth
-          << "; " << initvar << " = " << initvar << " + 1) begin\n"
-          << "  {{0}} = ";
-        auto repetitionCount = llvm::divideCeil(mem.dataWidth, randomWidth);
-        if (repetitionCount > 1)
-          s << "{";
-        for (size_t i = 0; i != repetitionCount; ++i) {
-          if (i > 0)
-            s << ", ";
-          s << "{`RANDOM}";
-        }
-        if (repetitionCount > 1)
-          s << "}";
-        s << ";\n";
-        s << "  Memory[" << initvar << "] = "
-          << "{{0}}[" << mem.dataWidth - 1 << ":" << 0 << "];\n"
-          << "end";
-        b.create<sv::VerbatimOp>(
-            verbatimForLoop, ValueRange{},
-            b.getArrayAttr({hw::InnerRefAttr::get(
-                op.getNameAttr(), randomMemReg.getInnerSymAttr())}));
-      });
+      if (!disableMemRandomization) {
+        b.create<sv::IfDefProceduralOp>("RANDOMIZE_MEM_INIT", [&]() {
+          std::string verbatimForLoop;
+          llvm::raw_string_ostream s(verbatimForLoop);
+          s << "for (" << initvar << " = 0; " << initvar << " < " << mem.depth
+            << "; " << initvar << " = " << initvar << " + 1) begin\n"
+            << "  {{0}} = ";
+          auto repetitionCount = llvm::divideCeil(mem.dataWidth, randomWidth);
+          if (repetitionCount > 1)
+            s << "{";
+          for (size_t i = 0; i != repetitionCount; ++i) {
+            if (i > 0)
+              s << ", ";
+            s << "{`RANDOM}";
+          }
+          if (repetitionCount > 1)
+            s << "}";
+          s << ";\n";
+          s << "  Memory[" << initvar << "] = "
+            << "{{0}}[" << mem.dataWidth - 1 << ":" << 0 << "];\n"
+            << "end";
+          b.create<sv::VerbatimOp>(
+              verbatimForLoop, ValueRange{},
+              b.getArrayAttr({hw::InnerRefAttr::get(
+                  op.getNameAttr(), randomMemReg.getInnerSymAttr())}));
+        });
+      }
 
       // Register randomization logic.  Randomize every register to a random
       // making efficient use of available randomization registers.
       //
-      // TODO: This shares a lot of common logic with LowerToHW.  Combine these
-      // two in a common randomization utility.
-      b.create<sv::IfDefProceduralOp>("RANDOMIZE_REG_INIT", [&]() {
-        unsigned bits = randomWidth;
-        for (sv::RegOp &reg : randRegs)
-          b.create<sv::VerbatimOp>(
-              b.getStringAttr("{{0}} = {`RANDOM};"), ValueRange{},
-              b.getArrayAttr(hw::InnerRefAttr::get(op.getNameAttr(),
-                                                   reg.getInnerSymAttr())));
-        auto randRegIdx = 0;
-        for (sv::RegOp &reg : registers) {
-          SmallVector<std::pair<Attribute, std::pair<size_t, size_t>>> values;
-          auto width = reg.getElementType().getIntOrFloatBitWidth();
-          auto widthRemaining = width;
-          while (widthRemaining > 0) {
-            if (bits == randomWidth) {
-              randReg = randRegs[randRegIdx++];
-              bits = 0;
+      // TODO: This shares a lot of common logic with LowerToHW.  Combine
+      // these two in a common randomization utility.
+      if (!disableRegRandomization) {
+        b.create<sv::IfDefProceduralOp>("RANDOMIZE_REG_INIT", [&]() {
+          unsigned bits = randomWidth;
+          for (sv::RegOp &reg : randRegs)
+            b.create<sv::VerbatimOp>(
+                b.getStringAttr("{{0}} = {`RANDOM};"), ValueRange{},
+                b.getArrayAttr(hw::InnerRefAttr::get(op.getNameAttr(),
+                                                     reg.getInnerSymAttr())));
+          auto randRegIdx = 0;
+          for (sv::RegOp &reg : registers) {
+            SmallVector<std::pair<Attribute, std::pair<size_t, size_t>>> values;
+            auto width = reg.getElementType().getIntOrFloatBitWidth();
+            auto widthRemaining = width;
+            while (widthRemaining > 0) {
+              if (bits == randomWidth) {
+                randReg = randRegs[randRegIdx++];
+                bits = 0;
+              }
+              auto innerRef = hw::InnerRefAttr::get(op.getNameAttr(),
+                                                    randReg.getInnerSymAttr());
+              if (widthRemaining <= randomWidth - bits) {
+                values.push_back({innerRef, {bits + widthRemaining - 1, bits}});
+                bits += widthRemaining;
+                widthRemaining = 0;
+                continue;
+              }
+              values.push_back({innerRef, {randomWidth - 1, bits}});
+              widthRemaining -= (randomWidth - bits);
+              bits = randomWidth;
             }
-            auto innerRef = hw::InnerRefAttr::get(op.getNameAttr(),
-                                                  randReg.getInnerSymAttr());
-            if (widthRemaining <= randomWidth - bits) {
-              values.push_back({innerRef, {bits + widthRemaining - 1, bits}});
-              bits += widthRemaining;
-              widthRemaining = 0;
-              continue;
+            SmallString<32> rhs("{{0}} = ");
+            unsigned idx = 1;
+            assert(reg.getInnerSymAttr());
+            SmallVector<Attribute, 4> symbols({hw::InnerRefAttr::get(
+                op.getNameAttr(), reg.getInnerSymAttr())});
+            if (values.size() > 1)
+              rhs.append("{");
+            for (auto &v : values) {
+              if (idx > 1)
+                rhs.append(", ");
+              auto [sym, range] = v;
+              symbols.push_back(sym);
+              rhs.append(("{{" + Twine(idx++) + "}}").str());
+              // Do not emit a part select as the whole value is used.
+              if (range.first == randomWidth - 1 && range.second == 0)
+                continue;
+              // Emit a single bit part select, e.g., "[3]"
+              if (range.first == range.second) {
+                rhs.append(("[" + Twine(range.first) + "]").str());
+                continue;
+              }
+              // Emit a part select, e.g., "[4:2]"
+              rhs.append(
+                  ("[" + Twine(range.first) + ":" + Twine(range.second) + "]")
+                      .str());
             }
-            values.push_back({innerRef, {randomWidth - 1, bits}});
-            widthRemaining -= (randomWidth - bits);
-            bits = randomWidth;
+            if (values.size() > 1)
+              rhs.append("}");
+            rhs.append(";");
+            b.create<sv::VerbatimOp>(rhs, ValueRange{},
+                                     b.getArrayAttr(symbols));
           }
-          SmallString<32> rhs("{{0}} = ");
-          unsigned idx = 1;
-          assert(reg.getInnerSymAttr());
-          SmallVector<Attribute, 4> symbols(
-              {hw::InnerRefAttr::get(op.getNameAttr(), reg.getInnerSymAttr())});
-          if (values.size() > 1)
-            rhs.append("{");
-          for (auto &v : values) {
-            if (idx > 1)
-              rhs.append(", ");
-            auto [sym, range] = v;
-            symbols.push_back(sym);
-            rhs.append(("{{" + Twine(idx++) + "}}").str());
-            // Do not emit a part select as the whole value is used.
-            if (range.first == randomWidth - 1 && range.second == 0)
-              continue;
-            // Emit a single bit part select, e.g., "[3]"
-            if (range.first == range.second) {
-              rhs.append(("[" + Twine(range.first) + "]").str());
-              continue;
-            }
-            // Emit a part select, e.g., "[4:2]"
-            rhs.append(
-                ("[" + Twine(range.first) + ":" + Twine(range.second) + "]")
-                    .str());
-          }
-          if (values.size() > 1)
-            rhs.append("}");
-          rhs.append(";");
-          b.create<sv::VerbatimOp>(rhs, ValueRange{}, b.getArrayAttr(symbols));
-        }
-      });
+        });
+      }
     });
   });
-
-  auto outputOp = op.getBodyBlock()->getTerminator();
-  outputOp->setOperands(outputs);
 }
 
 void HWMemSimImplPass::runOnOperation() {
@@ -548,7 +625,10 @@ void HWMemSimImplPass::runOnOperation() {
         newModule.setCommentAttr(
             builder.getStringAttr("VCS coverage exclude_file"));
 
-        HWMemSimImpl(ignoreReadEnableMem).generateMemory(newModule, mem);
+        HWMemSimImpl(ignoreReadEnableMem, stripMuxPragmas,
+                     disableMemRandomization, disableRegRandomization,
+                     addVivadoRAMAddressConflictSynthesisBugWorkaround)
+            .generateMemory(newModule, mem);
       }
 
       oldModule.erase();
@@ -560,10 +640,17 @@ void HWMemSimImplPass::runOnOperation() {
     markAllAnalysesPreserved();
 }
 
-std::unique_ptr<Pass>
-circt::sv::createHWMemSimImplPass(bool replSeqMem, bool ignoreReadEnableMem) {
+std::unique_ptr<Pass> circt::sv::createHWMemSimImplPass(
+    bool replSeqMem, bool ignoreReadEnableMem, bool stripMuxPragmas,
+    bool disableMemRandomization, bool disableRegRandomization,
+    bool addVivadoRAMAddressConflictSynthesisBugWorkaround) {
   auto pass = std::make_unique<HWMemSimImplPass>();
   pass->replSeqMem = replSeqMem;
   pass->ignoreReadEnableMem = ignoreReadEnableMem;
+  pass->stripMuxPragmas = stripMuxPragmas;
+  pass->disableMemRandomization = disableMemRandomization;
+  pass->disableRegRandomization = disableRegRandomization;
+  pass->addVivadoRAMAddressConflictSynthesisBugWorkaround =
+      addVivadoRAMAddressConflictSynthesisBugWorkaround;
   return pass;
 }

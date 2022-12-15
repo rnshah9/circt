@@ -14,21 +14,26 @@
 
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/ESI/ESIOps.h"
+#include "circt/Dialect/ESI/ESIPasses.h"
 #include "circt/Dialect/ESI/ESIServices.h"
 #include "circt/Dialect/ESI/ESITypes.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/BackedgeBuilder.h"
+#include "circt/Support/LLVM.h"
+#include "circt/Support/SymCache.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/JSON.h"
 
 #include <memory>
 
@@ -172,8 +177,7 @@ StringAttr ESIHWBuilder::constructInterfaceName(ChannelType port) {
 /// Return a parameter list for the stage module with the specified value.
 ArrayAttr ESIHWBuilder::getStageParameterList(Attribute value) {
   auto type = IntegerType::get(width.getContext(), 32, IntegerType::Unsigned);
-  auto widthParam =
-      ParamDeclAttr::get(width.getContext(), width, TypeAttr::get(type), value);
+  auto widthParam = ParamDeclAttr::get(width.getContext(), width, type, value);
   return ArrayAttr::get(width.getContext(), widthParam);
 }
 
@@ -198,13 +202,10 @@ HWModuleExternOp ESIHWBuilder::declareStage(Operation *symTable,
       {clk, PortDirection::INPUT, getI1Type(), argn++},
       {rst, PortDirection::INPUT, getI1Type(), argn++}};
 
-  if (stage.hasData())
-    ports.push_back({a, PortDirection::INPUT, dataType, argn++});
-
+  ports.push_back({a, PortDirection::INPUT, dataType, argn++});
   ports.push_back({aValid, PortDirection::INPUT, getI1Type(), argn++});
   ports.push_back({aReady, PortDirection::OUTPUT, getI1Type(), resn++});
-  if (stage.hasData())
-    ports.push_back({x, PortDirection::OUTPUT, dataType, resn++});
+  ports.push_back({x, PortDirection::OUTPUT, dataType, resn++});
 
   ports.push_back({xValid, PortDirection::OUTPUT, getI1Type(), resn++});
   ports.push_back({xReady, PortDirection::INPUT, getI1Type(), argn++});
@@ -238,7 +239,7 @@ HWModuleExternOp ESIHWBuilder::declareCosimEndpointOp(Operation *symTable,
                       {dataInReady, PortDirection::OUTPUT, getI1Type(), 2},
                       {dataIn, PortDirection::INPUT, sendType, 4}};
   SmallVector<Attribute, 8> params;
-  params.push_back(ParamDeclAttr::get("ENDPOINT_ID", getI32Type()));
+  params.push_back(ParamDeclAttr::get("ENDPOINT_ID_EXT", getStringAttr("")));
   params.push_back(
       ParamDeclAttr::get("SEND_TYPE_ID", getIntegerType(64, false)));
   params.push_back(ParamDeclAttr::get("SEND_TYPE_SIZE_BITS", getI32Type()));
@@ -267,12 +268,10 @@ InterfaceOp ESIHWBuilder::constructInterface(ChannelType chan) {
   return create<InterfaceOp>(constructInterfaceName(chan).getValue(), [&]() {
     create<InterfaceSignalOp>(validStr, getI1Type());
     create<InterfaceSignalOp>(readyStr, getI1Type());
-    if (chan.hasData())
-      create<InterfaceSignalOp>(dataStr, chan.getInner());
+    create<InterfaceSignalOp>(dataStr, chan.getInner());
     llvm::SmallVector<StringRef> validDataStrs;
     validDataStrs.push_back(validStr);
-    if (chan.hasData())
-      validDataStrs.push_back(dataStr);
+    validDataStrs.push_back(dataStr);
     create<InterfaceModportOp>(sinkStr,
                                /*inputs=*/ArrayRef<StringRef>{readyStr},
                                /*outputs=*/validDataStrs);
@@ -308,18 +307,18 @@ LogicalResult ChannelBufferLowering::matchAndRewrite(
   auto type = buffer.getType();
 
   // Expand 'abstract' buffer into 'physical' stages.
-  auto stages = buffer.stagesAttr();
+  auto stages = buffer.getStagesAttr();
   uint64_t numStages = 1;
   if (stages) {
     // Guaranteed positive by the parser.
     numStages = stages.getValue().getLimitedValue();
   }
-  Value input = buffer.input();
-  StringAttr bufferName = buffer.nameAttr();
+  Value input = buffer.getInput();
+  StringAttr bufferName = buffer.getNameAttr();
   for (uint64_t i = 0; i < numStages; ++i) {
     // Create the stages, connecting them up as we build.
-    auto stage = rewriter.create<PipelineStageOp>(loc, type, buffer.clk(),
-                                                  buffer.rst(), input);
+    auto stage = rewriter.create<PipelineStageOp>(loc, type, buffer.getClk(),
+                                                  buffer.getRst(), input);
     if (bufferName) {
       SmallString<64> stageName(
           {bufferName.getValue(), "_stage", std::to_string(i)});
@@ -456,17 +455,11 @@ bool ESIPortsPass::updateFunc(HWModuleOp mod) {
     }
     // When we find one, add a data and valid signal to the new args.
     Value data;
-    if (chanTy.hasData()) {
-      newArgTypes.push_back(chanTy.getInner());
-      newArgNames.push_back(argNameAttr);
-      data = mod.front().insertArgument(blockArgNum, chanTy.getInner(),
-                                        mod.getArgument(argNum).getLoc());
-      ++blockArgNum;
-    } else {
-      // This is a data-less channel - need to create a none-typed SSA value
-      // to feed into wrapvr.
-      data = modBuilder.create<esi::NoneSourceOp>();
-    }
+    newArgTypes.push_back(chanTy.getInner());
+    newArgNames.push_back(argNameAttr);
+    data = mod.front().insertArgument(blockArgNum, chanTy.getInner(),
+                                      mod.getArgument(argNum).getLoc());
+    ++blockArgNum;
 
     newArgTypes.push_back(i1);
     newArgNames.push_back(appendToRtlName(argNameAttr, "_valid"));
@@ -477,12 +470,14 @@ bool ESIPortsPass::updateFunc(HWModuleOp mod) {
     // they were. (A later pass takes care of eliminating the ESI ops.)
     auto wrap = modBuilder.create<WrapValidReadyOp>(data, valid);
     // Replace uses of the old ESI port argument with the new one from the wrap.
-    mod.front().getArgument(blockArgNum).replaceAllUsesWith(wrap.chanOutput());
+    mod.front()
+        .getArgument(blockArgNum)
+        .replaceAllUsesWith(wrap.getChanOutput());
     // Delete the ESI port block argument.
     mod.front().eraseArgument(blockArgNum);
     --blockArgNum;
-    newReadySignals.push_back(
-        std::make_pair(wrap.ready(), appendToRtlName(argNameAttr, "_ready")));
+    newReadySignals.push_back(std::make_pair(
+        wrap.getReady(), appendToRtlName(argNameAttr, "_ready")));
     updated = true;
   }
 
@@ -511,14 +506,12 @@ bool ESIPortsPass::updateFunc(HWModuleOp mod) {
     Value ready = mod.front().addArgument(
         i1, modBuilder.getUnknownLoc()); // Ready block arg.
     auto unwrap = modBuilder.create<UnwrapValidReadyOp>(oldOutputValue, ready);
-    if (unwrap.hasData()) {
-      newOutputOperands.push_back(unwrap.rawOutput());
-      newResultTypes.push_back(chanTy.getInner()); // Raw data.
-      newResultNames.push_back(oldResultName);
-    }
+    newOutputOperands.push_back(unwrap.getRawOutput());
+    newResultTypes.push_back(chanTy.getInner()); // Raw data.
+    newResultNames.push_back(oldResultName);
 
     newResultTypes.push_back(i1); // Valid.
-    newOutputOperands.push_back(unwrap.valid());
+    newOutputOperands.push_back(unwrap.getValid());
     newResultNames.push_back(appendToRtlName(oldResultName, "_valid"));
 
     newArgTypes.push_back(i1); // Ready func arg.
@@ -572,8 +565,8 @@ void ESIPortsPass::updateInstance(HWModuleOp mod, InstanceOp inst) {
     auto ready = beb.get(i1);
     inputReadysToConnect.push_back(ready);
     auto unwrap = b.create<UnwrapValidReadyOp>(operand, ready);
-    newOperands.push_back(unwrap.rawOutput());
-    newOperands.push_back(unwrap.valid());
+    newOperands.push_back(unwrap.getRawOutput());
+    newOperands.push_back(unwrap.getValid());
   }
 
   // -----
@@ -618,11 +611,12 @@ void ESIPortsPass::updateInstance(HWModuleOp mod, InstanceOp inst) {
       continue;
     }
 
-    auto wrap = b.create<WrapValidReadyOp>(
-        newInst.getResult(newInstResNum), newInst.getResult(newInstResNum + 1));
+    WrapValidReadyOp wrap;
+    wrap = b.create<WrapValidReadyOp>(newInst.getResult(newInstResNum),
+                                      newInst.getResult(newInstResNum + 1));
     newInstResNum += 2;
-    res.replaceAllUsesWith(wrap.chanOutput());
-    outputReadysToConnect[readyIdx].setValue(wrap.ready());
+    res.replaceAllUsesWith(wrap.getChanOutput());
+    outputReadysToConnect[readyIdx].setValue(wrap.getReady());
     readyIdx++;
   }
 
@@ -890,9 +884,9 @@ LogicalResult PipelineStageLowering::matchAndRewrite(
     PipelineStageOp stage, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   auto loc = stage.getLoc();
-  auto chPort = stage.input().getType().dyn_cast<ChannelType>();
+  auto chPort = stage.getInput().getType().dyn_cast<ChannelType>();
   if (!chPort)
-    return failure();
+    return rewriter.notifyMatchFailure(stage, "stage had wrong type");
   Operation *symTable = stage->getParentWithTrait<OpTrait::SymbolTable>();
   auto stageModule = builder.declareStage(symTable, stage);
 
@@ -907,7 +901,7 @@ LogicalResult PipelineStageLowering::matchAndRewrite(
   circt::BackedgeBuilder back(rewriter, loc);
   circt::Backedge wrapReady = back.get(rewriter.getI1Type());
   auto unwrap =
-      rewriter.create<UnwrapValidReadyOp>(loc, stage.input(), wrapReady);
+      rewriter.create<UnwrapValidReadyOp>(loc, stage.getInput(), wrapReady);
 
   StringRef pipeStageName = "pipelineStage";
   if (auto name = stage->getAttrOfType<StringAttr>("name"))
@@ -915,10 +909,9 @@ LogicalResult PipelineStageLowering::matchAndRewrite(
 
   // Instantiate the "ESI_PipelineStage" external module.
   circt::Backedge stageReady = back.get(rewriter.getI1Type());
-  llvm::SmallVector<Value> operands = {stage.clk(), stage.rst()};
-  if (stage.hasData())
-    operands.push_back(unwrap.rawOutput());
-  operands.push_back(unwrap.valid());
+  llvm::SmallVector<Value> operands = {stage.getClk(), stage.getRst()};
+  operands.push_back(unwrap.getRawOutput());
+  operands.push_back(unwrap.getValid());
   operands.push_back(stageReady);
   auto stageInst = rewriter.create<InstanceOp>(loc, stageModule, pipeStageName,
                                                operands, stageParams);
@@ -927,23 +920,16 @@ LogicalResult PipelineStageLowering::matchAndRewrite(
   // Set a_ready (from the unwrap) back edge correctly to its output from stage.
   wrapReady.setValue(stageInstResults[0]);
   Value x, xValid;
-  if (stage.hasData()) {
-    x = stageInstResults[1];
-    xValid = stageInstResults[2];
-  } else {
-    // This is a data-less channel - need to create a none-typed SSA value
-    // to feed into wrapvr.
-    x = rewriter.create<esi::NoneSourceOp>(loc);
-    xValid = stageInstResults[1];
-  }
+  x = stageInstResults[1];
+  xValid = stageInstResults[2];
 
   // Wrap up the output of the HW stage module.
   auto wrap = rewriter.create<WrapValidReadyOp>(
       loc, chPort, rewriter.getI1Type(), x, xValid);
   // Set the stages x_ready backedge correctly.
-  stageReady.setValue(wrap.ready());
+  stageReady.setValue(wrap.getReady());
 
-  rewriter.replaceOp(stage, wrap.chanOutput());
+  rewriter.replaceOp(stage, wrap.getChanOutput());
   return success();
 }
 
@@ -962,7 +948,7 @@ public:
 LogicalResult NullSourceOpLowering::matchAndRewrite(
     NullSourceOp nullop, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
-  auto innerType = nullop.out().getType().cast<ChannelType>().getInner();
+  auto innerType = nullop.getOut().getType().cast<ChannelType>().getInner();
   Location loc = nullop.getLoc();
   int64_t width = hw::getBitWidth(innerType);
   if (width == -1)
@@ -975,29 +961,9 @@ LogicalResult NullSourceOpLowering::matchAndRewrite(
   auto typedZero = rewriter.create<hw::BitcastOp>(loc, innerType, zero);
   auto wrap = rewriter.create<WrapValidReadyOp>(loc, typedZero, valid);
   wrap->setAttr("name", rewriter.getStringAttr("nullsource"));
-  rewriter.replaceOp(nullop, {wrap.chanOutput()});
+  rewriter.replaceOp(nullop, {wrap.getChanOutput()});
   return success();
 }
-
-namespace {
-struct RemoveNoneSourceOp : public OpConversionPattern<NoneSourceOp> {
-public:
-  RemoveNoneSourceOp(MLIRContext *ctxt) : OpConversionPattern(ctxt) {}
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(NoneSourceOp nullop, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override;
-};
-
-LogicalResult
-RemoveNoneSourceOp::matchAndRewrite(NoneSourceOp noneOp, OpAdaptor adaptor,
-                                    ConversionPatternRewriter &rewriter) const {
-  rewriter.eraseOp(noneOp);
-  return success();
-}
-
-} // anonymous namespace
 
 namespace {
 /// Eliminate back-to-back wrap-unwraps to reduce the number of ESI channels.
@@ -1013,16 +979,16 @@ public:
     WrapValidReadyOp wrap = dyn_cast<WrapValidReadyOp>(op);
     UnwrapValidReadyOp unwrap = dyn_cast<UnwrapValidReadyOp>(op);
     if (wrap) {
-      if (!wrap.chanOutput().hasOneUse() ||
+      if (!wrap.getChanOutput().hasOneUse() ||
           !(unwrap = dyn_cast<UnwrapValidReadyOp>(
-                wrap.chanOutput().use_begin()->getOwner())))
+                wrap.getChanOutput().use_begin()->getOwner())))
         return rewriter.notifyMatchFailure(
             wrap, "This conversion only supports wrap-unwrap back-to-back. "
                   "Could not find 'unwrap'.");
 
       data = operands[0];
       valid = operands[1];
-      ready = unwrap.ready();
+      ready = unwrap.getReady();
     } else if (unwrap) {
       wrap = dyn_cast<WrapValidReadyOp>(operands[0].getDefiningOp());
       if (!wrap)
@@ -1030,14 +996,14 @@ public:
             operands[0].getDefiningOp(),
             "This conversion only supports wrap-unwrap back-to-back. "
             "Could not find 'wrap'.");
-      valid = wrap.valid();
-      data = wrap.rawInput();
+      valid = wrap.getValid();
+      data = wrap.getRawInput();
       ready = operands[1];
     } else {
       return failure();
     }
 
-    if (!wrap.chanOutput().hasOneUse())
+    if (!wrap.getChanOutput().hasOneUse())
       return rewriter.notifyMatchFailure(wrap, [](Diagnostic &d) {
         d << "This conversion only supports wrap-unwrap back-to-back. "
              "Wrap didn't have exactly one use.";
@@ -1088,18 +1054,12 @@ WrapInterfaceLower::matchAndRewrite(WrapSVInterfaceOp wrap, OpAdaptor adaptor,
   auto validSignal = rewriter.create<ReadInterfaceSignalOp>(
       loc, ifaceInstance, ESIHWBuilder::validStr);
   Value dataSignal;
-  if (wrap.hasData())
-    dataSignal = rewriter.create<ReadInterfaceSignalOp>(loc, ifaceInstance,
-                                                        ESIHWBuilder::dataStr);
-  else {
-    // This is a data-less channel - need to create a none-typed SSA value
-    // to feed into wrapvr.
-    dataSignal = rewriter.create<esi::NoneSourceOp>(loc);
-  }
+  dataSignal = rewriter.create<ReadInterfaceSignalOp>(loc, ifaceInstance,
+                                                      ESIHWBuilder::dataStr);
   auto wrapVR = rewriter.create<WrapValidReadyOp>(loc, dataSignal, validSignal);
   rewriter.create<AssignInterfaceSignalOp>(
-      loc, ifaceInstance, ESIHWBuilder::readyStr, wrapVR.ready());
-  rewriter.replaceOp(wrap, {wrapVR.chanOutput()});
+      loc, ifaceInstance, ESIHWBuilder::readyStr, wrapVR.getReady());
+  rewriter.replaceOp(wrap, {wrapVR.getChanOutput()});
   return success();
 }
 
@@ -1141,11 +1101,10 @@ LogicalResult UnwrapInterfaceLower::matchAndRewrite(
   auto unwrapVR =
       rewriter.create<UnwrapValidReadyOp>(loc, operands[0], readySignal);
   rewriter.create<AssignInterfaceSignalOp>(
-      loc, ifaceInstance, ESIHWBuilder::validStr, unwrapVR.valid());
+      loc, ifaceInstance, ESIHWBuilder::validStr, unwrapVR.getValid());
 
-  if (unwrap.hasData())
-    rewriter.create<AssignInterfaceSignalOp>(
-        loc, ifaceInstance, ESIHWBuilder::dataStr, unwrapVR.rawOutput());
+  rewriter.create<AssignInterfaceSignalOp>(
+      loc, ifaceInstance, ESIHWBuilder::dataStr, unwrapVR.getRawOutput());
   rewriter.eraseOp(unwrap);
   return success();
 }
@@ -1190,14 +1149,17 @@ CosimLowering::matchAndRewrite(CosimEndpointOp ep, OpAdaptor adaptor,
   capnp::TypeSchema sendTypeSchema(send.getType());
   if (!sendTypeSchema.isSupported())
     return rewriter.notifyMatchFailure(ep, "Send type not supported yet");
-  capnp::TypeSchema recvTypeSchema(ep.recv().getType());
+  capnp::TypeSchema recvTypeSchema(ep.getRecv().getType());
   if (!recvTypeSchema.isSupported())
     return rewriter.notifyMatchFailure(ep, "Recv type not supported yet");
 
   // Set all the parameters.
   SmallVector<Attribute, 8> params;
-  params.push_back(ParamDeclAttr::get(
-      "ENDPOINT_ID", rewriter.getI32IntegerAttr(ep.endpointID())));
+  if (auto ext = ep->getAttrOfType<StringAttr>("name_ext"))
+    params.push_back(ParamDeclAttr::get("ENDPOINT_ID_EXT", ext));
+  else
+    params.push_back(
+        ParamDeclAttr::get("ENDPOINT_ID_EXT", StringAttr::get(ctxt, "")));
   params.push_back(ParamDeclAttr::get(
       "SEND_TYPE_ID",
       IntegerAttr::get(ui64Type, sendTypeSchema.capnpTypeID())));
@@ -1217,8 +1179,9 @@ CosimLowering::matchAndRewrite(CosimEndpointOp ep, OpAdaptor adaptor,
   auto sendReady = bb.get(rewriter.getI1Type());
   UnwrapValidReadyOp unwrapSend =
       rewriter.create<UnwrapValidReadyOp>(loc, send, sendReady);
-  auto encodeData = rewriter.create<CapnpEncodeOp>(
-      loc, egestBitArrayType, clk, unwrapSend.valid(), unwrapSend.rawOutput());
+  auto encodeData = rewriter.create<CapnpEncodeOp>(loc, egestBitArrayType, clk,
+                                                   unwrapSend.getValid(),
+                                                   unwrapSend.getRawOutput());
 
   // Get information necessary for injest path.
   auto recvReady = bb.get(rewriter.getI1Type());
@@ -1234,7 +1197,7 @@ CosimLowering::matchAndRewrite(CosimEndpointOp ep, OpAdaptor adaptor,
   StringAttr nameAttr = ep->getAttr("name").dyn_cast_or_null<StringAttr>();
   StringRef name = nameAttr ? nameAttr.getValue() : "CosimEndpointOp";
   Value epInstInputs[] = {
-      clk, rst, recvReady, unwrapSend.valid(), encodeData.capnpBits(),
+      clk, rst, recvReady, unwrapSend.getValid(), encodeData.getCapnpBits(),
   };
 
   auto cosimEpModule =
@@ -1249,11 +1212,11 @@ CosimLowering::matchAndRewrite(CosimEndpointOp ep, OpAdaptor adaptor,
       rewriter.create<CapnpDecodeOp>(loc, recvTypeSchema.getType(), clk,
                                      recvValidFromCosim, recvDataFromCosim);
   WrapValidReadyOp wrapRecv = rewriter.create<WrapValidReadyOp>(
-      loc, decodeData.decodedData(), recvValidFromCosim);
-  recvReady.setValue(wrapRecv.ready());
+      loc, decodeData.getDecodedData(), recvValidFromCosim);
+  recvReady.setValue(wrapRecv.getReady());
 
   // Replace the CosimEndpointOp op.
-  rewriter.replaceOp(ep, wrapRecv.chanOutput());
+  rewriter.replaceOp(ep, wrapRecv.getChanOutput());
 
   return success();
 #endif // CAPNP
@@ -1273,7 +1236,7 @@ public:
                                        "encode.capnp lowering requires the ESI "
                                        "capnp plugin, which was disabled.");
 #else
-    capnp::TypeSchema encodeType(enc.dataToEncode().getType());
+    capnp::TypeSchema encodeType(enc.getDataToEncode().getType());
     if (!encodeType.isSupported())
       return rewriter.notifyMatchFailure(enc, "Type not supported yet");
     auto operands = adaptor.getOperands();
@@ -1301,7 +1264,7 @@ public:
                                        "decode.capnp lowering requires the ESI "
                                        "capnp plugin, which was disabled.");
 #else
-    capnp::TypeSchema decodeType(dec.decodedData().getType());
+    capnp::TypeSchema decodeType(dec.getDecodedData().getType());
     if (!decodeType.isSupported())
       return rewriter.notifyMatchFailure(dec, "Type not supported yet");
     auto operands = adaptor.getOperands();
@@ -1326,7 +1289,6 @@ void ESItoHWPass::runOnOperation() {
   pass1Target.addLegalDialect<SVDialect>();
   pass1Target.addLegalOp<WrapValidReadyOp, UnwrapValidReadyOp>();
   pass1Target.addLegalOp<CapnpDecodeOp, CapnpEncodeOp>();
-  pass1Target.addLegalOp<NoneSourceOp>();
 
   pass1Target.addIllegalOp<WrapSVInterfaceOp, UnwrapSVInterfaceOp>();
   pass1Target.addIllegalOp<PipelineStageOp>();
@@ -1355,30 +1317,253 @@ void ESItoHWPass::runOnOperation() {
   pass2Patterns.insert<RemoveWrapUnwrap>(ctxt);
   pass2Patterns.insert<EncoderLowering>(ctxt);
   pass2Patterns.insert<DecoderLowering>(ctxt);
-  pass2Patterns.insert<RemoveNoneSourceOp>(ctxt);
   if (failed(
           applyPartialConversion(top, pass2Target, std::move(pass2Patterns))))
     signalPassFailure();
 }
 
 //===----------------------------------------------------------------------===//
-// Create Cap'n Proto schema pass
+// Emit ESI collateral pass. Collateral includes the capnp schema and a JSON
+// descriptor of the service hierarchy.
 //===----------------------------------------------------------------------===//
+
+static llvm::json::Value toJSON(Type type) {
+  // TODO: This is far from complete. Build out as necessary.
+  using llvm::json::Array;
+  using llvm::json::Object;
+  using llvm::json::Value;
+
+  StringRef dialect = type.getDialect().getNamespace();
+  std::string m;
+  Object o = TypeSwitch<Type, Object>(type)
+                 .Case([&](ChannelType t) {
+                   m = "channel";
+                   return Object({{"inner", toJSON(t.getInner())}});
+                 })
+                 .Case([&](AnyType t) {
+                   m = "any";
+                   return Object();
+                 })
+                 .Case([&](StructType t) {
+                   m = "struct";
+                   Array fields;
+                   for (auto field : t.getElements())
+                     fields.push_back(Object({{"name", field.name.getValue()},
+                                              {"type", toJSON(field.type)}}));
+                   return Object({{"fields", Value(std::move(fields))}});
+                 })
+                 .Default([&](Type t) {
+                   llvm::raw_string_ostream(m) << t;
+                   return Object();
+                 });
+  o["dialect"] = dialect;
+  if (m.length())
+    o["mnemonic"] = m;
+  return o;
+}
+
+// Serialize an attribute to a JSON value.
+static llvm::json::Value toJSON(Attribute attr) {
+  // TODO: This is far from complete. Build out as necessary.
+  using llvm::json::Value;
+  return TypeSwitch<Attribute, Value>(attr)
+      .Case([&](StringAttr a) { return a.getValue(); })
+      .Case([&](IntegerAttr a) { return a.getValue().getLimitedValue(); })
+      .Case([&](TypeAttr a) {
+        Type t = a.getValue();
+        llvm::json::Object typeMD;
+        typeMD["type_desc"] = toJSON(t);
+
+        std::string buf;
+        llvm::raw_string_ostream(buf) << t;
+        typeMD["mlir_name"] = buf;
+
+        if (auto chanType = t.dyn_cast<ChannelType>()) {
+          Type inner = chanType.getInner();
+          typeMD["hw_bitwidth"] = hw::getBitWidth(inner);
+#ifdef CAPNP
+          capnp::TypeSchema schema(inner);
+          typeMD["capnp_type_id"] = schema.capnpTypeID();
+          typeMD["capnp_name"] = schema.name().str();
+#endif
+        } else {
+          typeMD["hw_bitwidth"] = hw::getBitWidth(t);
+        }
+        return typeMD;
+      })
+      .Case([&](ArrayAttr a) {
+        return llvm::json::Array(
+            llvm::map_range(a, [](Attribute a) { return toJSON(a); }));
+      })
+      .Case([&](DictionaryAttr a) {
+        llvm::json::Object dict;
+        for (auto &entry : a.getValue())
+          dict[entry.getName().getValue()] = toJSON(entry.getValue());
+        return dict;
+      })
+      .Case([&](InnerRefAttr ref) {
+        llvm::json::Object dict;
+        dict["outer_sym"] = ref.getModule().getValue();
+        dict["inner"] = ref.getName().getValue();
+        return dict;
+      })
+      .Default([&](Attribute a) {
+        std::string buff;
+        llvm::raw_string_ostream(buff) << a;
+        return buff;
+      });
+}
 
 namespace {
 /// Run all the physical lowerings.
-struct ESICreateCapnpSchemaPass
-    : public ESICreateCapnpSchemaBase<ESICreateCapnpSchemaPass> {
+struct ESIEmitCollateralPass
+    : public ESIEmitCollateralBase<ESIEmitCollateralPass> {
   void runOnOperation() override;
+
+  /// Emit service hierarchy info in JSON format.
+  void emitServiceJSON();
 };
 } // anonymous namespace
 
-void ESICreateCapnpSchemaPass::runOnOperation() {
+void ESIEmitCollateralPass::emitServiceJSON() {
+  ModuleOp mod = getOperation();
+  auto *ctxt = &getContext();
+  SymbolCache topSyms;
+  topSyms.addDefinitions(mod);
+
+  // Check for invalid top names.
+  for (StringRef topModName : tops)
+    if (topSyms.getDefinition(FlatSymbolRefAttr::get(ctxt, topModName)) ==
+        nullptr) {
+      mod.emitError("Could not find module named '") << topModName << "'\n";
+      signalPassFailure();
+      return;
+    }
+
+  std::string jsonStrBuffer;
+  llvm::raw_string_ostream os(jsonStrBuffer);
+  llvm::json::OStream j(os, 2);
+
+  // Emit the list of ports of a service declaration.
+  auto emitPorts = [&](ServiceDeclOpInterface decl) {
+    SmallVector<ServicePortInfo> ports;
+    decl.getPortList(ports);
+    for (ServicePortInfo port : ports) {
+      j.object([&] {
+        j.attribute("name", port.name.getValue());
+        if (port.toClientType)
+          j.attribute("to-client-type", toJSON(port.toClientType));
+        if (port.toServerType)
+          j.attribute("to-server-type", toJSON(port.toServerType));
+      });
+    }
+  };
+
+  j.object([&] {
+    // Emit a list of the service declarations in a design.
+    j.attributeArray("declarations", [&] {
+      for (auto *op : llvm::make_pointer_range(mod.getOps())) {
+        if (auto decl = dyn_cast<ServiceDeclOpInterface>(op)) {
+          j.object([&] {
+            j.attribute("name", SymbolTable::getSymbolName(op).getValue());
+            j.attributeArray("ports", [&] { emitPorts(decl); });
+          });
+        }
+      }
+    });
+
+    j.attributeArray("top_levels", [&] {
+      for (auto topModName : tops) {
+        j.object([&] {
+          auto sym = FlatSymbolRefAttr::get(ctxt, topModName);
+          Operation *hwMod = topSyms.getDefinition(sym);
+          j.attribute("module", toJSON(sym));
+          j.attributeArray("services", [&] {
+            hwMod->walk([&](ServiceHierarchyMetadataOp md) {
+              j.object([&] {
+                j.attribute("service", md.getServiceSymbol());
+                j.attribute("instance_path",
+                            toJSON(md.getServerNamePathAttr()));
+              });
+            });
+          });
+        });
+      }
+    });
+
+    // Get a list of metadata ops which originated in modules (path is empty).
+    SmallVector<
+        std::pair<hw::HWModuleLike, SmallVector<ServiceHierarchyMetadataOp, 0>>>
+        modsWithLocalServices;
+    for (auto hwmod : mod.getOps<hw::HWModuleLike>()) {
+      SmallVector<ServiceHierarchyMetadataOp, 0> metadataOps;
+      hwmod.walk([&metadataOps](ServiceHierarchyMetadataOp md) {
+        if (md.getServerNamePath().empty())
+          metadataOps.push_back(md);
+      });
+      if (!metadataOps.empty())
+        modsWithLocalServices.push_back(std::make_pair(hwmod, metadataOps));
+    }
+
+    // Then output metadata for those modules exclusively.
+    j.attributeArray("modules", [&] {
+      for (auto &nameMdPair : modsWithLocalServices) {
+        hw::HWModuleLike hwmod = nameMdPair.first;
+        auto &mdOps = nameMdPair.second;
+        j.object([&] {
+          j.attribute("symbol", hwmod.moduleName());
+          j.attributeArray("services", [&] {
+            for (ServiceHierarchyMetadataOp metadata : mdOps) {
+              j.object([&] {
+                j.attribute("service", metadata.getServiceSymbol());
+                j.attribute("impl_type", metadata.getImplType());
+                if (metadata.getImplDetailsAttr())
+                  j.attribute("impl_details",
+                              toJSON(metadata.getImplDetailsAttr()));
+                j.attributeArray("clients", [&] {
+                  for (auto client : metadata.getClients())
+                    j.value(toJSON(client));
+                });
+              });
+            }
+          });
+        });
+      }
+    });
+  });
+
+  j.flush();
+  OpBuilder b = OpBuilder::atBlockEnd(mod.getBody());
+  auto verbatim = b.create<sv::VerbatimOp>(b.getUnknownLoc(),
+                                           StringAttr::get(ctxt, os.str()));
+  auto outputFileAttr = OutputFileAttr::getFromFilename(ctxt, "services.json");
+  verbatim->setAttr("output_file", outputFileAttr);
+
+  // By now, we should be done with all of the service declarations and metadata
+  // ops so we should delete them.
+  mod.walk([&](ServiceHierarchyMetadataOp op) { op.erase(); });
+  // Track declarations which are still used so that the service impl reqs are
+  // still valid.
+  DenseSet<StringAttr> stillUsed;
+  mod.walk([&](ServiceImplementReqOp req) {
+    auto sym = req.getServiceSymbol();
+    if (sym.has_value())
+      stillUsed.insert(StringAttr::get(req.getContext(), *sym));
+  });
+  mod.walk([&](ServiceDeclOpInterface decl) {
+    if (!stillUsed.contains(SymbolTable::getSymbolName(decl)))
+      decl.getOperation()->erase();
+  });
+}
+
+void ESIEmitCollateralPass::runOnOperation() {
   ModuleOp mod = getOperation();
   auto *ctxt = &getContext();
 
-  // Check for cosim endpoints in the design. If the design doesn't have any we
-  // don't need a schema.
+  emitServiceJSON();
+
+  // Check for cosim endpoints in the design. If the design doesn't have any
+  // we don't need a schema.
   WalkResult cosimWalk =
       mod.walk([](CosimEndpointOp _) { return WalkResult::interrupt(); });
   if (!cosimWalk.wasInterrupted())
@@ -1402,26 +1587,20 @@ void ESICreateCapnpSchemaPass::runOnOperation() {
   }
 }
 
-namespace circt {
-namespace esi {
-std::unique_ptr<OperationPass<ModuleOp>> createESICreateCapnpSchemaPass() {
-  return std::make_unique<ESICreateCapnpSchemaPass>();
+std::unique_ptr<OperationPass<ModuleOp>>
+circt::esi::createESIEmitCollateralPass() {
+  return std::make_unique<ESIEmitCollateralPass>();
 }
-std::unique_ptr<OperationPass<ModuleOp>> createESIPhysicalLoweringPass() {
+std::unique_ptr<OperationPass<ModuleOp>>
+circt::esi::createESIPhysicalLoweringPass() {
   return std::make_unique<ESIToPhysicalPass>();
 }
-std::unique_ptr<OperationPass<ModuleOp>> createESIPortLoweringPass() {
+std::unique_ptr<OperationPass<ModuleOp>>
+circt::esi::createESIPortLoweringPass() {
   return std::make_unique<ESIPortsPass>();
 }
-std::unique_ptr<OperationPass<ModuleOp>> createESItoHWPass() {
+std::unique_ptr<OperationPass<ModuleOp>> circt::esi::createESItoHWPass() {
   return std::make_unique<ESItoHWPass>();
 }
-} // namespace esi
-} // namespace circt
-
-namespace {
-#define GEN_PASS_REGISTRATION
-#include "circt/Dialect/ESI/ESIPasses.h.inc"
-} // namespace
 
 void circt::esi::registerESIPasses() { registerPasses(); }

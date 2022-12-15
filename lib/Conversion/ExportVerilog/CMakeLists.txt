@@ -1,9 +1,10 @@
 
 add_circt_translation_library(CIRCTExportVerilog
+  ApplyLoweringOptions.cpp
   ExportVerilog.cpp
   LegalizeNames.cpp
   PrepareForEmission.cpp
-  RearrangableOStream.cpp
+  PruneZeroValuedLogic.cpp
 
   ADDITIONAL_HEADER_DIRS
 
@@ -18,6 +19,8 @@ add_circt_translation_library(CIRCTExportVerilog
   CIRCTHW
   CIRCTSupport
   CIRCTSV
+  MLIRIR
   MLIRPass
   MLIRSideEffectInterfaces
+  MLIRTransforms
   )

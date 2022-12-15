@@ -109,7 +109,7 @@ static bool applyToPort(AnnotationSet annos, Operation *op, size_t portCount,
 }
 
 bool AnnotationSet::applyToPort(FModuleLike op, size_t portNo) const {
-  return ::applyToPort(*this, op.getOperation(), op.getNumPorts(), portNo);
+  return ::applyToPort(*this, op.getOperation(), getNumPorts(op), portNo);
 }
 
 bool AnnotationSet::applyToPort(MemOp op, size_t portNo) const {
@@ -666,7 +666,7 @@ PortAnnoTarget::getNLAReference(ModuleNamespace &moduleNamespace) const {
 FIRRTLType PortAnnoTarget::getType() const {
   auto *op = getOp();
   if (auto module = llvm::dyn_cast<FModuleLike>(op))
-    return module.getPortType(getPortNo());
+    return module.getPortType(getPortNo()).cast<FIRRTLType>();
   if (llvm::isa<MemOp, InstanceOp>(op))
     return op->getResult(getPortNo()).getType().cast<FIRRTLType>();
   llvm_unreachable("unknow operation kind");
@@ -683,4 +683,30 @@ bool circt::firrtl::isOMIRStringEncodedPassthrough(StringRef type) {
   return type == "OMID" || type == "OMReference" || type == "OMBigInt" ||
          type == "OMLong" || type == "OMString" || type == "OMDouble" ||
          type == "OMBigDecimal" || type == "OMDeleted" || type == "OMConstant";
+}
+
+//===----------------------------------------------------------------------===//
+// Utilities for Specific Annotations
+//
+// TODO: Remove these in favor of first-class annotations.
+//===----------------------------------------------------------------------===//
+
+LogicalResult circt::firrtl::extractDUT(const FModuleOp mod, FModuleOp &dut) {
+  if (!AnnotationSet(mod).hasAnnotation(dutAnnoClass))
+    return success();
+
+  // TODO: This check is duplicated multiple places, e.g., in
+  // WireDFT.  This should be factored out as part of the annotation
+  // lowering pass.
+  if (dut) {
+    auto diag = emitError(mod->getLoc())
+                << "is marked with a '" << dutAnnoClass << "', but '"
+                << dut.moduleName()
+                << "' also had such an annotation (this should "
+                   "be impossible!)";
+    diag.attachNote(dut.getLoc()) << "the first DUT was found here";
+    return failure();
+  }
+  dut = mod;
+  return success();
 }

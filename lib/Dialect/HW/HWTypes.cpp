@@ -46,8 +46,7 @@ mlir::Type circt::hw::getCanonicalType(mlir::Type type) {
 }
 
 /// Return true if the specified type is a value HW Integer type.  This checks
-/// that it is a signless standard dialect type, that it isn't zero bits, or a
-/// hw::IntType.
+/// that it is a signless standard dialect type or a hw::IntType.
 bool circt::hw::isHWIntegerType(mlir::Type type) {
   Type canonicalType = getCanonicalType(type);
 
@@ -58,7 +57,7 @@ bool circt::hw::isHWIntegerType(mlir::Type type) {
   if (!intType || !intType.isSignless())
     return false;
 
-  return intType.getWidth() != 0;
+  return true;
 }
 
 bool circt::hw::isHWEnumType(mlir::Type type) {
@@ -169,10 +168,11 @@ static ParseResult parseHWElementType(Type &result, AsmParser &p) {
 
   if (typeString.startswith("array<") || typeString.startswith("inout<") ||
       typeString.startswith("uarray<") || typeString.startswith("struct<") ||
-      typeString.startswith("typealias<") || typeString.startswith("int<")) {
+      typeString.startswith("typealias<") || typeString.startswith("int<") ||
+      typeString.startswith("enum<")) {
     llvm::StringRef mnemonic;
     auto parseResult = generatedTypeParser(p, &mnemonic, result);
-    return parseResult.hasValue() ? success() : failure();
+    return parseResult.has_value() ? success() : failure();
   }
 
   return p.parseType(result);
@@ -188,7 +188,7 @@ static void printHWElementType(Type element, AsmPrinter &p) {
 // Int Type
 //===----------------------------------------------------------------------===//
 
-Type IntType::get(Attribute width) {
+Type IntType::get(mlir::TypedAttr width) {
   // The width expression must always be a 32-bit wide integer type itself.
   auto widthWidth = width.getType().dyn_cast<IntegerType>();
   assert(widthWidth && widthWidth.getWidth() == 32 &&
@@ -206,7 +206,7 @@ Type IntType::parse(AsmParser &p) {
   // The bitwidth of the parameter size is always 32 bits.
   auto int32Type = p.getBuilder().getIntegerType(32);
 
-  Attribute width;
+  mlir::TypedAttr width;
   if (p.parseLess() || p.parseAttribute(width, int32Type) || p.parseGreater())
     return Type();
   return get(width);
@@ -367,9 +367,9 @@ static LogicalResult parseArray(AsmParser &p, Attribute &dim, Type &inner) {
   uint64_t dimLiteral;
   auto int64Type = p.getBuilder().getIntegerType(64);
 
-  if (auto res = p.parseOptionalInteger(dimLiteral); res.hasValue())
+  if (auto res = p.parseOptionalInteger(dimLiteral); res.has_value())
     dim = p.getBuilder().getI64IntegerAttr(dimLiteral);
-  else if (!p.parseOptionalAttribute(dim, int64Type).hasValue())
+  else if (!p.parseOptionalAttribute(dim, int64Type).has_value())
     return failure();
 
   if (!dim.isa<IntegerAttr, ParamExprAttr, ParamDeclRefAttr>()) {

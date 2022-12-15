@@ -48,44 +48,11 @@ using hw::PortDirection;
 /// annotated module should be dumped to a file.
 static const char moduleHierarchyFileAttrName[] = "firrtl.moduleHierarchyFile";
 
-/// Given a FIRRTL type, return the corresponding type for the HW dialect.
-/// This returns a null type if it cannot be lowered.
-static Type lowerType(Type type) {
-  auto firType = type.dyn_cast<FIRRTLType>();
-  if (!firType)
-    return {};
-
-  // Ignore flip types.
-  firType = firType.getPassiveType();
-
-  if (BundleType bundle = firType.dyn_cast<BundleType>()) {
-    mlir::SmallVector<hw::StructType::FieldInfo, 8> hwfields;
-    for (auto element : bundle) {
-      Type etype = lowerType(element.type);
-      if (!etype)
-        return {};
-      hwfields.push_back(hw::StructType::FieldInfo{element.name, etype});
-    }
-    return hw::StructType::get(type.getContext(), hwfields);
-  }
-  if (FVectorType vec = firType.dyn_cast<FVectorType>()) {
-    auto elemTy = lowerType(vec.getElementType());
-    if (!elemTy)
-      return {};
-    return hw::ArrayType::get(elemTy, vec.getNumElements());
-  }
-
-  auto width = firType.getBitWidthOrSentinel();
-  if (width >= 0) // IntType, analog with known width, clock, etc.
-    return IntegerType::get(type.getContext(), width);
-
-  return {};
-}
-
-/// Return true if the specified FIRRTL type is a sized type (Int or Analog)
+/// Return true if the specified type is a sized FIRRTL type (Int or Analog)
 /// with zero bits.
 static bool isZeroBitFIRRTLType(Type type) {
-  return type.cast<FIRRTLType>().getPassiveType().getBitWidthOrSentinel() == 0;
+  auto ftype = type.dyn_cast<FIRRTLBaseType>();
+  return ftype && ftype.getPassiveType().getBitWidthOrSentinel() == 0;
 }
 
 // Return a single source value in the operands of the given attach op if
@@ -150,18 +117,17 @@ static IntType getWidestIntType(Type t1, Type t2) {
   return t2c.getWidth() > t1c.getWidth() ? t2c : t1c;
 }
 
-/// Cast from a standard type to a FIRRTL type, potentially with a flip.
+/// Cast a value to a desired target type. This will insert struct casts and
+/// unrealized conversion casts as necessary.
 static Value castToFIRRTLType(Value val, Type type,
                               ImplicitLocOpBuilder &builder) {
-  auto firType = type.cast<FIRRTLType>();
-
   // Use HWStructCastOp for a bundle type.
   if (BundleType bundle = type.dyn_cast<BundleType>())
-    val = builder.createOrFold<HWStructCastOp>(firType.getPassiveType(), val);
+    val = builder.createOrFold<HWStructCastOp>(bundle.getPassiveType(), val);
 
   if (type != val.getType())
-    val = builder.create<mlir::UnrealizedConversionCastOp>(firType, val)
-              .getResult(0);
+    val = builder.create<mlir::UnrealizedConversionCastOp>(type, val).getResult(
+        0);
 
   return val;
 }
@@ -174,7 +140,7 @@ static Value castFromFIRRTLType(Value val, Type type,
     // Strip off Flip type if needed.
     val = builder
               .create<mlir::UnrealizedConversionCastOp>(
-                  val.getType().cast<FIRRTLType>().getPassiveType(), val)
+                  val.getType().cast<FIRRTLBaseType>().getPassiveType(), val)
               .getResult(0);
     val = builder.createOrFold<HWStructCastOp>(type, val);
     return val;
@@ -257,11 +223,12 @@ struct CircuitLoweringState {
   std::atomic<bool> used_RANDOMIZE_GARBAGE_ASSIGN{false};
 
   CircuitLoweringState(CircuitOp circuitOp, bool enableAnnotationWarning,
-                       bool emitChiselAssertsAsSVA,
+                       bool emitChiselAssertsAsSVA, bool stripMuxPragmas,
                        InstanceGraph *instanceGraph, NLATable *nlaTable)
       : circuitOp(circuitOp), instanceGraph(instanceGraph),
         enableAnnotationWarning(enableAnnotationWarning),
-        emitChiselAssertsAsSVA(emitChiselAssertsAsSVA), nlaTable(nlaTable) {
+        emitChiselAssertsAsSVA(emitChiselAssertsAsSVA),
+        stripMuxPragmas(stripMuxPragmas), nlaTable(nlaTable) {
     auto *context = circuitOp.getContext();
 
     // Get the testbench output directory.
@@ -355,6 +322,7 @@ private:
   std::mutex annotationPrintingMtx;
 
   const bool emitChiselAssertsAsSVA;
+  const bool stripMuxPragmas;
 
   // Records any sv::BindOps that are found during the course of execution.
   // This is unsafe to access directly and should only be used through addBind.
@@ -446,8 +414,11 @@ namespace {
 struct FIRRTLModuleLowering : public LowerFIRRTLToHWBase<FIRRTLModuleLowering> {
 
   void runOnOperation() override;
+  void setDisableMemRandomization() { disableMemRandomization = true; }
+  void setDisableRegRandomization() { disableRegRandomization = true; }
   void setEnableAnnotationWarning() { enableAnnotationWarning = true; }
   void setEmitChiselAssertAsSVA() { emitChiselAssertsAsSVA = true; }
+  void setStripMuxPragmas() { stripMuxPragmas = true; }
 
 private:
   void lowerFileHeader(CircuitOp op, CircuitLoweringState &loweringState);
@@ -455,6 +426,8 @@ private:
                            SmallVectorImpl<hw::PortInfo> &ports,
                            Operation *moduleOp,
                            CircuitLoweringState &loweringState);
+  bool handleForceNameAnnos(FModuleLike oldModule, AnnotationSet &annos,
+                            CircuitLoweringState &loweringState);
   hw::HWModuleOp lowerModule(FModuleOp oldModule, Block *topLevelModule,
                              CircuitLoweringState &loweringState);
   hw::HWModuleExternOp lowerExtModule(FExtModuleOp oldModule,
@@ -476,14 +449,21 @@ private:
 } // end anonymous namespace
 
 /// This is the pass constructor.
-std::unique_ptr<mlir::Pass>
-circt::createLowerFIRRTLToHWPass(bool enableAnnotationWarning,
-                                 bool emitChiselAssertsAsSVA) {
+std::unique_ptr<mlir::Pass> circt::createLowerFIRRTLToHWPass(
+    bool enableAnnotationWarning, bool emitChiselAssertsAsSVA,
+    bool stripMuxPragmas, bool disableMemRandomization,
+    bool disableRegRandomization) {
   auto pass = std::make_unique<FIRRTLModuleLowering>();
   if (enableAnnotationWarning)
     pass->setEnableAnnotationWarning();
   if (emitChiselAssertsAsSVA)
     pass->setEmitChiselAssertAsSVA();
+  if (stripMuxPragmas)
+    pass->setStripMuxPragmas();
+  if (disableMemRandomization)
+    pass->setDisableMemRandomization();
+  if (disableRegRandomization)
+    pass->setDisableRegRandomization();
   return pass;
 }
 
@@ -510,7 +490,7 @@ void FIRRTLModuleLowering::runOnOperation() {
   // Keep track of the mapping from old to new modules.  The result may be null
   // if lowering failed.
   CircuitLoweringState state(
-      circuit, enableAnnotationWarning, emitChiselAssertsAsSVA,
+      circuit, enableAnnotationWarning, emitChiselAssertsAsSVA, stripMuxPragmas,
       &getAnalysis<InstanceGraph>(), &getAnalysis<NLATable>());
 
   SmallVector<FModuleOp, 32> modulesToProcess;
@@ -524,6 +504,15 @@ void FIRRTLModuleLowering::runOnOperation() {
                 "firrtl.extract.cover");
   circuitAnno.removeAnnotationsWithClass(
       extractAssertAnnoClass, extractAssumeAnnoClass, extractCoverageAnnoClass);
+
+  // Pass along the testbench directory for ExtractTestCode to use later.
+  if (auto tbAnno = circuitAnno.getAnnotation(testBenchDirAnnoClass)) {
+    auto dirName = tbAnno.getMember<StringAttr>("dirname");
+    auto testBenchDir = hw::OutputFileAttr::getAsDirectory(
+        &getContext(), dirName.getValue(), /*excludeFromFileList=*/true,
+        /*includeReplicatedOps=*/true);
+    getOperation()->setAttr("firrtl.extract.testbench", testBenchDir);
+  }
 
   state.processRemainingAnnotations(circuit, circuitAnno);
   // Iterate through each operation in the circuit body, transforming any
@@ -549,9 +538,6 @@ void FIRRTLModuleLowering::runOnOperation() {
           if (!loweredMod)
             return signalPassFailure();
           state.oldToNewModuleMap[&op] = loweredMod;
-        })
-        .Case<HierPathOp>([&](auto nla) {
-          // Just drop it.
         })
         .Default([&](Operation *op) {
           // We don't know what this op is.  If it has no illegal FIRRTL types,
@@ -811,10 +797,15 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
     }
   };
 
+  bool needsRandomizeRegInit =
+      state.used_RANDOMIZE_REG_INIT && !disableRegRandomization;
+  bool needsRandomizeMemInit =
+      state.used_RANDOMIZE_MEM_INIT && !disableMemRandomization;
+
   // If none of the macros are needed, then don't emit any header at all, not
   // even the header comment.
-  if (!state.used_RANDOMIZE_GARBAGE_ASSIGN && !state.used_RANDOMIZE_REG_INIT &&
-      !state.used_RANDOMIZE_MEM_INIT && !state.used_PRINTF_COND &&
+  if (!state.used_RANDOMIZE_GARBAGE_ASSIGN && !needsRandomizeRegInit &&
+      !needsRandomizeMemInit && !state.used_PRINTF_COND &&
       !state.used_ASSERT_VERBOSE_COND && !state.used_STOP_COND)
     return;
 
@@ -825,11 +816,11 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
     emitGuardedDefine("RANDOMIZE_GARBAGE_ASSIGN", "RANDOMIZE");
     needRandom = true;
   }
-  if (state.used_RANDOMIZE_REG_INIT) {
+  if (needsRandomizeRegInit) {
     emitGuardedDefine("RANDOMIZE_REG_INIT", "RANDOMIZE");
     needRandom = true;
   }
-  if (state.used_RANDOMIZE_MEM_INIT) {
+  if (needsRandomizeMemInit) {
     emitGuardedDefine("RANDOMIZE_MEM_INIT", "RANDOMIZE");
     needRandom = true;
   }
@@ -924,8 +915,7 @@ LogicalResult FIRRTLModuleLowering::lowerPorts(
                             "not support per field symbols yet.");
         return failure();
       }
-    hwPort.sym = firrtlPort.sym ? firrtlPort.sym.getSymName()
-                                : StringAttr::get(moduleOp->getContext(), "");
+    hwPort.sym = firrtlPort.sym;
 
     // We can't lower all types, so make sure to cleanly reject them.
     if (!hwPort.type) {
@@ -935,8 +925,15 @@ LogicalResult FIRRTLModuleLowering::lowerPorts(
 
     // If this is a zero bit port, just drop it.  It doesn't matter if it is
     // input, output, or inout.  We don't want these at the HW level.
-    if (hwPort.type.isInteger(0))
+    if (hwPort.type.isInteger(0)) {
+      if (hwPort.sym && !hwPort.sym.empty()) {
+        moduleOp->emitError("zero width port ")
+            << hwPort.name << " is referenced by name [" << hwPort.sym
+            << "] (e.g. in an XMR).";
+        return failure();
+      }
       continue;
+    }
 
     // Figure out the direction of the port.
     if (firrtlPort.isOutput()) {
@@ -976,7 +973,7 @@ static ArrayAttr getHWParameters(FExtModuleOp module, bool ignoreValues) {
   SmallVector<Attribute> newParams;
   for (const ParamDeclAttr &entry : params) {
     auto name = entry.getName();
-    auto type = TypeAttr::get(entry.getValue().getType());
+    auto type = entry.getType();
     auto value = ignoreValues ? Attribute() : entry.getValue();
     auto paramAttr =
         hw::ParamDeclAttr::get(builder.getContext(), name, type, value);
@@ -985,104 +982,9 @@ static ArrayAttr getHWParameters(FExtModuleOp module, bool ignoreValues) {
   return builder.getArrayAttr(newParams);
 }
 
-hw::HWModuleExternOp
-FIRRTLModuleLowering::lowerExtModule(FExtModuleOp oldModule,
-                                     Block *topLevelModule,
-                                     CircuitLoweringState &loweringState) {
-  // Map the ports over, lowering their types as we go.
-  SmallVector<PortInfo> firrtlPorts = oldModule.getPorts();
-  SmallVector<hw::PortInfo, 8> ports;
-  if (failed(lowerPorts(firrtlPorts, ports, oldModule, loweringState)))
-    return {};
-
-  StringRef verilogName;
-  if (auto defName = oldModule.getDefname())
-    verilogName = defName.value();
-
-  // Build the new hw.module op.
-  auto builder = OpBuilder::atBlockEnd(topLevelModule);
-  auto nameAttr = builder.getStringAttr(oldModule.getName());
-  // Map over parameters if present.  Drop all values as we do so so there are
-  // no known default values in the extmodule.  This ensures that the
-  // hw.instance will print all the parameters when generating verilog.
-  auto parameters = getHWParameters(oldModule, /*ignoreValues=*/true);
-  auto newModule = builder.create<hw::HWModuleExternOp>(
-      oldModule.getLoc(), nameAttr, ports, verilogName, parameters);
-
-  bool hasOutputPort =
-      llvm::any_of(firrtlPorts, [&](auto p) { return p.isOutput(); });
-  if (!hasOutputPort &&
-      AnnotationSet::removeAnnotations(oldModule, verifBlackBoxAnnoClass) &&
-      loweringState.isInDUT(oldModule))
-    newModule->setAttr("firrtl.extract.cover.extra", builder.getUnitAttr());
-
-  loweringState.processRemainingAnnotations(oldModule,
-                                            AnnotationSet(oldModule));
-  return newModule;
-}
-
-hw::HWModuleExternOp
-FIRRTLModuleLowering::lowerMemModule(FMemModuleOp oldModule,
-                                     Block *topLevelModule,
-                                     CircuitLoweringState &loweringState) {
-  // Map the ports over, lowering their types as we go.
-  SmallVector<PortInfo> firrtlPorts = oldModule.getPorts();
-  SmallVector<hw::PortInfo, 8> ports;
-  if (failed(lowerPorts(firrtlPorts, ports, oldModule, loweringState)))
-    return {};
-
-  // Build the new hw.module op.
-  auto builder = OpBuilder::atBlockEnd(topLevelModule);
-  auto newModule = builder.create<hw::HWModuleExternOp>(
-      oldModule.getLoc(), oldModule.moduleNameAttr(), ports,
-      oldModule.moduleNameAttr());
-  loweringState.processRemainingAnnotations(oldModule,
-                                            AnnotationSet(oldModule));
-  return newModule;
-}
-
-/// Run on each firrtl.module, transforming it from an firrtl.module into an
-/// hw.module, then deleting the old one.
-hw::HWModuleOp
-FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
-                                  CircuitLoweringState &loweringState) {
-  // Map the ports over, lowering their types as we go.
-  SmallVector<PortInfo> firrtlPorts = oldModule.getPorts();
-  SmallVector<hw::PortInfo, 8> ports;
-  if (failed(lowerPorts(firrtlPorts, ports, oldModule, loweringState)))
-    return {};
-
-  // Build the new hw.module op.
-  auto builder = OpBuilder::atBlockEnd(topLevelModule);
-  auto nameAttr = builder.getStringAttr(oldModule.getName());
-  auto newModule =
-      builder.create<hw::HWModuleOp>(oldModule.getLoc(), nameAttr, ports);
-  if (auto outputFile = oldModule->getAttr("output_file"))
-    newModule->setAttr("output_file", outputFile);
-  if (auto comment = oldModule->getAttrOfType<StringAttr>("comment"))
-    newModule.setCommentAttr(comment);
-
-  // If the circuit has an entry point, set all other modules private.
-  // Otherwise, mark all modules as public.
-  SymbolTable::setSymbolVisibility(newModule,
-                                   SymbolTable::getSymbolVisibility(oldModule));
-
-  // Transform module annotations
-  AnnotationSet annos(oldModule);
-
-  if (annos.removeAnnotation(verifBlackBoxAnnoClass))
-    newModule->setAttr("firrtl.extract.cover.extra", builder.getUnitAttr());
-
-  // If this is in the test harness, make sure it goes to the test directory.
-  if (auto testBenchDir = loweringState.getTestBenchDirectory())
-    if (loweringState.isInTestHarness(oldModule)) {
-      newModule->setAttr("output_file", testBenchDir);
-      newModule->setAttr("firrtl.extract.do_not_extract",
-                         builder.getUnitAttr());
-      newModule.setCommentAttr(
-          builder.getStringAttr("VCS coverage exclude_file"));
-    }
-
+bool FIRRTLModuleLowering::handleForceNameAnnos(
+    FModuleLike oldModule, AnnotationSet &annos,
+    CircuitLoweringState &loweringState) {
   bool failed = false;
   // Remove ForceNameAnnotations by generating verilogNames on instances.
   annos.removeAnnotations([&](Annotation anno) {
@@ -1143,8 +1045,117 @@ FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
     }
     return true;
   });
+  return failed;
+}
 
-  if (failed)
+hw::HWModuleExternOp
+FIRRTLModuleLowering::lowerExtModule(FExtModuleOp oldModule,
+                                     Block *topLevelModule,
+                                     CircuitLoweringState &loweringState) {
+  // Map the ports over, lowering their types as we go.
+  SmallVector<PortInfo> firrtlPorts = oldModule.getPorts();
+  SmallVector<hw::PortInfo, 8> ports;
+  if (failed(lowerPorts(firrtlPorts, ports, oldModule, loweringState)))
+    return {};
+
+  StringRef verilogName;
+  if (auto defName = oldModule.getDefname())
+    verilogName = defName.value();
+
+  // Build the new hw.module op.
+  auto builder = OpBuilder::atBlockEnd(topLevelModule);
+  auto nameAttr = builder.getStringAttr(oldModule.getName());
+  // Map over parameters if present.  Drop all values as we do so, so there are
+  // no known default values in the extmodule.  This ensures that the
+  // hw.instance will print all the parameters when generating verilog.
+  auto parameters = getHWParameters(oldModule, /*ignoreValues=*/true);
+  auto newModule = builder.create<hw::HWModuleExternOp>(
+      oldModule.getLoc(), nameAttr, ports, verilogName, parameters);
+  SymbolTable::setSymbolVisibility(newModule,
+                                   SymbolTable::getSymbolVisibility(oldModule));
+
+  bool hasOutputPort =
+      llvm::any_of(firrtlPorts, [&](auto p) { return p.isOutput(); });
+  if (!hasOutputPort &&
+      AnnotationSet::removeAnnotations(oldModule, verifBlackBoxAnnoClass) &&
+      loweringState.isInDUT(oldModule))
+    newModule->setAttr("firrtl.extract.cover.extra", builder.getUnitAttr());
+
+  AnnotationSet annos(oldModule);
+  if (handleForceNameAnnos(oldModule, annos, loweringState))
+    return {};
+
+  loweringState.processRemainingAnnotations(oldModule, annos);
+  return newModule;
+}
+
+hw::HWModuleExternOp
+FIRRTLModuleLowering::lowerMemModule(FMemModuleOp oldModule,
+                                     Block *topLevelModule,
+                                     CircuitLoweringState &loweringState) {
+  // Map the ports over, lowering their types as we go.
+  SmallVector<PortInfo> firrtlPorts = oldModule.getPorts();
+  SmallVector<hw::PortInfo, 8> ports;
+  if (failed(lowerPorts(firrtlPorts, ports, oldModule, loweringState)))
+    return {};
+
+  // Build the new hw.module op.
+  auto builder = OpBuilder::atBlockEnd(topLevelModule);
+  auto newModule = builder.create<hw::HWModuleExternOp>(
+      oldModule.getLoc(), oldModule.moduleNameAttr(), ports,
+      oldModule.moduleNameAttr());
+  loweringState.processRemainingAnnotations(oldModule,
+                                            AnnotationSet(oldModule));
+  return newModule;
+}
+
+/// Run on each firrtl.module, transforming it from an firrtl.module into an
+/// hw.module, then deleting the old one.
+hw::HWModuleOp
+FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
+                                  CircuitLoweringState &loweringState) {
+  // Map the ports over, lowering their types as we go.
+  SmallVector<PortInfo> firrtlPorts = oldModule.getPorts();
+  SmallVector<hw::PortInfo, 8> ports;
+  if (failed(lowerPorts(firrtlPorts, ports, oldModule, loweringState)))
+    return {};
+
+  // Build the new hw.module op.
+  auto builder = OpBuilder::atBlockEnd(topLevelModule);
+  auto nameAttr = builder.getStringAttr(oldModule.getName());
+  auto newModule =
+      builder.create<hw::HWModuleOp>(oldModule.getLoc(), nameAttr, ports);
+  if (auto outputFile = oldModule->getAttr("output_file"))
+    newModule->setAttr("output_file", outputFile);
+  if (auto comment = oldModule->getAttrOfType<StringAttr>("comment"))
+    newModule.setCommentAttr(comment);
+
+  // Pass along the number of random initialization bits needed for this module.
+  if (auto randomWidth = oldModule->getAttr("firrtl.random_init_width"))
+    newModule->setAttr("firrtl.random_init_width", randomWidth);
+
+  // If the circuit has an entry point, set all other modules private.
+  // Otherwise, mark all modules as public.
+  SymbolTable::setSymbolVisibility(newModule,
+                                   SymbolTable::getSymbolVisibility(oldModule));
+
+  // Transform module annotations
+  AnnotationSet annos(oldModule);
+
+  if (annos.removeAnnotation(verifBlackBoxAnnoClass))
+    newModule->setAttr("firrtl.extract.cover.extra", builder.getUnitAttr());
+
+  // If this is in the test harness, make sure it goes to the test directory.
+  if (auto testBenchDir = loweringState.getTestBenchDirectory())
+    if (loweringState.isInTestHarness(oldModule)) {
+      newModule->setAttr("output_file", testBenchDir);
+      newModule->setAttr("firrtl.extract.do_not_extract",
+                         builder.getUnitAttr());
+      newModule.setCommentAttr(
+          builder.getStringAttr("VCS coverage exclude_file"));
+    }
+
+  if (handleForceNameAnnos(oldModule, annos, loweringState))
     return {};
 
   loweringState.processRemainingAnnotations(oldModule, annos);
@@ -1228,25 +1239,32 @@ static Value tryEliminatingConnectsToValue(Value flipValue,
 
   auto connectSrc = connectOp->getOperand(1);
 
+  // Directly forward foreign types.
+  if (!connectSrc.getType().isa<FIRRTLType>()) {
+    connectOp->erase();
+    return connectSrc;
+  }
+
   // Convert fliped sources to passive sources.
-  if (!connectSrc.getType().cast<FIRRTLType>().isPassive())
+  if (!connectSrc.getType().cast<FIRRTLBaseType>().isPassive())
     connectSrc =
         builder
             .create<mlir::UnrealizedConversionCastOp>(
-                connectSrc.getType().cast<FIRRTLType>().getPassiveType(),
+                connectSrc.getType().cast<FIRRTLBaseType>().getPassiveType(),
                 connectSrc)
             .getResult(0);
 
   // We know it must be the destination operand due to the types, but the
   // source may not match the destination width.
-  auto destTy = flipValue.getType().cast<FIRRTLType>().getPassiveType();
+  auto destTy = flipValue.getType().cast<FIRRTLBaseType>().getPassiveType();
 
   if (!destTy.isGround()) {
     // If types are not ground type and they don't match, we give up.
     if (destTy != connectSrc.getType().cast<FIRRTLType>())
       return {};
-  } else if (destTy.getBitWidthOrSentinel() !=
-             connectSrc.getType().cast<FIRRTLType>().getBitWidthOrSentinel()) {
+  } else if (destTy.getBitWidthOrSentinel() != connectSrc.getType()
+                                                   .cast<FIRRTLBaseType>()
+                                                   .getBitWidthOrSentinel()) {
     // The only type mismatchs we care about is due to integer width
     // differences.
     auto destWidth = destTy.getBitWidthOrSentinel();
@@ -1315,7 +1333,8 @@ FIRRTLModuleLowering::lowerModuleBody(FModuleOp oldModule,
     auto oldArg = oldModule.getBody().getArgument(firrtlArg++);
 
     bool isZeroWidth =
-        port.type.cast<FIRRTLType>().getBitWidthOrSentinel() == 0;
+        port.type.isa<FIRRTLBaseType>() &&
+        port.type.cast<FIRRTLBaseType>().getBitWidthOrSentinel() == 0;
 
     if (!port.isOutput() && !isZeroWidth) {
       // Inputs and InOuts are modeled as arguments in the result, so we can
@@ -1417,8 +1436,8 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   void runWithInsertionPointAtEndOfBlock(std::function<void(void)> fn,
                                          Region &region);
 
-  /// Return an `sv::ReadInOutOp` for the specified value, auto-uniquing them.
-  Value getReadInOutOp(Value v);
+  /// Return a read value for the specified inout value, auto-uniquing them.
+  Value getReadValue(Value v);
 
   void addToAlwaysBlock(sv::EventControl clockEdge, Value clock,
                         ::ResetType resetStyle, sv::EventControl resetEdge,
@@ -1433,13 +1452,12 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   void addToIfDefBlock(StringRef cond, std::function<void(void)> thenCtor,
                        std::function<void(void)> elseCtor = {});
   void addToInitialBlock(std::function<void(void)> body);
-  void addToIfDefProceduralBlock(StringRef cond,
-                                 std::function<void(void)> thenCtor,
-                                 std::function<void(void)> elseCtor = {});
   void addIfProceduralBlock(Value cond, std::function<void(void)> thenCtor,
                             std::function<void(void)> elseCtor = {});
-  Value getExtOrTruncAggregateValue(Value array, FIRRTLType sourceType,
-                                    FIRRTLType destType, bool allowTruncate);
+  Value getExtOrTruncAggregateValue(Value array, FIRRTLBaseType sourceType,
+                                    FIRRTLBaseType destType,
+                                    bool allowTruncate);
+  Value createArrayIndexing(Value array, Value index);
 
   // Create a temporary wire at the current insertion point, and try to
   // eliminate it later as part of lowering post processing.
@@ -1463,6 +1481,9 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   LogicalResult visitExpr(SubindexOp op);
   LogicalResult visitExpr(SubaccessOp op);
   LogicalResult visitExpr(SubfieldOp op);
+  LogicalResult visitExpr(VectorCreateOp op);
+  LogicalResult visitExpr(BundleCreateOp op);
+  LogicalResult visitExpr(AggregateConstantOp op);
   LogicalResult visitUnhandledOp(Operation *op) { return failure(); }
   LogicalResult visitInvalidOp(Operation *op) { return failure(); }
 
@@ -1549,7 +1570,7 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   }
 
   // Verif Operations
-  LogicalResult visitExpr(IsXVerifOp op);
+  LogicalResult visitExpr(IsXIntrinsicOp op);
 
   // Other Operations
   LogicalResult visitExpr(BitsPrimOp op);
@@ -1617,7 +1638,7 @@ private:
   /// We auto-unique "ReadInOut" ops from wires and regs, enabling
   /// optimizations and CSEs of the read values to be more obvious.  This
   /// caches a known ReadInOutOp for the given value and is managed by
-  /// `getReadInOutOp(v)`.
+  /// `getReadValue(v)`.
   DenseMap<Value, Value> readInOutCreated;
 
   // We auto-unique graph-level blocks to reduce the amount of generated
@@ -1803,8 +1824,7 @@ Value FIRRTLLowering::getOrCreateIntConstant(const APInt &value) {
 /// zero bit, or returns failure() if it was some other kind of failure.
 static LogicalResult handleZeroBit(Value failedOperand,
                                    std::function<LogicalResult()> fn) {
-  assert(failedOperand && failedOperand.getType().isa<FIRRTLType>() &&
-         "Should be called on the failed FIRRTL operand");
+  assert(failedOperand && "Should be called on the failed operand");
   if (!isZeroBitFIRRTLType(failedOperand.getType()))
     return failure();
   return fn();
@@ -1853,7 +1873,7 @@ Value FIRRTLLowering::getLoweredValue(Value value) {
   // If we got an inout value, implicitly read it.  FIRRTL allows direct use
   // of wires and other things that lower to inout type.
   if (result.getType().isa<hw::InOutType>())
-    return getReadInOutOp(result);
+    return getReadValue(result);
 
   return result;
 }
@@ -1862,13 +1882,14 @@ Value FIRRTLLowering::getLoweredValue(Value value) {
 /// `destType`. We have to care about the extension/truncation/signedness of
 /// each element.
 Value FIRRTLLowering::getExtOrTruncAggregateValue(Value array,
-                                                  FIRRTLType sourceType,
-                                                  FIRRTLType destType,
+                                                  FIRRTLBaseType sourceType,
+                                                  FIRRTLBaseType destType,
                                                   bool allowTruncate) {
   SmallVector<Value> resultBuffer;
 
   // Helper function to cast each element of array to dest type.
-  auto cast = [&](Value value, FIRRTLType sourceType, FIRRTLType destType) {
+  auto cast = [&](Value value, FIRRTLBaseType sourceType,
+                  FIRRTLBaseType destType) {
     auto srcWidth = sourceType.cast<IntType>().getWidthOrSentinel();
     auto destWidth = destType.cast<IntType>().getWidthOrSentinel();
     auto resultType = builder.getIntegerType(destWidth);
@@ -1891,9 +1912,10 @@ Value FIRRTLLowering::getExtOrTruncAggregateValue(Value array,
   };
 
   // This recursive function constructs the output array.
-  std::function<LogicalResult(Value, FIRRTLType, FIRRTLType)> recurse =
-      [&](Value src, FIRRTLType srcType, FIRRTLType destType) -> LogicalResult {
-    return TypeSwitch<FIRRTLType, LogicalResult>(srcType)
+  std::function<LogicalResult(Value, FIRRTLBaseType, FIRRTLBaseType)> recurse =
+      [&](Value src, FIRRTLBaseType srcType,
+          FIRRTLBaseType destType) -> LogicalResult {
+    return TypeSwitch<FIRRTLBaseType, LogicalResult>(srcType)
         .Case<FVectorType>([&](auto srcVectorType) {
           auto destVectorType = destType.cast<FVectorType>();
           unsigned size = resultBuffer.size();
@@ -1963,11 +1985,12 @@ Value FIRRTLLowering::getExtOrTruncAggregateValue(Value array,
 /// This returns a null value for FIRRTL values that cannot be lowered, e.g.
 /// unknown width integers.
 Value FIRRTLLowering::getLoweredAndExtendedValue(Value value, Type destType) {
-  assert(value.getType().isa<FIRRTLType>() && destType.isa<FIRRTLType>() &&
+  assert(value.getType().isa<FIRRTLBaseType>() &&
+         destType.isa<FIRRTLBaseType>() &&
          "input/output value should be FIRRTL");
 
   // We only know how to extend integer types with known width.
-  auto destWidth = destType.cast<FIRRTLType>().getBitWidthOrSentinel();
+  auto destWidth = destType.cast<FIRRTLBaseType>().getBitWidthOrSentinel();
   if (destWidth == -1)
     return {};
 
@@ -1992,9 +2015,10 @@ Value FIRRTLLowering::getLoweredAndExtendedValue(Value value, Type destType) {
     if (destType == value.getType())
       return result;
 
-    return getExtOrTruncAggregateValue(
-        result, value.getType().cast<FIRRTLType>(), destType.cast<FIRRTLType>(),
-        /* allowTruncate */ false);
+    return getExtOrTruncAggregateValue(result,
+                                       value.getType().cast<FIRRTLBaseType>(),
+                                       destType.cast<FIRRTLBaseType>(),
+                                       /* allowTruncate */ false);
   }
 
   auto srcWidth = result.getType().cast<IntegerType>().getWidth();
@@ -2009,7 +2033,7 @@ Value FIRRTLLowering::getLoweredAndExtendedValue(Value value, Type destType) {
   auto resultType = builder.getIntegerType(destWidth);
 
   // Extension follows the sign of the source value, not the destination.
-  auto valueFIRType = value.getType().cast<FIRRTLType>().getPassiveType();
+  auto valueFIRType = value.getType().cast<FIRRTLBaseType>().getPassiveType();
   if (valueFIRType.cast<IntType>().isSigned())
     return comb::createOrFoldSExt(result, resultType, builder);
 
@@ -2023,11 +2047,12 @@ Value FIRRTLLowering::getLoweredAndExtendedValue(Value value, Type destType) {
 /// This returns a null value for FIRRTL values that cannot be lowered, e.g.
 /// unknown width integers.
 Value FIRRTLLowering::getLoweredAndExtOrTruncValue(Value value, Type destType) {
-  assert(value.getType().isa<FIRRTLType>() && destType.isa<FIRRTLType>() &&
+  assert(value.getType().isa<FIRRTLBaseType>() &&
+         destType.isa<FIRRTLBaseType>() &&
          "input/output value should be FIRRTL");
 
   // We only know how to adjust integer types with known width.
-  auto destWidth = destType.cast<FIRRTLType>().getBitWidthOrSentinel();
+  auto destWidth = destType.cast<FIRRTLBaseType>().getBitWidthOrSentinel();
   if (destWidth == -1)
     return {};
 
@@ -2052,9 +2077,10 @@ Value FIRRTLLowering::getLoweredAndExtOrTruncValue(Value value, Type destType) {
     if (destType == value.getType())
       return result;
 
-    return getExtOrTruncAggregateValue(
-        result, value.getType().cast<FIRRTLType>(), destType.cast<FIRRTLType>(),
-        /* allowTruncate */ true);
+    return getExtOrTruncAggregateValue(result,
+                                       value.getType().cast<FIRRTLBaseType>(),
+                                       destType.cast<FIRRTLBaseType>(),
+                                       /* allowTruncate */ true);
   }
 
   auto srcWidth = result.getType().cast<IntegerType>().getWidth();
@@ -2072,7 +2098,7 @@ Value FIRRTLLowering::getLoweredAndExtOrTruncValue(Value value, Type destType) {
   auto resultType = builder.getIntegerType(destWidth);
 
   // Extension follows the sign of the source value, not the destination.
-  auto valueFIRType = value.getType().cast<FIRRTLType>().getPassiveType();
+  auto valueFIRType = value.getType().cast<FIRRTLBaseType>().getPassiveType();
   if (valueFIRType.cast<IntType>().isSigned())
     return comb::createOrFoldSExt(result, resultType, builder);
 
@@ -2092,8 +2118,9 @@ LogicalResult FIRRTLLowering::setLowering(Value orig, Value result) {
            "Lowering didn't turn a FIRRTL value into a non-FIRRTL value");
 
 #ifndef NDEBUG
-    auto srcWidth =
-        origType.cast<FIRRTLType>().getPassiveType().getBitWidthOrSentinel();
+    // Only base types should reach this point.
+    auto baseType = origType.cast<FIRRTLBaseType>();
+    auto srcWidth = baseType.getPassiveType().getBitWidthOrSentinel();
 
     // Caller should pass null value iff this was a zero bit value.
     if (srcWidth != -1) {
@@ -2189,24 +2216,35 @@ void FIRRTLLowering::runWithInsertionPointAtEndOfBlock(
   builder.restoreInsertionPoint(oldIP);
 }
 
-/// Return an `sv::ReadInOutOp` for the specified value, auto-uniquing them.
-Value FIRRTLLowering::getReadInOutOp(Value v) {
-  Value &result = readInOutCreated[v];
+/// Return a read value for the specified inout operation, auto-uniquing them.
+Value FIRRTLLowering::getReadValue(Value v) {
+  Value result = readInOutCreated.lookup(v);
   if (result)
     return result;
 
-  // Make sure to put the "ReadInOut" at the correct scope so it dominates all
+  // Make sure to put the read value at the correct scope so it dominates all
   // future uses.
   auto oldIP = builder.saveInsertionPoint();
   if (auto *vOp = v.getDefiningOp()) {
     builder.setInsertionPointAfter(vOp);
   } else {
-    // For reads of ports, just put the ReadInOut at the top of the module.
+    // For reads of ports, just set the insertion point at the top of the
+    // module.
     builder.setInsertionPoint(&theModule.getBodyBlock()->front());
   }
 
-  result = builder.createOrFold<sv::ReadInOutOp>(v);
+  // Instead of creating `ReadInOutOp` for `ArrayIndexInOutOp`, create
+  // `ArrayGetOp` for root arrays.
+  if (auto arrayIndexInout = v.getDefiningOp<sv::ArrayIndexInOutOp>()) {
+    result = getReadValue(arrayIndexInout.getInput());
+    result = builder.createOrFold<hw::ArrayGetOp>(result,
+                                                  arrayIndexInout.getIndex());
+  } else {
+    // Otherwise, create a read inout operation.
+    result = builder.createOrFold<sv::ReadInOutOp>(v);
+  }
   builder.restoreInsertionPoint(oldIP);
+  readInOutCreated.insert({v, result});
   return result;
 }
 
@@ -2310,24 +2348,6 @@ void FIRRTLLowering::addToInitialBlock(std::function<void(void)> body) {
   }
 }
 
-void FIRRTLLowering::addToIfDefProceduralBlock(
-    StringRef cond, std::function<void(void)> thenCtor,
-    std::function<void(void)> elseCtor) {
-  // Check to see if we already have an ifdef on this condition immediately
-  // before the insertion point.  If so, extend it.
-  auto insertIt = builder.getInsertionPoint();
-  if (insertIt != builder.getBlock()->begin())
-    if (auto ifdef = dyn_cast<sv::IfDefProceduralOp>(*--insertIt)) {
-      if (ifdef.getCond().getIdent() == cond) {
-        runWithInsertionPointAtEndOfBlock(thenCtor, ifdef.getThenRegion());
-        runWithInsertionPointAtEndOfBlock(elseCtor, ifdef.getElseRegion());
-        return;
-      }
-    }
-
-  builder.create<sv::IfDefProceduralOp>(cond, thenCtor, elseCtor);
-}
-
 void FIRRTLLowering::addIfProceduralBlock(Value cond,
                                           std::function<void(void)> thenCtor,
                                           std::function<void(void)> elseCtor) {
@@ -2381,7 +2401,7 @@ FIRRTLLowering::handleUnloweredOp(Operation *op) {
   // them all right here.
   if (op->getNumResults() == 1) {
     auto resultType = op->getResult(0).getType();
-    if (resultType.isa<FIRRTLType>() && isZeroBitFIRRTLType(resultType) &&
+    if (resultType.isa<FIRRTLBaseType>() && isZeroBitFIRRTLType(resultType) &&
         (isExpression(op) || isa<mlir::UnrealizedConversionCastOp>(op))) {
       // Zero bit values lower to the null Value.
       (void)setLowering(op->getResult(0), Value());
@@ -2434,7 +2454,13 @@ LogicalResult FIRRTLLowering::visitExpr(SubaccessOp op) {
 
   auto resultType = lowerType(op->getResult(0).getType());
   Value value = getPossiblyInoutLoweredValue(op.getInput());
-  Value valueIdx = getLoweredValue(op.getIndex());
+  Value valueIdx = getLoweredAndExtOrTruncValue(
+      op.getIndex(),
+      UIntType::get(
+          op.getContext(),
+          getBitWidthFromVectorSize(
+              op.getInput().getType().cast<FVectorType>().getNumElements())));
+
   if (!resultType || !value || !valueIdx) {
     op.emitError() << "input lowering failed";
     return failure();
@@ -2443,8 +2469,8 @@ LogicalResult FIRRTLLowering::visitExpr(SubaccessOp op) {
   // If the value has an inout type, we need to lower to ArrayIndexInOutOp.
   if (value.getType().isa<sv::InOutType>())
     return setLoweringTo<sv::ArrayIndexInOutOp>(op, value, valueIdx);
-  // Otherwise, hw::ArrayGetOp
-  return setLoweringTo<hw::ArrayGetOp>(op, value, valueIdx);
+  // Otherwise, lower the op to array indexing.
+  return setLowering(op, createArrayIndexing(value, valueIdx));
 }
 
 LogicalResult FIRRTLLowering::visitExpr(SubfieldOp op) {
@@ -2475,11 +2501,63 @@ LogicalResult FIRRTLLowering::visitExpr(SubfieldOp op) {
           op.getFieldIndex()));
 }
 
+LogicalResult FIRRTLLowering::visitExpr(VectorCreateOp op) {
+  auto resultType = lowerType(op.getResult().getType());
+  SmallVector<Value> operands;
+  // NOTE: The operand order must be inverted.
+  for (auto oper : llvm::reverse(op.getOperands())) {
+    auto val = getLoweredValue(oper);
+    if (!val)
+      return failure();
+    operands.push_back(val);
+  }
+  return setLoweringTo<hw::ArrayCreateOp>(op, resultType, operands);
+}
+
+LogicalResult FIRRTLLowering::visitExpr(BundleCreateOp op) {
+  auto resultType = lowerType(op.getResult().getType());
+  SmallVector<Value> operands;
+  for (auto oper : op.getOperands()) {
+    auto val = getLoweredValue(oper);
+    if (!val)
+      return failure();
+    operands.push_back(val);
+  }
+  return setLoweringTo<hw::StructCreateOp>(op, resultType, operands);
+}
+
+LogicalResult FIRRTLLowering::visitExpr(AggregateConstantOp op) {
+  auto resultType = lowerType(op.getResult().getType());
+  auto vec = op.getType().dyn_cast<FVectorType>();
+  // Currently we only support 1d vector types.
+  if (!vec || !vec.getElementType().isa<IntType>()) {
+    op.emitError()
+        << "has an unsupported type; currently we only support 1d vectors";
+    return failure();
+  }
+
+  // TODO: Use hw aggregate constant
+  SmallVector<Value> operands;
+  // Make sure to reverse the operands.
+  for (auto elem : llvm::reverse(op.getFields()))
+    operands.push_back(
+        getOrCreateIntConstant(elem.cast<IntegerAttr>().getValue()));
+
+  return setLoweringTo<hw::ArrayCreateOp>(op, resultType, operands);
+}
+
 //===----------------------------------------------------------------------===//
 // Declarations
 //===----------------------------------------------------------------------===//
 
 LogicalResult FIRRTLLowering::visitDecl(WireOp op) {
+  // Foreign types lower to a backedge that needs to be resolved by a later
+  // connect op.
+  if (!op.getType().isa<FIRRTLType>()) {
+    createBackedge(op, op.getType());
+    return success();
+  }
+
   auto resultType = lowerType(op.getResult().getType());
   if (!resultType)
     return failure();
@@ -2578,13 +2656,24 @@ LogicalResult FIRRTLLowering::visitDecl(RegOp op) {
 
   // Add symbol if DontTouch annotation present.
   auto symName = getInnerSymName(op);
-  if (AnnotationSet::removeAnnotations(op, dontTouchAnnoClass) && !symName)
+  if ((AnnotationSet::removeAnnotations(op, dontTouchAnnoClass) ||
+       op.getNameKind() == NameKindEnum::InterestingName) &&
+      !symName)
     symName = op.getNameAttr();
 
   // Create a reg op, wiring itself to its input.
   Backedge inputEdge = backedgeBuilder.get(resultType);
   auto reg = builder.create<seq::FirRegOp>(inputEdge, clockVal,
                                            op.getNameAttr(), symName);
+
+  // Pass along the start and end random initialization bits for this register.
+  if (auto randomRegister = op->getAttr("firrtl.random_init_register"))
+    reg->setAttr("firrtl.random_init_register", randomRegister);
+  if (auto randomStart = op->getAttr("firrtl.random_init_start"))
+    reg->setAttr("firrtl.random_init_start", randomStart);
+  if (auto randomEnd = op->getAttr("firrtl.random_init_end"))
+    reg->setAttr("firrtl.random_init_end", randomEnd);
+
   inputEdge.setValue(reg);
   circuitState.used_RANDOMIZE_REG_INIT = 1;
   regMapping.try_emplace(op, reg);
@@ -2603,13 +2692,15 @@ LogicalResult FIRRTLLowering::visitDecl(RegResetOp op) {
   Value resetSignal = getLoweredValue(op.getResetSignal());
   // Reset values may be narrower than the register.  Extend appropriately.
   Value resetValue = getLoweredAndExtOrTruncValue(
-      op.getResetValue(), op.getType().cast<FIRRTLType>());
+      op.getResetValue(), op.getType().cast<FIRRTLBaseType>());
 
   if (!clockVal || !resetSignal || !resetValue)
     return failure();
 
   auto symName = getInnerSymName(op);
-  if (AnnotationSet::removeAnnotations(op, dontTouchAnnoClass) && !symName)
+  if ((AnnotationSet::removeAnnotations(op, dontTouchAnnoClass) ||
+       op.getNameKind() == NameKindEnum::InterestingName) &&
+      !symName)
     symName = op.getNameAttr();
 
   // Create a reg op, wiring itself to its input.
@@ -2618,6 +2709,15 @@ LogicalResult FIRRTLLowering::visitDecl(RegResetOp op) {
   auto reg =
       builder.create<seq::FirRegOp>(inputEdge, clockVal, op.getNameAttr(),
                                     resetSignal, resetValue, symName, isAsync);
+
+  // Pass along the start and end random initialization bits for this register.
+  if (auto randomRegister = op->getAttr("firrtl.random_init_register"))
+    reg->setAttr("firrtl.random_init_register", randomRegister);
+  if (auto randomStart = op->getAttr("firrtl.random_init_start"))
+    reg->setAttr("firrtl.random_init_start", randomStart);
+  if (auto randomEnd = op->getAttr("firrtl.random_init_end"))
+    reg->setAttr("firrtl.random_init_end", randomEnd);
+
   inputEdge.setValue(reg);
   circuitState.used_RANDOMIZE_REG_INIT = 1;
   regMapping.try_emplace(op, reg);
@@ -2633,7 +2733,10 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
 
   // TODO: Remove this restriction and preserve aggregates in
   // memories.
-  if (op.getDataType().cast<FIRRTLType>().getPassiveType().isa<BundleType>())
+  if (op.getDataType()
+          .cast<FIRRTLBaseType>()
+          .getPassiveType()
+          .isa<BundleType>())
     return op.emitOpError(
         "should have already been lowered from a ground type to an aggregate "
         "type using the LowerTypes pass. Use "
@@ -2694,14 +2797,14 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
 
         for (auto a : accesses) {
           if (a.getType()
-                  .cast<FIRRTLType>()
+                  .cast<FIRRTLBaseType>()
                   .getPassiveType()
                   .getBitWidthOrSentinel() > 0)
             (void)setLowering(a, wire);
           else
             a->eraseOperand(0);
         }
-        wire = getReadInOutOp(wire);
+        wire = getReadValue(wire);
         if (!field2.empty()) {
           // This handles the case, when the single bit mask field is removed,
           // and the enable is updated after 'And' with mask bit.
@@ -2711,14 +2814,15 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
 
           for (auto a : accesses2) {
             if (a.getType()
-                    .cast<FIRRTLType>()
+                    .cast<FIRRTLBaseType>()
                     .getPassiveType()
                     .getBitWidthOrSentinel() > 0)
               (void)setLowering(a, wire2);
             else
               a->eraseOperand(0);
           }
-          wire = builder.createOrFold<comb::AndOp>(wire, getReadInOutOp(wire2));
+          wire = builder.createOrFold<comb::AndOp>(wire, getReadValue(wire2),
+                                                   true);
         }
 
         operands.push_back(wire);
@@ -2806,7 +2910,8 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
       circuitState.getInstanceGraph()->getReferencedModule(oldInstance);
   auto newModule = circuitState.getNewModule(oldModule);
   if (!newModule) {
-    oldInstance->emitOpError("could not find module referenced by instance");
+    oldInstance->emitOpError("could not find module [")
+        << oldInstance.getModuleName() << "] referenced by instance";
     return failure();
   }
 
@@ -2868,6 +2973,12 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
       }
     }
 
+    // Directly materialize foreign types.
+    if (!port.type.isa<FIRRTLType>()) {
+      operands.push_back(createBackedge(portResult, portType));
+      continue;
+    }
+
     // Create a wire for each input/inout operand, so there is
     // something to connect to.
     Value wire =
@@ -2879,7 +2990,7 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
 
     // inout ports directly use the wire, but normal inputs read it.
     if (!port.isInOut())
-      wire = getReadInOutOp(wire);
+      wire = getReadValue(wire);
 
     operands.push_back(wire);
   }
@@ -3041,7 +3152,7 @@ LogicalResult FIRRTLLowering::visitExpr(NotPrimOp op) {
   // ~x  ---> x ^ 0xFF
   auto allOnes = getOrCreateIntConstant(
       APInt::getAllOnes(operand.getType().getIntOrFloatBitWidth()));
-  return setLoweringTo<comb::XorOp>(op, operand, allOnes);
+  return setLoweringTo<comb::XorOp>(op, operand, allOnes, true);
 }
 
 LogicalResult FIRRTLLowering::visitExpr(NegPrimOp op) {
@@ -3054,7 +3165,7 @@ LogicalResult FIRRTLLowering::visitExpr(NegPrimOp op) {
   auto resultType = lowerType(op.getType());
 
   auto zero = getOrCreateIntConstant(resultType.getIntOrFloatBitWidth(), 0);
-  return setLoweringTo<comb::SubOp>(op, zero, operand);
+  return setLoweringTo<comb::SubOp>(op, zero, operand, true);
 }
 
 // Pad is a noop or extension operation.
@@ -3089,7 +3200,8 @@ LogicalResult FIRRTLLowering::visitExpr(AndRPrimOp op) {
   return setLoweringTo<comb::ICmpOp>(
       op, ICmpPredicate::eq, operand,
       getOrCreateIntConstant(
-          APInt::getAllOnes(operand.getType().getIntOrFloatBitWidth())));
+          APInt::getAllOnes(operand.getType().getIntOrFloatBitWidth())),
+      true);
 }
 
 LogicalResult FIRRTLLowering::visitExpr(OrRPrimOp op) {
@@ -3104,7 +3216,8 @@ LogicalResult FIRRTLLowering::visitExpr(OrRPrimOp op) {
   // Lower OrR to != 0
   return setLoweringTo<comb::ICmpOp>(
       op, ICmpPredicate::ne, operand,
-      getOrCreateIntConstant(operand.getType().getIntOrFloatBitWidth(), 0));
+      getOrCreateIntConstant(operand.getType().getIntOrFloatBitWidth(), 0),
+      true);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3119,7 +3232,7 @@ LogicalResult FIRRTLLowering::lowerBinOpToVariadic(Operation *op) {
   if (!lhs || !rhs)
     return failure();
 
-  return setLoweringTo<ResultOpType>(op, lhs, rhs);
+  return setLoweringTo<ResultOpType>(op, lhs, rhs, true);
 }
 
 /// lowerBinOp extends each operand to the destination type, then performs the
@@ -3135,8 +3248,8 @@ LogicalResult FIRRTLLowering::lowerBinOp(Operation *op) {
 
   // Emit the result operation.
   if (resultType.cast<IntType>().isSigned())
-    return setLoweringTo<ResultSignedOpType>(op, lhs, rhs);
-  return setLoweringTo<ResultUnsignedOpType>(op, lhs, rhs);
+    return setLoweringTo<ResultSignedOpType>(op, lhs, rhs, true);
+  return setLoweringTo<ResultUnsignedOpType>(op, lhs, rhs, true);
 }
 
 /// lowerCmpOp extends each operand to the longest type, then performs the
@@ -3160,7 +3273,8 @@ LogicalResult FIRRTLLowering::lowerCmpOp(Operation *op, ICmpPredicate signedOp,
   // Emit the result operation.
   Type resultType = builder.getIntegerType(1);
   return setLoweringTo<comb::ICmpOp>(
-      op, resultType, lhsIntType.isSigned() ? signedOp : unsignedOp, lhs, rhs);
+      op, resultType, lhsIntType.isSigned() ? signedOp : unsignedOp, lhs, rhs,
+      true);
 }
 
 /// Lower a divide or dynamic shift, where the operation has to be performed
@@ -3183,9 +3297,11 @@ LogicalResult FIRRTLLowering::lowerDivLikeOp(Operation *op) {
 
   Value result;
   if (opType.isSigned())
-    result = builder.createOrFold<SignedOp>(lhs, rhs);
+    result = builder.createOrFold<SignedOp>(lhs, rhs, true);
   else
-    result = builder.createOrFold<UnsignedOp>(lhs, rhs);
+    result = builder.createOrFold<UnsignedOp>(lhs, rhs, true);
+
+  tryCopyName(result.getDefiningOp(), op);
 
   if (resultType == opType)
     return setLowering(op->getResult(0), result);
@@ -3215,14 +3331,14 @@ LogicalResult FIRRTLLowering::visitExpr(CatPrimOp op) {
 // Verif Operations
 //===----------------------------------------------------------------------===//
 
-LogicalResult FIRRTLLowering::visitExpr(IsXVerifOp op) {
+LogicalResult FIRRTLLowering::visitExpr(IsXIntrinsicOp op) {
   auto input = getLoweredValue(op.getArg());
   if (!input)
     return failure();
 
   return setLoweringTo<comb::ICmpOp>(
       op, ICmpPredicate::ceq, input,
-      getOrCreateXConstant(input.getType().getIntOrFloatBitWidth()));
+      getOrCreateXConstant(input.getType().getIntOrFloatBitWidth()), true);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3252,13 +3368,14 @@ LogicalResult FIRRTLLowering::visitExpr(InvalidValueOp op) {
     return setLoweringTo<sv::WireOp>(op, resultTy, ".invalid_analog");
 
   // We don't allow aggregate values which contain values of analog types.
-  if (op.getType().cast<FIRRTLType>().containsAnalog())
+  if (op.getType().cast<FIRRTLBaseType>().containsAnalog())
     return failure();
 
   // We lower invalid to 0.  TODO: the FIRRTL spec mentions something about
   // lowering it to a random value, we should see if this is what we need to
   // do.
-  if (auto bitwidth = firrtl::getBitWidth(op.getType().cast<FIRRTLType>())) {
+  if (auto bitwidth =
+          firrtl::getBitWidth(op.getType().cast<FIRRTLBaseType>())) {
     if (bitwidth.value() == 0) // Let the caller handle zero width values.
       return failure();
 
@@ -3344,8 +3461,59 @@ LogicalResult FIRRTLLowering::visitExpr(MuxPrimOp op) {
   if (!cond || !ifTrue || !ifFalse)
     return failure();
 
-  return setLoweringTo<comb::MuxOp>(op, ifTrue.getType(), cond, ifTrue,
-                                    ifFalse);
+  return setLoweringTo<comb::MuxOp>(op, ifTrue.getType(), cond, ifTrue, ifFalse,
+                                    true);
+}
+
+// Construct array indexing annotated with vendor pragmas to get
+// better synthesis results. Specifically we annotate pragmas in the following
+// form.
+// ```
+//   wire GEN;
+//   /* synopsys infer_mux_override */
+//   assign GEN = array[index] /* cadence map_to_mux */;
+// ```
+Value FIRRTLLowering::createArrayIndexing(Value array, Value index) {
+
+  auto size = hw::type_cast<hw::ArrayType>(array.getType()).getSize();
+  // Extend to power of 2.  FIRRTL semantics say out-of-bounds access result in
+  // an indeterminate value.  Existing chisel code depends on this behavior
+  // being "return index 0".  Ideally, we would tail extend the array to improve
+  // optimization.
+  if (!llvm::isPowerOf2_64(size)) {
+    auto extElem = getOrCreateIntConstant(APInt(llvm::Log2_64_Ceil(size), 0));
+    auto extValue = builder.create<hw::ArrayGetOp>(array, extElem);
+    SmallVector<Value> temp(llvm::NextPowerOf2(size) - size, extValue);
+    auto ext = builder.create<hw::ArrayCreateOp>(temp);
+    Value temp2[] = {ext.getResult(), array};
+    array = builder.create<hw::ArrayConcatOp>(temp2);
+  }
+
+  Value inBoundsRead;
+  // If `stripMuxPragmas` is specified, just lower to a vanilla array indexing.
+  // Also remove mux pragmas if the array size is 1 since it causes a
+  // complication failure.
+  if (circuitState.stripMuxPragmas || size <= 1) {
+    inBoundsRead = builder.create<hw::ArrayGetOp>(array, index);
+  } else {
+    auto arrayGet = builder.create<hw::ArrayGetOp>(array, index);
+    auto valWire = builder.create<sv::WireOp>(
+        hw::type_cast<hw::ArrayType>(array.getType()).getElementType());
+    // Use SV attributes to annotate pragmas.
+    circt::sv::setSVAttributes(
+        arrayGet,
+        sv::SVAttributesAttr::get(builder.getContext(), {"cadence map_to_mux"},
+                                  /*emitAsComments=*/true));
+
+    auto assignOp = builder.create<sv::AssignOp>(valWire, arrayGet);
+    sv::setSVAttributes(
+        assignOp, sv::SVAttributesAttr::get(builder.getContext(),
+                                            {"synopsys infer_mux_override"},
+                                            /*emitAsComments=*/true));
+    inBoundsRead = builder.create<sv::ReadInOutOp>(valWire);
+  }
+
+  return inBoundsRead;
 }
 
 LogicalResult FIRRTLLowering::visitExpr(MultibitMuxOp op) {
@@ -3366,49 +3534,8 @@ LogicalResult FIRRTLLowering::visitExpr(MultibitMuxOp op) {
     loweredInputs.push_back(lowered);
   }
 
-  // We lower multbit mux into array indexing with vendor pragmas in the
-  // following form.
-  //
-  // wire GEN;
-  // assign GEN = array[index] /* cadence map_to_mux */;
-  // /* synopsys infer_mux_override */
-
   Value array = builder.create<hw::ArrayCreateOp>(loweredInputs);
-  auto valWire = builder.create<sv::WireOp>(lowerType(op.getType()));
-  auto arrayGet = builder.create<hw::ArrayGetOp>(array, index);
-
-  // FIXME: We currently use verbatim op to add pragams. Use comment attributes
-  // once they are supported.
-  builder.create<sv::VerbatimOp>(
-      arrayGet.getLoc(),
-      builder.getStringAttr("assign {{0}} = {{1}} /* cadence map_to_mux */; /* "
-                            "synopsys infer_mux_override */"),
-      ValueRange{valWire, arrayGet}, builder.getArrayAttr({}));
-
-  Value inBoundsRead = builder.create<sv::ReadInOutOp>(valWire);
-
-  // If the multi-bit mux can never have an out-of-bounds read, then lower it
-  // into a HW multi-bit mux.
-  if (llvm::isPowerOf2_64(op.getInputs().size()))
-    return setLowering(op, inBoundsRead);
-
-  // If the multi-bit mux can have an out-of-bounds read (the size of the array
-  // is not a power-of-two), then generate a mux that will return the zeroth
-  // element for any out-of-bounds reads.  This is done to match SFC behavior
-  // for subaccesses.
-  //
-  // TODO: Explore alternatives that don't rely on SFC-exact behavior or guard
-  // against this situation happeneing, e.g., by emitting an SV assertion to
-  // error if an out-of-bounds read ever occurs.
-  Value zerothRead = builder.create<hw::ArrayGetOp>(
-      array,
-      getOrCreateIntConstant(index.getType().getIntOrFloatBitWidth(), 0));
-  Value isOutOfBounds = builder.create<comb::ICmpOp>(
-      ICmpPredicate::uge, index,
-      getOrCreateIntConstant(index.getType().getIntOrFloatBitWidth(),
-                             op.getInputs().size()));
-  return setLoweringTo<comb::MuxOp>(op, inBoundsRead.getType(), isOutOfBounds,
-                                    zerothRead, inBoundsRead);
+  return setLowering(op, createArrayIndexing(array, index));
 }
 
 LogicalResult FIRRTLLowering::visitExpr(VerbatimExprOp op) {
@@ -3450,9 +3577,8 @@ void FIRRTLLowering::lowerRegConnect(const FieldRef &fieldRef, Value dest,
   // outermost ones, the new value is computed by updating one of its
   // fields. The value of the field itself is determined by updating the
   // previous value according to the subsequent access operation.
-  std::function<Value(Value, Type, unsigned)> inject = [&](Value base,
-                                                           Type type,
-                                                           unsigned fieldID) {
+  std::function<Value(Value, Type, unsigned)> inject =
+      [&](Value base, Type type, unsigned fieldID) -> Value {
     if (auto bundle = type.dyn_cast<BundleType>()) {
       auto index = bundle.getIndexForFieldID(fieldID);
       fieldID -= bundle.getFieldID(index);
@@ -3501,17 +3627,19 @@ void FIRRTLLowering::lowerRegConnect(const FieldRef &fieldRef, Value dest,
       if (index == 0 && size == 1)
         return builder.create<hw::ArrayCreateOp>(value).getResult();
 
+      // Slice around the updated element and concatenate the results.
+      // Higher indices are passed to the concat op first.
       SmallVector<Value> elements;
-      if (index != 0) {
-        elements.push_back(builder.create<hw::ArraySliceOp>(
-            hw::ArrayType::get(elemTy, index), base,
-            getOrCreateIntConstant(indexWidth, 0)));
-      }
-      elements.push_back(builder.create<hw::ArrayCreateOp>(value));
       if (index + 1 != size) {
         elements.push_back(builder.create<hw::ArraySliceOp>(
             hw::ArrayType::get(elemTy, size - index - 1), base,
             getOrCreateIntConstant(indexWidth, index + 1)));
+      }
+      elements.push_back(builder.create<hw::ArrayCreateOp>(value));
+      if (index != 0) {
+        elements.push_back(builder.create<hw::ArraySliceOp>(
+            hw::ArrayType::get(elemTy, index), base,
+            getOrCreateIntConstant(indexWidth, 0)));
       }
 
       return builder.create<hw::ArrayConcatOp>(elements).getResult();
@@ -3535,7 +3663,7 @@ void FIRRTLLowering::lowerRegConnect(const FieldRef &fieldRef, Value dest,
 LogicalResult FIRRTLLowering::visitStmt(ConnectOp op) {
   auto dest = op.getDest();
   // The source can be a smaller integer, extend it as appropriate if so.
-  auto destType = dest.getType().cast<FIRRTLType>().getPassiveType();
+  auto destType = dest.getType().cast<FIRRTLBaseType>().getPassiveType();
   auto srcVal = getLoweredAndExtendedValue(op.getSrc(), destType);
   if (!srcVal)
     return handleZeroBit(op.getSrc(), []() { return success(); });
@@ -3633,7 +3761,7 @@ LogicalResult FIRRTLLowering::visitStmt(PrintFOp op) {
       // Emit an "sv.if '`PRINTF_COND_ & cond' into the #ifndef.
       Value ifCond =
           builder.create<sv::MacroRefExprOp>(cond.getType(), "PRINTF_COND_");
-      ifCond = builder.createOrFold<comb::AndOp>(ifCond, cond);
+      ifCond = builder.createOrFold<comb::AndOp>(ifCond, cond, true);
 
       addIfProceduralBlock(ifCond, [&]() {
         // Emit the sv.fwrite, writing to stderr by default.
@@ -3663,7 +3791,7 @@ LogicalResult FIRRTLLowering::visitStmt(StopOp op) {
       // Emit an "sv.if '`STOP_COND_ & cond' into the #ifndef.
       Value ifCond =
           builder.create<sv::MacroRefExprOp>(cond.getType(), "STOP_COND_");
-      ifCond = builder.createOrFold<comb::AndOp>(ifCond, cond);
+      ifCond = builder.createOrFold<comb::AndOp>(ifCond, cond, true);
       addIfProceduralBlock(ifCond, [&]() {
         // Emit the sv.fatal or sv.finish.
         if (op.getExitCode())
@@ -3753,6 +3881,12 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
     message = opMessageAttr;
     for (auto operand : opOperands) {
       auto loweredValue = getLoweredValue(operand);
+      if (!loweredValue) {
+        // If this is a zero bit operand, just pass a one bit zero.
+        if (!isZeroBitFIRRTLType(operand.getType()))
+          return failure();
+        loweredValue = getOrCreateIntConstant(1, 0);
+      }
       // Wrap any message ops in $sampled() to guarantee that these will print
       // with the same value as when the assertion triggers.  (See SystemVerilog
       // 2017 spec section 16.9.3 for more information.)  The custom
@@ -3790,7 +3924,7 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
     if (format && (format.getValue() == "ifElseFatal" &&
                    !circuitState.emitChiselAssertsAsSVA)) {
       predicate = comb::createOrFoldNot(predicate, builder);
-      predicate = builder.createOrFold<comb::AndOp>(enable, predicate);
+      predicate = builder.createOrFold<comb::AndOp>(enable, predicate, true);
       addToIfDefBlock("SYNTHESIS", {}, [&]() {
         addToAlwaysBlock(clock, [&]() {
           addIfProceduralBlock(predicate, [&]() {
@@ -3813,9 +3947,9 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
     // Except for covers, combine them: enable & predicate
     if (!isCover) {
       auto notEnable = comb::createOrFoldNot(enable, builder);
-      predicate = builder.createOrFold<comb::OrOp>(notEnable, predicate);
+      predicate = builder.createOrFold<comb::OrOp>(notEnable, predicate, true);
     } else {
-      predicate = builder.createOrFold<comb::AndOp>(enable, predicate);
+      predicate = builder.createOrFold<comb::AndOp>(enable, predicate, true);
     }
 
     // Handle the regular SVA case.
@@ -3938,7 +4072,7 @@ LogicalResult FIRRTLLowering::visitStmt(AttachOp op) {
       [&]() {
         SmallVector<Value, 4> values;
         for (size_t i = 0, e = inoutValues.size(); i != e; ++i)
-          values.push_back(getReadInOutOp(inoutValues[i]));
+          values.push_back(getReadValue(inoutValues[i]));
 
         for (size_t i1 = 0, e = inoutValues.size(); i1 != e; ++i1) {
           for (size_t i2 = 0; i2 != e; ++i2)

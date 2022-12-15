@@ -1,4 +1,4 @@
-// RUN: circt-opt -pass-pipeline='firrtl.circuit(firrtl-imconstprop)' --split-input-file  %s | FileCheck %s
+// RUN: circt-opt -pass-pipeline='builtin.module(firrtl.circuit(firrtl-imconstprop))' --split-input-file  %s | FileCheck %s
 
 firrtl.circuit "Test" {
 
@@ -71,11 +71,11 @@ firrtl.circuit "Test" {
     %extWire = firrtl.wire : !firrtl.uint<2>
     firrtl.connect %extWire, %c0_ui1 : !firrtl.uint<2>, !firrtl.uint<1>
 
-    // Connects of invalid values shouldn't hurt.
+    // Connects of invalid values should hurt.
     %invalid = firrtl.invalidvalue : !firrtl.uint<2>
     firrtl.connect %extWire, %invalid : !firrtl.uint<2>, !firrtl.uint<2>
 
-    // CHECK: firrtl.connect %result5, %c0_ui2
+    // CHECK-NOT: firrtl.connect %result5, %c0_ui2
     firrtl.connect %result5, %extWire: !firrtl.uint<2>, !firrtl.uint<2>
 
     // regreset
@@ -93,22 +93,17 @@ firrtl.circuit "Test" {
     // CHECK: firrtl.connect %result7, %c0_ui4
     firrtl.connect %result7, %reg: !firrtl.uint<4>, !firrtl.uint<4>
 
-    // Wire without connects to it should turn into 'invalid'.
-    %unconnectedWire = firrtl.wire : !firrtl.uint<2>
-    // CHECK: firrtl.connect %result8, %invalid_ui2
-    firrtl.connect %result8, %unconnectedWire: !firrtl.uint<4>, !firrtl.uint<2>
-
     %c1_ui2 = firrtl.constant 1 : !firrtl.uint<2>
     %c2_ui2 = firrtl.constant 2 : !firrtl.uint<2>
 
     // Multiple operations that fold to constants shouldn't leave dead constants
     // around.
-    %a = firrtl.and %extWire, %c2_ui2 : (!firrtl.uint<2>, !firrtl.uint<2>) -> !firrtl.uint<2>
+    %a = firrtl.and %c2_ui2, %c2_ui2 : (!firrtl.uint<2>, !firrtl.uint<2>) -> !firrtl.uint<2>
     %b = firrtl.or %a, %c1_ui2 : (!firrtl.uint<2>, !firrtl.uint<2>) -> !firrtl.uint<2>
     // CHECK-NOT: firrtl.constant
     %c = firrtl.xor %b, %c2_ui2 : (!firrtl.uint<2>, !firrtl.uint<2>) -> !firrtl.uint<2>
 
-    // CHECK-NEXT: firrtl.connect %result9, %c3_ui2
+    // CHECK-NEXT: firrtl.connect %result9, %c1_ui2
     firrtl.connect %result9, %c: !firrtl.uint<4>, !firrtl.uint<2>
 
 
@@ -134,12 +129,12 @@ firrtl.circuit "Test" {
 
     %0 = firrtl.mem Undefined {depth = 16 : i64, name = "ReadMemory", portNames = ["read0"], readLatency = 1 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>
 
-    %1 = firrtl.subfield %0(3) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>) -> !firrtl.sint<8>
-    %2 = firrtl.subfield %0(0) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>) -> !firrtl.uint<4>
+    %1 = firrtl.subfield %0[data] : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>
+    %2 = firrtl.subfield %0[addr] : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>
     firrtl.connect %2, %c0_ui1 : !firrtl.uint<4>, !firrtl.uint<1>
-    %3 = firrtl.subfield %0(1) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>) -> !firrtl.uint<1>
+    %3 = firrtl.subfield %0[en] : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>
     firrtl.connect %3, %c1_ui1 : !firrtl.uint<1>, !firrtl.uint<1>
-    %4 = firrtl.subfield %0(2) : (!firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>) -> !firrtl.clock
+    %4 = firrtl.subfield %0[clk] : !firrtl.bundle<addr: uint<4>, en: uint<1>, clk: clock, data flip: sint<8>>
   }
 }
 
@@ -215,11 +210,21 @@ firrtl.circuit "testDontTouch"  {
     // CHECK: firrtl.connect %a2, %blockProp3_b
     firrtl.connect %a2, %blockProp3_b : !firrtl.uint<1>, !firrtl.uint<1>
   }
-  // CHECK-LABEL: firrtl.module private @CheckNode
-  firrtl.module private @CheckNode(in %x: !firrtl.uint<1>, out %y: !firrtl.uint<1>) {
-    %z = firrtl.node   sym @s2 %x: !firrtl.uint<1>
-    // CHECK: firrtl.connect %y, %z
-    firrtl.connect %y, %z : !firrtl.uint<1>, !firrtl.uint<1>
+  // CHECK-LABEL: firrtl.module @CheckNode
+  firrtl.module @CheckNode(out %x: !firrtl.uint<1>, out %y: !firrtl.uint<1>, out %z: !firrtl.uint<1>) {
+    %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
+    // CHECK-NOT: %d1 = firrtl.node 
+    %d1 = firrtl.node droppable_name %c1_ui1 : !firrtl.uint<1>
+    // CHECK: %d2 = firrtl.node 
+    %d2 = firrtl.node interesting_name %c1_ui1 : !firrtl.uint<1>
+    // CHECK: %d3 = firrtl.node 
+    %d3 = firrtl.node   sym @s2 %c1_ui1: !firrtl.uint<1>
+    // CHECK: firrtl.connect %x, %c1_ui1
+    firrtl.connect %x, %d1 : !firrtl.uint<1>, !firrtl.uint<1>
+    // CHECK: firrtl.connect %y, %c1_ui1
+    firrtl.connect %y, %d2 : !firrtl.uint<1>, !firrtl.uint<1>
+    // CHECK: firrtl.connect %z, %d3
+    firrtl.connect %z, %d3 : !firrtl.uint<1>, !firrtl.uint<1>
   }
 
 }
@@ -337,41 +342,13 @@ firrtl.circuit "invalidReg2"   {
   firrtl.module @invalidReg2(in %clock: !firrtl.clock, out %a: !firrtl.uint<1>) {
     %foobar = firrtl.reg %clock  : !firrtl.uint<1>
     firrtl.connect %foobar, %foobar : !firrtl.uint<1>, !firrtl.uint<1>
-    //CHECK: %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
-    //CHECK: firrtl.connect %a, %invalid_ui1 : !firrtl.uint<1>, !firrtl.uint<1>
+    //CHECK-NOT: firrtl.connect %foobar, %foobar
+    //CHECK: %[[inv:.*]] = firrtl.invalidvalue
+    //CHECK: firrtl.connect %a, %[[inv]]
     firrtl.connect %a, %foobar : !firrtl.uint<1>, !firrtl.uint<1>
   }
 }
 
-// -----
-
-// CHECK-LABEL: firrtl.circuit "RegResetInvalid"
-firrtl.circuit "RegResetInvalid"  {
-  firrtl.module @RegResetInvalid(in %clock: !firrtl.clock, in %a: !firrtl.uint<1>, out %b: !firrtl.uint<1>) {
-    %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
-    %r = firrtl.regreset %clock, %a, %c1_ui1  : !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>
-    %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
-    firrtl.strictconnect %r, %invalid_ui1 : !firrtl.uint<1>
-    // CHECK: %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
-    // CHECK: firrtl.strictconnect %b, %c1_ui1 : !firrtl.uint<1>
-    firrtl.strictconnect %b, %r : !firrtl.uint<1>
-  }
-}
-
-// -----
-
-// CHECK-LABEL: firrtl.circuit "RegResetInvalidReset"
-firrtl.circuit "RegResetInvalidReset"  {
-  firrtl.module @RegResetInvalidReset(in %clock: !firrtl.clock, out %a: !firrtl.uint<1>) {
-    %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
-    %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
-    %r = firrtl.regreset %clock, %invalid_ui1, %c1_ui1  : !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>
-    firrtl.strictconnect %r, %invalid_ui1 : !firrtl.uint<1>
-    // CHECK: %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
-    // CHECK: firrtl.strictconnect %a, %invalid_ui1 : !firrtl.uint<1>
-    firrtl.strictconnect %a, %r : !firrtl.uint<1>
-  }
-}
 // -----
 
 // This test is checking the behavior of a RegOp, "r", and a RegResetOp, "s",
@@ -399,7 +376,7 @@ firrtl.circuit "Oscillators"   {
   }
   // CHECK: firrtl.module private @Bar
   firrtl.module private @Bar(in %clock: !firrtl.clock, in %reset: !firrtl.asyncreset, out %a: !firrtl.uint<1>) {
-    // CHECK: firrtl.reg
+    // CHECK: %r = firrtl.reg
     %r = firrtl.reg %clock  : !firrtl.uint<1>
     %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
     // CHECK: firrtl.regreset
@@ -470,7 +447,7 @@ firrtl.circuit "Oscillators"   {
 // reduced. See:
 //   - https://github.com/llvm/circt/issues/1488
 //
-// CHECK-LABK: firrtl.circuit "rhs_sink_output_used_as_wire"
+// CHECK-LABEL: firrtl.circuit "rhs_sink_output_used_as_wire"
 firrtl.circuit "rhs_sink_output_used_as_wire" {
   // CHECK: firrtl.module private @Bar
   firrtl.module private @Bar(in %a: !firrtl.uint<1>, in %b: !firrtl.uint<1>, out %c: !firrtl.uint<1>, out %d: !firrtl.uint<1>) {
@@ -533,21 +510,79 @@ firrtl.circuit "AnnotationsBlockRemoval"  {
 firrtl.circuit "Issue3372"  {
   firrtl.module @Issue3372(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>, out %value: !firrtl.uint<1>) {
     %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
-    %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
     %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
     %other_zero = firrtl.instance other interesting_name  @Other(out zero: !firrtl.uint<1>)
-    %shared = firrtl.regreset interesting_name %clock, %c0_ui1, %c1_ui1  : !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>
+    %shared = firrtl.regreset interesting_name %clock, %other_zero, %c1_ui1  : !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>
     firrtl.strictconnect %shared, %shared : !firrtl.uint<1>
     %test = firrtl.wire interesting_name  : !firrtl.uint<1>
     firrtl.strictconnect %test, %shared : !firrtl.uint<1>
-    firrtl.strictconnect %value, %invalid_ui1 : !firrtl.uint<1>
+    firrtl.strictconnect %value, %test : !firrtl.uint<1>
   }
-// CHECK:  firrtl.strictconnect %shared, %invalid_ui1 : !firrtl.uint<1>
-// CHECK:  firrtl.strictconnect %test, %invalid_ui1 : !firrtl.uint<1>
-// CHECK:  firrtl.strictconnect %value, %invalid_ui1_0 : !firrtl.uint<1>
+// CHECK:  %other_zero = firrtl.instance other interesting_name @Other(out zero: !firrtl.uint<1>) 
+// CHECK:  %test = firrtl.wire interesting_name : !firrtl.uint<1> 
+// CHECK:  firrtl.strictconnect %value, %test : !firrtl.uint<1> 
 
   firrtl.module private @Other(out %zero: !firrtl.uint<1>) {
     %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
     firrtl.strictconnect %zero, %c0_ui1 : !firrtl.uint<1>
+  }
+}
+
+// -----
+
+// CHECK-LABEL: "SendThroughRef"
+firrtl.circuit "SendThroughRef" {
+  firrtl.module private @Bar(out %_a: !firrtl.ref<uint<1>>) {
+    %zero = firrtl.constant 0 : !firrtl.uint<1>
+    %ref_zero = firrtl.ref.send %zero : !firrtl.uint<1>
+    firrtl.strictconnect %_a, %ref_zero : !firrtl.ref<uint<1>>
+  }
+  // CHECK:  firrtl.strictconnect %a, %c0_ui1 : !firrtl.uint<1>
+  firrtl.module @SendThroughRef(out %a: !firrtl.uint<1>) {
+    %bar_a = firrtl.instance bar @Bar(out _a: !firrtl.ref<uint<1>>)
+    %0 = firrtl.ref.resolve %bar_a : !firrtl.ref<uint<1>>
+    firrtl.strictconnect %a, %0 : !firrtl.uint<1>
+  }
+}
+
+// -----
+
+// CHECK-LABEL: "ForwardRef"
+firrtl.circuit "ForwardRef" {
+  firrtl.module private @RefForward2(out %_a: !firrtl.ref<uint<1>>) {
+    %zero = firrtl.constant 0 : !firrtl.uint<1>
+    %ref_zero = firrtl.ref.send %zero : !firrtl.uint<1>
+    firrtl.strictconnect %_a, %ref_zero : !firrtl.ref<uint<1>>
+  }
+  firrtl.module private @RefForward(out %_a: !firrtl.ref<uint<1>>) {
+    %fwd_2 = firrtl.instance fwd_2 @RefForward2(out _a: !firrtl.ref<uint<1>>)
+    firrtl.strictconnect %_a, %fwd_2 : !firrtl.ref<uint<1>>
+  }
+  // CHECK:  firrtl.strictconnect %a, %c0_ui1 : !firrtl.uint<1>
+  firrtl.module @ForwardRef(out %a: !firrtl.uint<1>) {
+    %fwd_a = firrtl.instance fwd @RefForward(out _a: !firrtl.ref<uint<1>>)
+    %0 = firrtl.ref.resolve %fwd_a : !firrtl.ref<uint<1>>
+    firrtl.strictconnect %a, %0 : !firrtl.uint<1>
+  }
+}
+
+// -----
+
+// Verbatim expressions should not be optimized away.
+firrtl.circuit "Verbatim"  {
+  firrtl.module @Verbatim() {
+    // CHECK: %[[v0:.+]] = firrtl.verbatim.expr
+    %0 = firrtl.verbatim.expr "random.something" : () -> !firrtl.uint<1>
+    // CHECK: %tap = firrtl.wire   : !firrtl.uint<1>
+    %tap = firrtl.wire   : !firrtl.uint<1>
+    %fizz = firrtl.wire   {annotations = [{class = "firrtl.transforms.DontTouchAnnotation"}]} : !firrtl.uint<1>
+    firrtl.strictconnect %fizz, %tap : !firrtl.uint<1>
+    // CHECK: firrtl.strictconnect %tap, %[[v0]] : !firrtl.uint<1>
+    firrtl.strictconnect %tap, %0 : !firrtl.uint<1>
+    // CHECK: firrtl.verbatim.wire "randomBar.b"
+    %1 = firrtl.verbatim.wire "randomBar.b" : () -> !firrtl.uint<1> {symbols = []}
+    // CHECK: %tap2 = firrtl.wire   : !firrtl.uint<1>
+    %tap2 = firrtl.wire   : !firrtl.uint<1>
+    firrtl.strictconnect %tap2, %1 : !firrtl.uint<1>
   }
 }

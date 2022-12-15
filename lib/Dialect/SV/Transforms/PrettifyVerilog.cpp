@@ -75,7 +75,7 @@ static bool isVerilogUnaryOperator(Operation *op) {
 static llvm::Optional<APInt> getInt(Value value) {
   if (auto cst = dyn_cast_or_null<hw::ConstantOp>(value.getDefiningOp()))
     return cst.getValue();
-  return llvm::None;
+  return std::nullopt;
 }
 
 // Checks whether the destination and the source of an assignment are the same.
@@ -101,7 +101,7 @@ static bool isSelfWrite(Value dst, Value src) {
       })
       .Case<hw::ArrayGetOp>([&](auto get) {
         auto toGet = dyn_cast<sv::ArrayIndexInOutOp>(dstOp);
-        if (!toGet)
+        if (!toGet || toGet.getIndex().getType() != get.getIndex().getType())
           return false;
         auto toIdx = getInt(toGet.getIndex());
         auto fromIdx = getInt(get.getIndex());
@@ -184,10 +184,10 @@ bool PrettifyVerilogPass::splitArrayAssignment(OpBuilder &builder,
     if (concat.getNumOperands() == 2) {
       auto c = concat.getInputs();
 
-      auto lhs = dyn_cast_or_null<hw::ArraySliceOp>(c[0].getDefiningOp());
-      auto rhs = dyn_cast_or_null<hw::ArraySliceOp>(c[1].getDefiningOp());
-      auto midL = dyn_cast_or_null<hw::ArrayCreateOp>(c[0].getDefiningOp());
-      auto midR = dyn_cast_or_null<hw::ArrayCreateOp>(c[1].getDefiningOp());
+      auto lhs = dyn_cast_or_null<hw::ArraySliceOp>(c[1].getDefiningOp());
+      auto rhs = dyn_cast_or_null<hw::ArraySliceOp>(c[0].getDefiningOp());
+      auto midL = dyn_cast_or_null<hw::ArrayCreateOp>(c[1].getDefiningOp());
+      auto midR = dyn_cast_or_null<hw::ArrayCreateOp>(c[0].getDefiningOp());
 
       auto size = hw::type_cast<hw::ArrayType>(concat.getType()).getSize();
       if (lhs && midR) {
@@ -216,9 +216,9 @@ bool PrettifyVerilogPass::splitArrayAssignment(OpBuilder &builder,
     // n))
     if (concat.getNumOperands() == 3) {
       auto c = concat.getInputs();
-      auto lhs = dyn_cast_or_null<hw::ArraySliceOp>(c[0].getDefiningOp());
+      auto rhs = dyn_cast_or_null<hw::ArraySliceOp>(c[0].getDefiningOp());
       auto mid = dyn_cast_or_null<hw::ArrayCreateOp>(c[1].getDefiningOp());
-      auto rhs = dyn_cast_or_null<hw::ArraySliceOp>(c[2].getDefiningOp());
+      auto lhs = dyn_cast_or_null<hw::ArraySliceOp>(c[2].getDefiningOp());
       if (!lhs || !mid || !rhs || mid.getInputs().size() != 1)
         break;
       auto elem = mid.getInputs()[0];
@@ -283,7 +283,7 @@ bool PrettifyVerilogPass::splitAssignment(OpBuilder &builder, Value dst,
 /// operation so it can be sunk into multiple blocks. If there are no more uses
 /// in the current block, the op will be removed.
 void PrettifyVerilogPass::sinkOrCloneOpToUses(Operation *op) {
-  assert(mlir::MemoryEffectOpInterface::hasNoEffect(op) &&
+  assert(mlir::isMemoryEffectFree(op) &&
          "Op with side effects cannot be sunk to its uses.");
   auto block = op->getBlock();
   // This maps a block to the block local instance of the op.
@@ -403,7 +403,7 @@ void PrettifyVerilogPass::sinkExpression(Operation *op) {
     if (curOpBlock != op->user_begin()->getBlock()) {
       // Ok, we're about to make a change, ensure that there are no side
       // effects.
-      if (!mlir::MemoryEffectOpInterface::hasNoEffect(op))
+      if (!mlir::isMemoryEffectFree(op))
         return;
 
       op->moveBefore(*op->user_begin());
@@ -451,7 +451,7 @@ void PrettifyVerilogPass::sinkExpression(Operation *op) {
 
   // Ok, we're about to make a change, ensure that there are no side
   // effects.
-  if (!mlir::MemoryEffectOpInterface::hasNoEffect(op))
+  if (!mlir::isMemoryEffectFree(op))
     return;
 
   // Ok, we found a common ancestor between all the users that is deeper than
@@ -475,13 +475,17 @@ void PrettifyVerilogPass::processPostOrder(Block &body) {
 
     // Simplify assignments involving structures and arrays.
     if (auto assign = dyn_cast<sv::PAssignOp>(op)) {
-      OpBuilder builder(assign);
-      if (splitAssignment(builder, assign.getDest(), assign.getSrc())) {
-        anythingChanged = true;
-        toDelete.insert(assign.getSrc().getDefiningOp());
-        toDelete.insert(assign.getDest().getDefiningOp());
-        assign.erase();
-        continue;
+      auto dst = assign.getDest();
+      auto src = assign.getSrc();
+      if (!isSelfWrite(dst, src)) {
+        OpBuilder builder(assign);
+        if (splitAssignment(builder, dst, src)) {
+          anythingChanged = true;
+          toDelete.insert(src.getDefiningOp());
+          toDelete.insert(dst.getDefiningOp());
+          assign.erase();
+          continue;
+        }
       }
     }
 

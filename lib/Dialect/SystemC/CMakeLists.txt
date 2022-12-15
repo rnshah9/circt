@@ -19,7 +19,10 @@ add_circt_dialect_library(CIRCTSystemC
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRInferTypeOpInterface
+  MLIREmitCDialect
   CIRCTHW
 )
 
 add_dependencies(circt-headers MLIRSystemCIncGen)
+
+add_subdirectory(Transforms)

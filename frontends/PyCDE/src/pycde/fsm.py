@@ -98,7 +98,7 @@ def generate_fsm_machine_op(generate_obj: Generator,
                             spec_mod: _SpecializedModule):
   """ Generator callback for generating an FSM op. """
   entry_block = spec_mod.circt_mod.body.blocks[0]
-  ports = _GeneratorPortAccess(spec_mod)
+  ports = _GeneratorPortAccess(spec_mod, entry_block.arguments)
 
   with InsertionPoint(entry_block), generate_obj.loc:
     for state in spec_mod.modcls.states:
@@ -313,7 +313,8 @@ def gen_fsm(transitions: dict, name: str = "MyFSM"):
       if guard_port:
         ensure_input(guard_port)
         currentStateAttr.add_transitions(
-            (nextStateAttr, lambda ports: getattr(ports, guard_port)))
+            (nextStateAttr,
+             lambda ports, guard_port=guard_port: getattr(ports, guard_port)))
       else:
         currentStateAttr.add_transitions((nextStateAttr,))
 

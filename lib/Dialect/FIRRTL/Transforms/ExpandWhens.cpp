@@ -40,24 +40,53 @@ struct HashTableStack {
   using ScopeT = typename llvm::MapVector<KeyT, ValueT>;
   using StackT = typename llvm::SmallVector<ScopeT, 3>;
 
+  struct Iterator {
+    Iterator(typename StackT::iterator stackIt,
+             typename ScopeT::iterator scopeIt)
+        : stackIt(stackIt), scopeIt(scopeIt) {}
+
+    bool operator==(const Iterator &rhs) const {
+      return stackIt == rhs.stackIt && scopeIt == rhs.scopeIt;
+    }
+
+    bool operator!=(const Iterator &rhs) const { return !(*this == rhs); }
+
+    std::pair<KeyT, ValueT> &operator*() const { return *scopeIt; }
+
+    Iterator &operator++() {
+      if (scopeIt == stackIt->end())
+        scopeIt = (++stackIt)->begin();
+      else
+        ++scopeIt;
+      return *this;
+    }
+
+    typename StackT::iterator stackIt;
+    typename ScopeT::iterator scopeIt;
+  };
+
   HashTableStack() {
     // We require at least one scope.
     pushScope();
   }
 
-  // TODO: This class will need its own iterator eventually.
-  using iterator = typename ScopeT::iterator;
+  using iterator = Iterator;
 
-  iterator end() { return iterator(); }
+  iterator begin() {
+    return Iterator(mapStack.begin(), mapStack.first().begin());
+  }
+
+  iterator end() { return Iterator(mapStack.end() - 1, mapStack.back().end()); }
 
   iterator find(const KeyT &key) {
     // Try to find a hashtable with the missing value.
-    for (auto &map : llvm::reverse(mapStack)) {
+    for (auto i = mapStack.size(); i > 0; --i) {
+      auto &map = mapStack[i - 1];
       auto it = map.find(key);
       if (it != map.end())
-        return it;
+        return Iterator(mapStack.begin() + i - 1, it);
     }
-    return iterator();
+    return end();
   }
 
   ScopeT &getLastScope() { return mapStack.back(); }
@@ -264,7 +293,8 @@ public:
   void visitDecl(MemOp op) {
     // Track any memory inputs which require connections.
     for (auto result : op.getResults())
-      declareSinks(result, Flow::Sink);
+      if (!result.getType().cast<FIRRTLType>().isa<RefType>())
+        declareSinks(result, Flow::Sink);
   }
 
   void visitStmt(ConnectOp op) {
@@ -476,9 +506,9 @@ void LastConnectResolver<ConcreteT>::processWhenOp(WhenOp whenOp,
   auto condition = whenOp.getCondition();
   auto ui1Type = condition.getType();
 
-  // Process both sides of the the WhenOp, fixing up all simulation
-  // contructs, and resolving last connect semantics in each block. This
-  // process returns the set of connects in each side of the when op.
+  // Process both sides of the WhenOp, fixing up all simulation constructs,
+  // and resolving last connect semantics in each block. This process returns
+  // the set of connects in each side of the when op.
 
   // Process the `then` block. If we are already in a whenblock, the we need to
   // conjoin ('and') the outer conditions.
@@ -581,6 +611,7 @@ void ModuleVisitor::visitStmt(WhenOp whenOp) {
 /// Perform initialization checking.  This uses the built up state from
 /// running on a module. Returns failure in the event of bad initialization.
 LogicalResult ModuleVisitor::checkInitialization() {
+  bool failed = false;
   for (auto destAndConnect : driverMap.getLastScope()) {
     // If there is valid connection to this destination, everything is good.
     auto *connect = std::get<1>(destAndConnect);
@@ -596,10 +627,14 @@ LogicalResult ModuleVisitor::checkInitialization() {
                  "\" not fully initialized in module \""
           << mod.moduleName() << "\"";
     else
-      definingOp->emitError("sink \"" + getFieldName(dest) +
-                            "\" not fully initialized");
-    return failure();
+      definingOp->emitError(
+          "sink \"" + getFieldName(dest) +
+          "\" not fully initialized in module \"" +
+          definingOp->getParentOfType<FModuleLike>().moduleName() + "\"");
+    failed = true;
   }
+  if (failed)
+    return failure();
   return success();
 }
 

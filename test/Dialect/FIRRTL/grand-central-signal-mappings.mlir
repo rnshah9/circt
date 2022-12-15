@@ -1,4 +1,4 @@
-// RUN: circt-opt --pass-pipeline='firrtl.circuit(firrtl-grand-central-signal-mappings)' --split-input-file %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-grand-central-signal-mappings))' --split-input-file %s | FileCheck %s
 
 firrtl.circuit "SubCircuit" attributes {
   annotations = [
@@ -152,9 +152,9 @@ firrtl.circuit "GenerateJSON"  attributes {
   // CHECK-SAME:   \22vendor\22: {
   // CHECK-SAME:     \22vcs\22: {
   // CHECK-SAME:       \22vsrcs\22: [
-  // CHECK-SAME:         \22{{.+}}/GenerateJSON_signal_mappings.sv\22,
-  // CHECK-SAME:         \22{{.+}}/GenerateJSON.sv\22,
-  // CHECK-SAME:         \22{{.+}}/InlineExternalModule.sv\22
+  // CHECK-SAME:         \22{{.+}}GenerateJSON_signal_mappings.sv\22,
+  // CHECK-SAME:         \22{{.+}}GenerateJSON.sv\22,
+  // CHECK-SAME:         \22{{.+}}InlineExternalModule.sv\22
   // CHECK-SAME:       ]
   // CHECK-SAME:     },
   // CHECK-SAME:     \22verilator\22: {
@@ -279,11 +279,11 @@ firrtl.circuit "MainWithNLA" attributes {
     }
   ]} {
   // Starting from DUT
-  firrtl.hierpath @nla_dut_rel [@DUT::@l, @Leaf::@w]
+  hw.hierpath private @nla_dut_rel [@DUT::@l, @Leaf::@w]
   // Not through DUT, describes multiple paths
-  firrtl.hierpath @nla_segment [@Mid::@l, @Leaf::@in]
+  hw.hierpath private @nla_segment [@Mid::@l, @Leaf::@in]
   // Top to leaf, through the DUT
-  firrtl.hierpath @nla_top_thru_dut_to_w [@MainWithNLA::@dut, @DUT::@m, @Mid::@l, @Leaf::@w]
+  hw.hierpath private @nla_top_thru_dut_to_w [@MainWithNLA::@dut, @DUT::@m, @Mid::@l, @Leaf::@w]
   firrtl.module private @Leaf(
     in %in: !firrtl.uint<1> sym @in [{
       circt.nonlocal = @nla_segment,
@@ -473,11 +473,11 @@ firrtl.circuit "MainWithnewNLA" attributes {
     }
   ]} {
   // Starting from DUT
-  firrtl.hierpath @nla_dut_rel [@DUT::@l, @Leaf]
+  hw.hierpath private @nla_dut_rel [@DUT::@l, @Leaf]
   // Not through DUT, describes multiple paths
-  firrtl.hierpath @nla_segment [@Mid::@l, @Leaf]
+  hw.hierpath private @nla_segment [@Mid::@l, @Leaf]
   // Top to leaf, through the DUT
-  firrtl.hierpath @nla_top_thru_dut_to_w [@MainWithnewNLA::@dut, @DUT::@m, @Mid::@l, @Leaf]
+  hw.hierpath private @nla_top_thru_dut_to_w [@MainWithnewNLA::@dut, @DUT::@m, @Mid::@l, @Leaf]
   firrtl.module private @Leaf(
     in %in: !firrtl.uint<1> [{
       circt.nonlocal = @nla_segment,

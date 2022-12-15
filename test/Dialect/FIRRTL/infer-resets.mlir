@@ -1,4 +1,4 @@
-// RUN: circt-opt --pass-pipeline='firrtl.circuit(firrtl-infer-resets)' --verify-diagnostics --split-input-file %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-infer-resets))' --verify-diagnostics --split-input-file %s | FileCheck %s
 
 // Tests extracted from:
 // - github.com/chipsalliance/firrtl:
@@ -101,16 +101,16 @@ firrtl.module @MultipleModuleBoundariesTop(in %clock: !firrtl.clock, in %reset: 
 // CHECK-LABEL: firrtl.module @NestedAggregates
 // CHECK-SAME: out %buzz: !firrtl.bundle<foo flip: vector<bundle<a: asyncreset, b flip: asyncreset, c: uint<1>>, 2>, bar: vector<bundle<a: asyncreset, b flip: asyncreset, c: uint<8>>, 2>>
 firrtl.module @NestedAggregates(out %buzz: !firrtl.bundle<foo flip: vector<bundle<a: asyncreset, b flip: reset, c: uint<1>>, 2>, bar: vector<bundle<a: reset, b flip: asyncreset, c: uint<8>>, 2>>) {
-  %0 = firrtl.subfield %buzz(1) : (!firrtl.bundle<foo flip: vector<bundle<a: asyncreset, b flip: reset, c: uint<1>>, 2>, bar: vector<bundle<a: reset, b flip: asyncreset, c: uint<8>>, 2>>) -> !firrtl.vector<bundle<a: reset, b flip: asyncreset, c: uint<8>>, 2>
-  %1 = firrtl.subfield %buzz(0) : (!firrtl.bundle<foo flip: vector<bundle<a: asyncreset, b flip: reset, c: uint<1>>, 2>, bar: vector<bundle<a: reset, b flip: asyncreset, c: uint<8>>, 2>>) -> !firrtl.vector<bundle<a: asyncreset, b flip: reset, c: uint<1>>, 2>
+  %0 = firrtl.subfield %buzz[bar] : !firrtl.bundle<foo flip: vector<bundle<a: asyncreset, b flip: reset, c: uint<1>>, 2>, bar: vector<bundle<a: reset, b flip: asyncreset, c: uint<8>>, 2>>
+  %1 = firrtl.subfield %buzz[foo] : !firrtl.bundle<foo flip: vector<bundle<a: asyncreset, b flip: reset, c: uint<1>>, 2>, bar: vector<bundle<a: reset, b flip: asyncreset, c: uint<8>>, 2>>
   firrtl.connect %0, %1 : !firrtl.vector<bundle<a: reset, b flip: asyncreset, c: uint<8>>, 2>, !firrtl.vector<bundle<a: asyncreset, b flip: reset, c: uint<1>>, 2>
 }
 
 // Should work with deeply nested aggregates.
 // CHECK-LABEL: firrtl.module @DeeplyNestedAggregates(in %reset: !firrtl.uint<1>, out %buzz: !firrtl.bundle<a: bundle<b: uint<1>>>) {
 firrtl.module @DeeplyNestedAggregates(in %reset: !firrtl.uint<1>, out %buzz: !firrtl.bundle<a: bundle<b: reset>>) {
-  %0 = firrtl.subfield %buzz(0) : (!firrtl.bundle<a: bundle<b : reset>>) -> !firrtl.bundle<b: reset>
-  %1 = firrtl.subfield %0(0) : (!firrtl.bundle<b: reset>) -> !firrtl.reset
+  %0 = firrtl.subfield %buzz[a] : !firrtl.bundle<a: bundle<b : reset>>
+  %1 = firrtl.subfield %0[b] : !firrtl.bundle<b: reset>
   // CHECK: firrtl.connect %1, %reset : !firrtl.uint<1>, !firrtl.uint<1>
   firrtl.connect %1, %reset : !firrtl.reset, !firrtl.uint<1>
 }
@@ -326,6 +326,19 @@ firrtl.module @ShouldAdjustExtModule2() {
   firrtl.connect %x_reset, %c1_ui1 : !firrtl.reset, !firrtl.uint<1>
 }
 
+// Should not crash if there are connects with foreign types.
+// CHECK-LABEL: firrtl.module @ForeignTypes
+firrtl.module @ForeignTypes(out %out: !firrtl.reset) {
+  %0 = firrtl.wire : index
+  %1 = firrtl.wire : index
+  firrtl.strictconnect %0, %1 : index
+  // CHECK-NEXT: [[W0:%.+]] = firrtl.wire : index
+  // CHECK-NEXT: [[W1:%.+]] = firrtl.wire : index
+  // CHECK-NEXT: firrtl.strictconnect [[W0]], [[W1]] : index
+  %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
+  firrtl.connect %out, %c1_ui1 : !firrtl.reset, !firrtl.uint<1>
+}
+
 
 //===----------------------------------------------------------------------===//
 // Full Async Reset
@@ -378,13 +391,13 @@ firrtl.circuit "Top" {
     // Factoring of sync reset into mux works through subfield op.
     // CHECK: %reg4 = firrtl.regreset %clock, %extraReset, %2
     // CHECK: %4 = firrtl.mux(%init, %reset4, %reg4)
-    // CHECK: %5 = firrtl.subfield %reset4(0)
-    // CHECK: %6 = firrtl.subfield %reg4(0)
+    // CHECK: %5 = firrtl.subfield %reset4[a]
+    // CHECK: %6 = firrtl.subfield %reg4[a]
     // CHECK: %7 = firrtl.mux(%init, %5, %in)
     // CHECK: firrtl.connect %6, %7
     %reset4 = firrtl.wire : !firrtl.bundle<a: uint<8>>
     %reg4 = firrtl.regreset %clock, %init, %reset4 : !firrtl.uint<1>, !firrtl.bundle<a: uint<8>>, !firrtl.bundle<a: uint<8>>
-    %0 = firrtl.subfield %reg4(0) : (!firrtl.bundle<a: uint<8>>) -> !firrtl.uint<8>
+    %0 = firrtl.subfield %reg4[a] : !firrtl.bundle<a: uint<8>>
     firrtl.connect %0, %in : !firrtl.uint<8>, !firrtl.uint<8>
 
     // Factoring of sync reset into mux works through subindex op.
@@ -415,9 +428,9 @@ firrtl.circuit "Top" {
 
     // Subfields that are never assigned to should not leave unused reset
     // subfields behind.
-    // CHECK-NOT: firrtl.subfield %reset4(0)
-    // CHECK: %20 = firrtl.subfield %reg4(0)
-    %3 = firrtl.subfield %reg4(0) : (!firrtl.bundle<a: uint<8>>) -> !firrtl.uint<8>
+    // CHECK-NOT: firrtl.subfield %reset4[a]
+    // CHECK: %20 = firrtl.subfield %reg4[a]
+    %3 = firrtl.subfield %reg4[a] : !firrtl.bundle<a: uint<8>>
   }
 }
 
@@ -436,14 +449,14 @@ firrtl.circuit "Top" {
     %reg_sint = firrtl.reg %clock : !firrtl.sint
     // CHECK: %0 = firrtl.wire : !firrtl.bundle<a: uint<8>, b: bundle<x: uint<8>, y: uint<8>>>
     // CHECK: %c0_ui8 = firrtl.constant 0 : !firrtl.uint<8>
-    // CHECK: %1 = firrtl.subfield %0(0)
+    // CHECK: %1 = firrtl.subfield %0[a]
     // CHECK: firrtl.strictconnect %1, %c0_ui8
     // CHECK: %2 = firrtl.wire : !firrtl.bundle<x: uint<8>, y: uint<8>>
-    // CHECK: %3 = firrtl.subfield %2(0)
+    // CHECK: %3 = firrtl.subfield %2[x]
     // CHECK: firrtl.strictconnect %3, %c0_ui8
-    // CHECK: %4 = firrtl.subfield %2(1)
+    // CHECK: %4 = firrtl.subfield %2[y]
     // CHECK: firrtl.strictconnect %4, %c0_ui8
-    // CHECK: %5 = firrtl.subfield %0(1)
+    // CHECK: %5 = firrtl.subfield %0[b]
     // CHECK: firrtl.strictconnect %5, %2
     // CHECK: %reg_bundle = firrtl.regreset %clock, %reset, %0
     %reg_bundle = firrtl.reg %clock : !firrtl.bundle<a: uint<8>, b: bundle<x: uint<8>, y: uint<8>>>
@@ -750,10 +763,10 @@ firrtl.circuit "ZeroWidthRegister" {
 // CHECK-LABEL: firrtl.module @ZeroLengthVectorInBundle1
 firrtl.circuit "ZeroLengthVectorInBundle1"  {
   firrtl.module @ZeroLengthVectorInBundle1(out %out: !firrtl.bundle<resets: vector<reset, 0>, data flip: uint<3>>) {
-    %0 = firrtl.subfield %out(0) : (!firrtl.bundle<resets: vector<reset, 0>, data flip: uint<3>>) -> !firrtl.vector<reset, 0>
+    %0 = firrtl.subfield %out[resets] : !firrtl.bundle<resets: vector<reset, 0>, data flip: uint<3>>
     %invalid = firrtl.invalidvalue : !firrtl.vector<reset, 0>
     firrtl.strictconnect %0, %invalid : !firrtl.vector<reset, 0>
-    // CHECK-NEXT: %0 = firrtl.subfield %out(0) : (!firrtl.bundle<resets: vector<uint<1>, 0>, data flip: uint<3>>) -> !firrtl.vector<uint<1>, 0>
+    // CHECK-NEXT: %0 = firrtl.subfield %out[resets] : !firrtl.bundle<resets: vector<uint<1>, 0>, data flip: uint<3>>
     // CHECK-NEXT: %invalid = firrtl.invalidvalue : !firrtl.vector<uint<1>, 0>
     // CHECK-NEXT: firrtl.strictconnect %0, %invalid : !firrtl.vector<uint<1>, 0>
   }
@@ -764,10 +777,10 @@ firrtl.circuit "ZeroLengthVectorInBundle1"  {
 // CHECK-LABEL: firrtl.module @ZeroLengthVectorInBundle2
 firrtl.circuit "ZeroLengthVectorInBundle2"  {
   firrtl.module @ZeroLengthVectorInBundle2(out %out: !firrtl.bundle<resets: vector<bundle<a: reset>, 0>, data flip: uint<3>>) {
-    %0 = firrtl.subfield %out(0) : (!firrtl.bundle<resets: vector<bundle<a: reset>, 0>, data flip: uint<3>>) -> !firrtl.vector<bundle<a: reset>, 0>
+    %0 = firrtl.subfield %out[resets] : !firrtl.bundle<resets: vector<bundle<a: reset>, 0>, data flip: uint<3>>
     %invalid = firrtl.invalidvalue : !firrtl.vector<bundle<a: reset>, 0>
     firrtl.strictconnect %0, %invalid : !firrtl.vector<bundle<a: reset>, 0>
-    // CHECK-NEXT: %0 = firrtl.subfield %out(0) : (!firrtl.bundle<resets: vector<bundle<a: uint<1>>, 0>, data flip: uint<3>>) -> !firrtl.vector<bundle<a: uint<1>>, 0>
+    // CHECK-NEXT: %0 = firrtl.subfield %out[resets] : !firrtl.bundle<resets: vector<bundle<a: uint<1>>, 0>, data flip: uint<3>>
     // CHECK-NEXT: %invalid = firrtl.invalidvalue : !firrtl.vector<bundle<a: uint<1>>, 0>
     // CHECK-NEXT: firrtl.strictconnect %0, %invalid : !firrtl.vector<bundle<a: uint<1>>, 0>
   }
@@ -798,5 +811,30 @@ firrtl.circuit "ZeroVec"  {
   firrtl.module @ZeroVec(in %a: !firrtl.bundle<x: vector<reset, 0>>, out %b: !firrtl.bundle<x: vector<reset, 0>>) {
     firrtl.connect %b, %a : !firrtl.bundle<x: vector<reset, 0>>, !firrtl.bundle<x: vector<reset, 0>>
     // CHECK-NEXT: firrtl.connect %b, %a : !firrtl.bundle<x: vector<uint<1>, 0>>, !firrtl.bundle<x: vector<uint<1>, 0>>
+  }
+}
+
+// -----
+
+// CHECK-LABEL: "RefReset"
+firrtl.circuit "RefReset" {
+  // CHECK-LABEL: firrtl.module private @SendReset
+  // CHECK-SAME: in %r: !firrtl.asyncreset
+  // CHECK-SAME: out %ref: !firrtl.ref<asyncreset>
+  // CHECK-NEXT: send %r : !firrtl.asyncreset
+  // CHECK-NEXT: ref<asyncreset>
+  firrtl.module private @SendReset(in %r: !firrtl.reset, out %ref: !firrtl.ref<reset>) {
+    %ref_r = firrtl.ref.send %r : !firrtl.reset
+    firrtl.strictconnect %ref, %ref_r : !firrtl.ref<reset>
+  }
+  // CHECK-LABEL: firrtl.module @RefReset
+  // CHECK-NEXT: in r: !firrtl.asyncreset
+  // CHECK-SAME: out ref: !firrtl.ref<asyncreset>
+  // CHECK-NEXT: !firrtl.asyncreset, !firrtl.asyncreset
+  // CHECK-NEXT: %s_ref : !firrtl.ref<asyncreset>
+  firrtl.module @RefReset(in %r: !firrtl.asyncreset) {
+    %s_r, %s_ref = firrtl.instance s @SendReset(in r: !firrtl.reset, out ref: !firrtl.ref<reset>)
+    firrtl.connect %s_r, %r : !firrtl.reset, !firrtl.asyncreset
+    %reset = firrtl.ref.resolve %s_ref : !firrtl.ref<reset>
   }
 }

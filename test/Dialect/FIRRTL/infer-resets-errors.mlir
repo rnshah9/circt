@@ -1,4 +1,4 @@
-// RUN: circt-opt --pass-pipeline='firrtl.circuit(firrtl-infer-resets)' --verify-diagnostics --split-input-file %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-infer-resets))' --verify-diagnostics --split-input-file %s
 
 // Tests extracted from:
 // - github.com/chipsalliance/firrtl:
@@ -98,7 +98,7 @@ firrtl.circuit "top"   {
 firrtl.circuit "top" {
   // expected-error @+1 {{reset network never driven with concrete type}}
   firrtl.module @top(in %in: !firrtl.bundle<foo: reset>, out %out: !firrtl.reset) {
-    %0 = firrtl.subfield %in(0) : (!firrtl.bundle<foo: reset>) -> !firrtl.reset
+    %0 = firrtl.subfield %in[foo] : !firrtl.bundle<foo: reset>
     firrtl.connect %out, %0 : !firrtl.reset, !firrtl.reset
   }
 }
@@ -110,7 +110,7 @@ firrtl.circuit "top" {
   firrtl.module @top(out %out: !firrtl.reset) {
     // expected-error @+1 {{reset network never driven with concrete type}}
     %e_out = firrtl.instance e @ext(out out: !firrtl.bundle<foo: reset>)
-    %0 = firrtl.subfield %e_out(0) : (!firrtl.bundle<foo: reset>) -> !firrtl.reset
+    %0 = firrtl.subfield %e_out[foo] : !firrtl.bundle<foo: reset>
     firrtl.connect %out, %0 : !firrtl.reset, !firrtl.reset
   }
 }
@@ -227,6 +227,13 @@ firrtl.circuit "Top" {
 // -----
 
 firrtl.circuit "UninferredReset" {
-  // expected-error @+1 {{contains an abstract reset type after InferResets}}
+  // expected-error @+1 {{has an abstract reset type port "reset" after InferResets}}
   firrtl.module @UninferredReset(in %reset: !firrtl.reset) {}
+}
+
+// -----
+
+firrtl.circuit "UninferredRefReset" {
+  // expected-error @+1 {{has an abstract reset type port "reset" after InferResets}}
+  firrtl.module @UninferredRefReset(in %reset: !firrtl.ref<reset>) {}
 }

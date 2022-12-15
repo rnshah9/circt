@@ -32,7 +32,7 @@ indicate to the compiler that a wire "foo" should not be optimized away.
 ```
 
 Some annotations have more complex interactions with the IR. For example the
-[BoringUtils](https://www.chisel-lang.org/api/latest/chisel3/util/experimental/BoringUtils$.html)
+[BoringUtils](https://javadoc.io/doc/edu.berkeley.cs/chisel3_2.13/latest/chisel3/util/experimental/BoringUtils$.html)
 provides FIRRTL with annotations which can be used to wire together any two
 things across the module instance hierarchy.
 
@@ -221,7 +221,7 @@ Example:
 }
 ```
 
-### [BlackBoxInlineAnno](https://www.chisel-lang.org/api/firrtl/latest/firrtl/transforms/BlackBoxInlineAnno.html)
+### [BlackBoxInlineAnno](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/BlackBoxInlineAnno.html)
 
 | Property   | Type   | Description                            |
 | ---------- | ------ | -------------                          |
@@ -243,7 +243,7 @@ Example:
 }
 ```
 
-### [BlackBoxPathAnno](https://www.chisel-lang.org/api/firrtl/latest/firrtl/transforms/BlackBoxPathAnno.html)
+### [BlackBoxPathAnno](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/BlackBoxPathAnno.html)
 
 | Property   | Type   | Description                          |
 | ---------- | ------ | -------------                        |
@@ -263,7 +263,7 @@ Example:
 }
 ```
 
-### [BlackBoxResourceFileNameAnno](https://www.chisel-lang.org/api/firrtl/latest/firrtl/transforms/BlackBoxResourceFileNameAnno.html)
+### [BlackBoxResourceFileNameAnno](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/BlackBoxResourceFileNameAnno.html)
 
 | Property         | Type   | Description                              |
 | ----------       | ------ | -------------                            |
@@ -281,7 +281,7 @@ Example:
 }
 ```
 
-### [BlackBoxTargetDirAnno](https://www.chisel-lang.org/api/firrtl/latest/firrtl/transforms/BlackBoxTargetDirAnno.html)
+### [BlackBoxTargetDirAnno](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/BlackBoxTargetDirAnno.html)
 
 | Property   | Type   | Description                               |
 | ---------- | ------ | -------------                             |
@@ -367,7 +367,7 @@ Example:
 }
 ```
 
-### [DontTouchAnnotation](https://www.chisel-lang.org/api/firrtl/latest/firrtl/transforms/DontTouchAnnotation.html)
+### [DontTouchAnnotation](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/DontTouchAnnotation.html)
 
 | Property   | Type   | Description                             |
 | ---------- | ------ | -------------                           |
@@ -388,7 +388,7 @@ Example:
 }
 ```
 
-### [FlattenAnnotation](https://www.chisel-lang.org/api/firrtl/latest/firrtl/transforms/FlattenAnnotation.html)
+### [FlattenAnnotation](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/transforms/FlattenAnnotation.html)
 
 | Property   | Type   | Description                           |
 | ---------- | ------ | -------------                         |
@@ -469,7 +469,7 @@ Example:
 }
 ```
 
-### [InlineAnnotation](https://www.chisel-lang.org/api/firrtl/latest/firrtl/passes/InlineAnnotation.html)
+### [InlineAnnotation](https://javadoc.io/doc/edu.berkeley.cs/firrtl_2.13/latest/firrtl/passes/InlineAnnotation.html)
 
 | Property   | Type   | Description                      |
 | ---------- | ------ | -------------                    |
@@ -770,6 +770,19 @@ Example:
   "className":"freechips.rocketchip.prci.ClockGroupAggregator"
 }
 ```
+
+### circt.intrinsic
+
+| Property   | Type   | Description       |
+| ---------- | ------ | -------------     |
+| class      | string | `circt.intrinsic` |
+| target     | string | Reference target  |
+| intrinsic  | string | Name of Intrinsic |
+
+Used to indicate an external module is really an intrinsic module.  This exists
+to allow a frontend to generate intrinsics without firrtl language support for
+intrinsics.  It is expect this will be deprecated as soon as the firrtl language
+supports intrinsics.  This annotation can only be local and applied to a module.
 
 ### SitestBlackBoxAnnotation
 
@@ -1450,6 +1463,11 @@ modules. This attribute has type `OutputFileAttr`.
 Used by SVExtractTestCode.  Specifies the output directory for extracted
 modules. This attribute has type `OutputFileAttr`.
 
+### firrtl.extract.testbench
+
+Used by SVExtractTestCode.  Specifies the output directory for extracted
+testbench only modules. This attribute has type `OutputFileAttr`.
+
 ### firrtl.extract.assert.bindfile
 
 Used by SVExtractTestCode.  Specifies the output file for extracted
@@ -1469,3 +1487,4 @@ modules' bind file. This attribute has type `OutputFileAttr`.
 
 Used by SVExtractTestCode.  Indicates a module whose instances should be
 extracted from the circuit in the indicated extraction type.
+

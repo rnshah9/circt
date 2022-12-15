@@ -78,7 +78,7 @@ struct SignalMapping {
   /// The reference target of the thing we are forcing or probing.
   StringAttr remoteTarget;
   /// The type of the signal being mapped.
-  FIRRTLType type;
+  FIRRTLBaseType type;
   /// The block argument or result that interacts with the remote target, either
   /// by forcing it or by reading from it through a connect.
   Value localValue;
@@ -344,8 +344,9 @@ void ModuleSignalMappings::run() {
 /// `SignalMapping` information and adds an entry to the `mappings` array, to be
 /// later consumed when the mappings module is constructed.
 void ModuleSignalMappings::addTarget(Value value, Annotation anno) {
-  // Ignore the target if it is zero width.
-  if (!value.getType().cast<FIRRTLType>().getBitWidthOrSentinel())
+  // Ignore the target if it is zero width or not a base type.
+  auto targetType = value.getType().dyn_cast<FIRRTLBaseType>();
+  if (!targetType || !targetType.getBitWidthOrSentinel())
     return;
 
   SignalMapping mapping;
@@ -354,7 +355,7 @@ void ModuleSignalMappings::addTarget(Value value, Annotation anno) {
                     : MappingDirection::DriveRemote;
   mapping.remoteTarget = anno.getMember<StringAttr>("peer");
   mapping.localValue = value;
-  mapping.type = value.getType().cast<FIRRTLType>();
+  mapping.type = targetType;
   mapping.isLocal = anno.getMember<StringAttr>("side").getValue() == "local";
   mapping.nlaSym = anno.getMember<FlatSymbolRefAttr>("circt.nonlocal");
 
@@ -756,6 +757,8 @@ FailureOr<bool> GrandCentralSignalMappingsPass::emitUpdatedMappings(
           NameKindEnum::DroppableName, builder.getArrayAttr({}),
           replacementWireName);
       port.replaceAllUsesWith(replacementWire);
+      AnnotationSet::addDontTouch(replacementWire);
+      AnnotationSet::addDontTouch(bufferWire);
       builder.create<StrictConnectOp>(builder.getUnknownLoc(), port,
                                       bufferWire);
       builder.create<StrictConnectOp>(builder.getUnknownLoc(), bufferWire,
@@ -857,7 +860,7 @@ FailureOr<bool> GrandCentralSignalMappingsPass::emitUpdatedMappings(
     // If there's an NLA, add instance path information.
     if (mapping.nlaSym) {
       auto nla =
-          cast<HierPathOp>(circuit.lookupSymbol(mapping.nlaSym.getAttr()));
+          cast<hw::HierPathOp>(circuit.lookupSymbol(mapping.nlaSym.getAttr()));
       assert(!nla.getNamepath().empty());
 
       // Start from root of NLA, or from top/DUT if through it
